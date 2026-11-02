@@ -122,11 +122,14 @@ impl TieredLinearIm {
             }
         }
         for pair in tiers.windows(2) {
-            if pair[1].floor <= pair[0].floor {
+            let [lower, upper] = pair else {
+                continue;
+            };
+            if upper.floor <= lower.floor {
                 return invalid("floors must be strictly increasing");
             }
-            if pair[1].initial_rate < pair[0].initial_rate
-                || pair[1].maintenance_rate < pair[0].maintenance_rate
+            if upper.initial_rate < lower.initial_rate
+                || upper.maintenance_rate < lower.maintenance_rate
             {
                 return invalid("rates must not decrease from one tier to the next");
             }
@@ -193,7 +196,7 @@ impl TieredLinearIm {
             if notional <= tier.floor {
                 break;
             }
-            let top = match self.tiers.get(index + 1) {
+            let top = match index.checked_add(1).and_then(|next| self.tiers.get(next)) {
                 Some(next) => notional.min(next.floor),
                 None => notional,
             };
@@ -206,7 +209,10 @@ impl TieredLinearIm {
         }
         let round_up = |rate: fn(&TierSlice) -> Decimal, op| {
             let terms: Vec<[Decimal; 2]> = slices.iter().map(|s| [s.notional, rate(s)]).collect();
-            let terms: Vec<&[Decimal]> = terms.iter().map(|t| t.as_slice()).collect();
+            let terms: Vec<&[Decimal]> = terms
+                .iter()
+                .map(<[rust_decimal::Decimal; 2]>::as_slice)
+                .collect();
             sum_terms_round(&terms, self.scale, Rounding::AwayFromZero, op)
         };
         let initial = round_up(|s| s.initial_rate, "initial margin")?;

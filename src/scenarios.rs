@@ -36,7 +36,7 @@ use std::collections::BTreeMap;
 
 use rust_decimal::Decimal;
 
-use crate::decimal::{Rounding, add, check_scale, mul_div_round, product, sub, sum};
+use crate::decimal::{Rounding, add, check_scale, mul_div_round, neg, product, sub, sum};
 use crate::error::{MarginError, Result};
 use crate::ids::{Asset, InstrumentId};
 use crate::instrument::Instrument;
@@ -261,7 +261,7 @@ fn apply_hypothetical(
     )?;
     let (signed_quantity, signed_value) = match fill.side {
         Side::Buy => (fill.quantity, notional),
-        Side::Sell => (-fill.quantity, -notional),
+        Side::Sell => (neg(fill.quantity), neg(notional)),
     };
     // Every change to one asset is summed in one exact step, so a fee in
     // the base or quote asset cannot make an intermediate overflow.
@@ -273,13 +273,13 @@ fn apply_hypothetical(
     deltas
         .entry(spot.quote().clone())
         .or_default()
-        .push(-signed_value);
+        .push(neg(signed_value));
     if let Some(fee) = &fill.fee {
         check_scale(fee.amount, scale_of(&fee.asset)?, "fee")?;
         deltas
             .entry(fee.asset.clone())
             .or_default()
-            .push(-fee.amount);
+            .push(neg(fee.amount));
         let paid = snapshot.fees_paid.entry(fee.asset.clone()).or_default();
         *paid = add(*paid, fee.amount, "fees + fee")?;
     }

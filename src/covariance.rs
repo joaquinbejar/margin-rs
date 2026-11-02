@@ -79,27 +79,28 @@ impl ValidatedCovariance {
         }
         for (i, row) in matrix.iter().enumerate() {
             for (j, value) in row.iter().enumerate() {
-                if *value != matrix[j][i] {
+                if matrix.get(j).and_then(|other| other.get(i)) != Some(value) {
                     return invalid("the matrix must be exactly symmetric");
                 }
             }
         }
         for (i, row) in matrix.iter().enumerate() {
-            if row[i] < Decimal::ZERO {
+            if row.get(i).is_none_or(|variance| *variance < Decimal::ZERO) {
                 return invalid("variances must not be negative");
             }
         }
-        if n == 2 {
+        if let [first, second] = matrix.as_slice() {
+            let ([c11, c12], [c21, c22]) = (first.as_slice(), second.as_slice()) else {
+                return invalid("the matrix must have one row and one column per factor");
+            };
             // det >= 0 <=> c11 * c22 >= c12 * c21, compared exactly: the
             // products need not be representable as Decimals.
-            let order = compare_products(
-                &[matrix[0][0], matrix[1][1]],
-                &[matrix[0][1], matrix[1][0]],
-                "determinant",
-            )
-            .map_err(|_| MarginError::InvalidCovariance {
-                reason: "the determinant cannot be evaluated",
-            })?;
+            let order =
+                compare_products(&[*c11, *c22], &[*c12, *c21], "determinant").map_err(|_| {
+                    MarginError::InvalidCovariance {
+                        reason: "the determinant cannot be evaluated",
+                    }
+                })?;
             if order == core::cmp::Ordering::Less {
                 return invalid("the matrix must be positive semidefinite");
             }
@@ -116,6 +117,10 @@ impl ValidatedCovariance {
     /// correlation is outside `[-1, 1]`, the diagonal of the correlation
     /// matrix is not 1, a covariance cannot be represented, or the result
     /// fails [`ValidatedCovariance::new`].
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "public signature: taking slices would be a breaking change"
+    )]
     pub fn from_correlation(
         factors: Vec<Factor>,
         deviations: Vec<Decimal>,
@@ -133,27 +138,31 @@ impl ValidatedCovariance {
             return invalid("standard deviations must not be negative");
         }
         for (i, row) in correlation.iter().enumerate() {
-            if row[i] != Decimal::ONE {
+            if row.get(i) != Some(&Decimal::ONE) {
                 return invalid("correlations of a factor with itself must be 1");
             }
             if row.iter().any(|r| r.abs() > Decimal::ONE) {
                 return invalid("correlations must be in [-1, 1]");
             }
         }
-        let mut matrix = vec![vec![Decimal::ZERO; n]; n];
-        for i in 0..n {
-            for j in 0..n {
-                // One exact product: only the covariance itself must be
-                // representable.
-                matrix[i][j] = product(
-                    &[correlation[i][j], deviations[i], deviations[j]],
-                    "rho * sigma_i * sigma_j",
-                )
-                .map_err(|_| MarginError::InvalidCovariance {
-                    reason: "a covariance rho * sigma_i * sigma_j cannot be represented",
-                })?;
-            }
-        }
+        // One exact product per entry: only the covariance itself must be
+        // representable.
+        let matrix = correlation
+            .iter()
+            .zip(&deviations)
+            .map(|(row, sigma_i)| {
+                row.iter()
+                    .zip(&deviations)
+                    .map(|(rho, sigma_j)| {
+                        product(&[*rho, *sigma_i, *sigma_j], "rho * sigma_i * sigma_j").map_err(|_| {
+                            MarginError::InvalidCovariance {
+                                reason: "a covariance rho * sigma_i * sigma_j cannot be represented",
+                            }
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
         Self::new(factors, matrix)
     }
 
@@ -244,7 +253,13 @@ pub fn portfolio_variance(
     let n = covariance.factors.len();
     let mut per_factor: Vec<Vec<Decimal>> = vec![Vec::new(); n];
     for (exposure, slot) in exposures.iter().zip(&slots) {
-        per_factor[*slot].push(exposure.amount);
+        // Every slot came from the factor index above, so it is in range.
+        per_factor
+            .get_mut(*slot)
+            .ok_or_else(|| MarginError::UnknownFactor {
+                factor: exposure.factor.clone(),
+            })?
+            .push(exposure.amount);
     }
     let (variance, net) = quadratic_form_round(
         &per_factor,

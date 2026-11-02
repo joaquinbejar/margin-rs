@@ -104,7 +104,10 @@ impl ContractGrid {
             return Err(error());
         }
         let (truncated, _) = product
-            .div_rem(U768::pow10(self.step_scale - scale).ok_or_else(error)?)
+            .div_rem(
+                U768::pow10(self.step_scale.checked_sub(scale).ok_or_else(error)?)
+                    .ok_or_else(error)?,
+            )
             .ok_or_else(error)?;
         Wide::new(false, truncated)
             .to_decimal(scale)
@@ -131,7 +134,14 @@ impl ContractGrid {
         // value / step = (mn / 10^sn) / ((md / 10^sd) * (ms / 10^ss))
         //              = mn * 10^(sd + ss) / (md * ms * 10^sn).
         let top = magnitude(numerator)
-            .checked_mul(U768::pow10(denominator_scale + self.step_scale).ok_or_else(error)?)
+            .checked_mul(
+                U768::pow10(
+                    denominator_scale
+                        .checked_add(self.step_scale)
+                        .ok_or_else(error)?,
+                )
+                .ok_or_else(error)?,
+            )
             .ok_or_else(error)?;
         let bottom = denominator
             .magnitude
@@ -168,6 +178,12 @@ impl ContractGrid {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
@@ -188,7 +204,7 @@ mod tests {
         assert_eq!(grid.last(), GridIndex(U768::from_u128(4)));
     }
 
-    /// Decimal::MAX with step 2: ceil(MAX / 2) * 2 exceeds MAX, but the last
+    /// `Decimal::MAX` with step 2: ceil(MAX / 2) * 2 exceeds MAX, but the last
     /// count is the cap.
     #[test]
     fn huge_cap_and_tiny_step_do_not_overflow() {

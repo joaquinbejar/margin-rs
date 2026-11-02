@@ -1,0 +1,3 @@
+# Words that clippy::doc_markdown accepts without backticks. ".." keeps
+# clippy's default list.
+doc-valid-idents = ["PnL", ".."]

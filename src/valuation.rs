@@ -57,7 +57,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rust_decimal::Decimal;
 
-use crate::decimal::{Rounding, add, sub, sum, sum_terms_round};
+use crate::decimal::{Rounding, add, neg, sub, sum, sum_terms_round};
 use crate::error::{MarginError, Result};
 use crate::ids::Asset;
 use crate::instrument::Instrument;
@@ -294,10 +294,10 @@ pub(crate) fn pricing(
                 prices.insert(asset.clone(), mark.price);
                 if mark.timestamp_ms > marks.as_of_ms {
                     MarkStatus::Future {
-                        ahead_ms: mark.timestamp_ms - marks.as_of_ms,
+                        ahead_ms: mark.timestamp_ms.abs_diff(marks.as_of_ms),
                     }
                 } else {
-                    let age_ms = marks.as_of_ms - mark.timestamp_ms;
+                    let age_ms = marks.as_of_ms.abs_diff(mark.timestamp_ms);
                     if age_ms > policy.max_age_ms {
                         MarkStatus::Stale { age_ms }
                     } else {
@@ -414,6 +414,10 @@ fn floor_terms(terms: &[&[Decimal]], scale: u32, operation: &'static str) -> Res
 /// - [`MarginError::InvalidInput`] if the mark set prices the reporting
 ///   asset or the haircut is outside `[0, 1]`.
 /// - [`MarginError::Arithmetic`] if a result cannot be represented.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one valuation pass: marks, conversions, per position terms and the single final rounding of each total"
+)]
 pub fn value(
     snapshot: &LedgerSnapshot,
     marks: &MarkSet,
@@ -536,7 +540,7 @@ pub fn value(
             needed.insert(spot.quote());
             if let Some(quote) = price(spot.quote()) {
                 realized_terms.push(vec![position.realized_pnl, quote]);
-                unrealized_terms.push(vec![-position.cost_basis, quote]);
+                unrealized_terms.push(vec![neg(position.cost_basis), quote]);
             }
         }
         if !position.quantity.is_zero() {
@@ -575,7 +579,10 @@ pub fn value(
             let unrealized = round_terms(&unrealized_terms, rounding, "unrealized")?;
             let fees = round_terms(&fee_terms, rounding, "fees")?;
             // net - (realized + unrealized - fees), in one exact step.
-            let rounding_difference = sum(&[net, -realized, -unrealized, fees], "net - explained")?;
+            let rounding_difference = sum(
+                &[net, neg(realized), neg(unrealized), fees],
+                "net - explained",
+            )?;
             Some(PnlAttribution {
                 realized,
                 unrealized,

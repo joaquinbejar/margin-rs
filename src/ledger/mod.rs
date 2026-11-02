@@ -78,7 +78,7 @@ pub use snapshot::{BalanceSnapshot, LedgerSnapshot, PositionSnapshot};
 pub use valuation::{AssetPnl, PositionValuation, Valuation};
 
 use crate::decimal::{
-    self, Rounding, add, check_configured_scale, check_scale, mul, mul_div_round, sub,
+    self, Rounding, add, check_configured_scale, check_scale, mul, mul_div_round, neg, sub,
 };
 use crate::error::{MarginError, Result};
 use crate::ids::{Asset, ExecutionId, InstrumentId, ReservationId, TransferId};
@@ -143,20 +143,27 @@ impl Transfer {
     fn signed_amount(&self) -> Decimal {
         match self.kind {
             TransferKind::Deposit => self.amount,
-            TransferKind::Withdrawal => -self.amount,
+            TransferKind::Withdrawal => neg(self.amount),
         }
     }
 }
 
+/// A balance. `available = total - reserved` is computed exactly when the
+/// balance changes, so reading it never does arithmetic.
 #[derive(Debug, Clone, Copy, Default)]
 struct Balance {
     total: Decimal,
     reserved: Decimal,
+    available: Decimal,
 }
 
 impl Balance {
-    fn available(self) -> Result<Decimal> {
-        sub(self.total, self.reserved, "total - reserved")
+    fn new(total: Decimal, reserved: Decimal) -> Result<Self> {
+        Ok(Self {
+            total,
+            reserved,
+            available: sub(total, reserved, "total - reserved")?,
+        })
     }
 }
 
@@ -368,7 +375,7 @@ impl Ledger {
             "balance + transfer",
         )?;
         if transfer.kind == TransferKind::Withdrawal {
-            let available = balance.available()?;
+            let available = balance.available;
             if transfer.amount > available {
                 return Err(MarginError::InsufficientBalance {
                     asset: transfer.asset,
@@ -385,10 +392,7 @@ impl Ledger {
         let net = add(net, transfer.signed_amount(), "net transfers")?;
         self.balances.insert(
             transfer.asset.clone(),
-            Balance {
-                total,
-                reserved: balance.reserved,
-            },
+            Balance::new(total, balance.reserved)?,
         );
         self.net_transfers.insert(transfer.asset.clone(), net);
         self.transfers.insert(transfer.id.clone(), transfer);
@@ -420,7 +424,7 @@ impl Ledger {
         }
         self.validated_amount(&asset, amount, "amount")?;
         let balance = self.balance_of(&asset)?;
-        let available = balance.available()?;
+        let available = balance.available;
         if amount > available {
             return Err(MarginError::InsufficientBalance {
                 asset,
@@ -429,13 +433,8 @@ impl Ledger {
             });
         }
         let reserved = add(balance.reserved, amount, "reserved + amount")?;
-        self.balances.insert(
-            asset.clone(),
-            Balance {
-                total: balance.total,
-                reserved,
-            },
-        );
+        self.balances
+            .insert(asset.clone(), Balance::new(balance.total, reserved)?);
         self.reservations.insert(id, (asset, amount));
         Ok(true)
     }
@@ -481,10 +480,10 @@ impl Ledger {
             let balance = self.balance_of(old_asset)?;
             updates.insert(
                 old_asset.clone(),
-                Balance {
-                    total: balance.total,
-                    reserved: sub(balance.reserved, *old_amount, "reserved - previous")?,
-                },
+                Balance::new(
+                    balance.total,
+                    sub(balance.reserved, *old_amount, "reserved - previous")?,
+                )?,
             );
         }
         let current = match updates.get(&asset) {
@@ -500,13 +499,7 @@ impl Ledger {
                 available: sub(current.total, current.reserved, "total - reserved")?,
             });
         }
-        updates.insert(
-            asset.clone(),
-            Balance {
-                total: current.total,
-                reserved,
-            },
-        );
+        updates.insert(asset.clone(), Balance::new(current.total, reserved)?);
         // Commit.
         for (asset, balance) in updates {
             self.balances.insert(asset, balance);
@@ -535,13 +528,8 @@ impl Ledger {
             .ok_or_else(|| MarginError::UnknownReservation { id: id.to_string() })?;
         let balance = self.balance_of(&asset)?;
         let reserved = sub(balance.reserved, amount, "reserved - amount")?;
-        self.balances.insert(
-            asset.clone(),
-            Balance {
-                total: balance.total,
-                reserved,
-            },
-        );
+        self.balances
+            .insert(asset.clone(), Balance::new(balance.total, reserved)?);
         self.reservations.remove(id);
         Ok((asset, amount))
     }
@@ -629,6 +617,10 @@ impl Ledger {
             })
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the whole booking is one validate-then-commit sequence: every check runs before any balance changes, so it stays in one function"
+    )]
     fn book(
         &mut self,
         execution: &Execution,
@@ -638,7 +630,12 @@ impl Ledger {
         if let Some((previous, index)) = self.executions.get(&execution.id) {
             if previous == execution {
                 return Ok((
-                    Booking::Duplicate(self.journal[*index].clone()),
+                    Booking::Duplicate(
+                        self.journal
+                            .get(*index)
+                            .cloned()
+                            .ok_or(MarginError::arithmetic("execution journal index"))?,
+                    ),
                     BTreeMap::new(),
                 ));
             }
@@ -694,7 +691,7 @@ impl Ledger {
         // Signed quantity and signed quote value (positive when buying).
         let (signed_quantity, signed_value) = match execution.side {
             Side::Buy => (execution.quantity, notional),
-            Side::Sell => (-execution.quantity, -notional),
+            Side::Sell => (neg(execution.quantity), neg(notional)),
         };
 
         // Changes per asset, each summed in one exact step (a fee in the
@@ -707,12 +704,12 @@ impl Ledger {
         changes
             .entry(spot.quote().clone())
             .or_default()
-            .push(-signed_value);
+            .push(neg(signed_value));
         if let Some(fee) = &execution.fee {
             changes
                 .entry(fee.asset.clone())
                 .or_default()
-                .push(-fee.amount);
+                .push(neg(fee.amount));
         }
         let mut deltas: BTreeMap<Asset, Decimal> = BTreeMap::new();
         for (asset, values) in changes {
@@ -766,16 +763,16 @@ impl Ledger {
             if delta < Decimal::ZERO {
                 let available_after = sub(total, reserved, "total - reserved")?;
                 if available_after < Decimal::ZERO && allow_overdraft {
-                    shortfalls.insert(asset.clone(), -available_after);
+                    shortfalls.insert(asset.clone(), neg(available_after));
                 } else if available_after < Decimal::ZERO {
                     return Err(MarginError::InsufficientBalance {
                         asset: asset.clone(),
-                        required: -delta,
+                        required: neg(delta),
                         available: sub(balance.total, reserved, "total - reserved")?,
                     });
                 }
             }
-            new_balances.push((asset.clone(), Balance { total, reserved }));
+            new_balances.push((asset.clone(), Balance::new(total, reserved)?));
         }
 
         let position = self
@@ -869,7 +866,11 @@ impl Ledger {
         if let Some((previous, index)) = self.settlements.get(&settlement.id) {
             if previous == settlement {
                 return Ok(SettlementBooking {
-                    cashflow: self.settlement_journal[*index].clone(),
+                    cashflow: self
+                        .settlement_journal
+                        .get(*index)
+                        .cloned()
+                        .ok_or(MarginError::arithmetic("settlement journal index"))?,
                     is_new: false,
                     shortfall: None,
                 });
@@ -899,8 +900,8 @@ impl Ledger {
         let delta = sub(settlement.realized_pnl, settlement.fee, "realized - fee")?;
         let total = add(balance.total, delta, "balance + settlement")?;
         let available_after = sub(total, balance.reserved, "total - reserved")?;
-        let shortfall =
-            (delta < Decimal::ZERO && available_after < Decimal::ZERO).then_some(-available_after);
+        let shortfall = (delta < Decimal::ZERO && available_after < Decimal::ZERO)
+            .then_some(neg(available_after));
         let fees = add(
             self.fees_paid(&settlement.asset),
             settlement.fee,
@@ -915,10 +916,7 @@ impl Ledger {
         // Commit: nothing below can fail.
         self.balances.insert(
             settlement.asset.clone(),
-            Balance {
-                total,
-                reserved: balance.reserved,
-            },
+            Balance::new(total, balance.reserved)?,
         );
         self.fees_paid.insert(settlement.asset.clone(), fees);
         self.settled_pnl.insert(settlement.asset.clone(), settled);
@@ -964,10 +962,9 @@ impl Ledger {
         self.balances.get(asset).map(|b| BalanceSnapshot {
             total: b.total,
             reserved: b.reserved,
-            // Both terms are far from the Decimal limits (they were computed
-            // exactly), so this difference cannot overflow. It is negative
-            // only after an overdraft.
-            available: b.total - b.reserved,
+            // Computed exactly when the balance changed; negative only after
+            // an overdraft.
+            available: b.available,
         })
     }
 
@@ -1114,7 +1111,7 @@ impl Ledger {
                     .push(*settled);
             }
         }
-        for (asset, line) in by_asset.iter_mut() {
+        for (asset, line) in &mut by_asset {
             if let Some((realized, unrealized)) = asset_terms.get(asset) {
                 line.realized_pnl = decimal::sum(realized, "realized sum")?;
                 line.unrealized_pnl = decimal::sum(unrealized, "unrealized sum")?;
@@ -1123,7 +1120,7 @@ impl Ledger {
                 .get(asset)
                 .map(|(r, u)| r.iter().chain(u).copied().collect::<Vec<_>>())
                 .unwrap_or_default();
-            net.push(-line.fees_paid);
+            net.push(neg(line.fees_paid));
             line.net_pnl = decimal::sum(&net, "realized + unrealized - fees")?;
         }
         Ok(Valuation {
@@ -1142,7 +1139,7 @@ impl Ledger {
         self.balances
             .iter()
             .filter(|(_, b)| b.total < b.reserved)
-            .map(|(asset, b)| (asset.clone(), b.reserved - b.total))
+            .map(|(asset, b)| (asset.clone(), neg(b.available)))
             .collect()
     }
 
@@ -1166,6 +1163,10 @@ impl Ledger {
     ///
     /// [`MarginError::ReconciliationMismatch`] naming the first failed check,
     /// or [`MarginError::Arithmetic`] on overflow.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one replay of the journal followed by one comparison per balance and position; splitting it would duplicate the replayed state"
+    )]
     pub fn reconcile(&self) -> Result<Reconciliation> {
         // Every figure is the exact wide sum of its terms, independent of
         // order: partial sums never need to be representable.
@@ -1217,8 +1218,8 @@ impl Ledger {
                 fee_terms.entry(&fee.asset).or_default().push(fee.amount);
             }
             let (quantity, cash) = match cashflow.side {
-                Side::Buy => (cashflow.quantity, -cashflow.notional),
-                Side::Sell => (-cashflow.quantity, cashflow.notional),
+                Side::Buy => (cashflow.quantity, neg(cashflow.notional)),
+                Side::Sell => (neg(cashflow.quantity), cashflow.notional),
             };
             quantity_terms
                 .entry(&cashflow.instrument)
@@ -1375,18 +1376,18 @@ pub(crate) fn apply_fill(
                 "released cost",
             )?
         };
-        let realized = sub(-signed_value, released, "realized pnl")?;
+        let realized = sub(neg(signed_value), released, "realized pnl")?;
         (realized, sub(cost, released, "cost - released")?)
     } else {
         let close_value =
             mul_div_round(&[price, held], &[], quote_scale, rounding, "price * held")?;
         let close_value = if signed_value.is_sign_negative() {
-            -close_value
+            neg(close_value)
         } else {
             close_value
         };
         let open_value = sub(signed_value, close_value, "open value")?;
-        let realized = sub(-close_value, cost, "realized pnl")?;
+        let realized = sub(neg(close_value), cost, "realized pnl")?;
         (realized, open_value)
     };
     let realized_pnl = add(position.realized_pnl, realized, "realized sum")?;

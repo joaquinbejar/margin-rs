@@ -3,6 +3,13 @@
 //! Every expected value below is written out by hand from the rules in
 //! `docs/ledger.md`; none is computed by the code under test.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+
 use std::collections::BTreeMap;
 
 use margin_rs::ledger::{Booking, Execution, Ledger, LedgerConfig, Side};
@@ -679,7 +686,7 @@ fn registration_rules() {
     );
 }
 
-/// M104-1: a deposit whose sum rust_decimal would round is rejected and
+/// M104-1: a deposit whose sum `rust_decimal` would round is rejected and
 /// leaves the balance unchanged, in both orders.
 #[test]
 fn deposits_that_would_lose_digits_are_rejected() {
@@ -936,7 +943,7 @@ fn real_execution_can_overdraw() {
     assert!(ledger.reconcile().expect("reconciles").is_clean());
 }
 
-/// set_reservation is atomic: it resizes in one step, shrinking always
+/// `set_reservation` is atomic: it resizes in one step, shrinking always
 /// works even on an overdrawn balance, and an uncovered increase changes
 /// nothing.
 #[test]
@@ -974,5 +981,36 @@ fn set_reservation_is_atomic_even_when_overdrawn() {
         .expect("remove");
     assert_eq!(ledger.reservation(&hold), None);
     assert_eq!(ledger.balance(&usdc).expect("balance").reserved, dec!(0));
+    ledger.reconcile().expect("reconciles");
+}
+
+/// A balance whose `total - reserved` cannot be represented is refused when
+/// it is booked, with the ledger unchanged; reading balances never does
+/// arithmetic.
+#[test]
+fn test_reserve_unrepresentable_available_is_arithmetic_error() {
+    let mut ledger = Ledger::new(LedgerConfig {
+        rounding: Rounding::HalfEven,
+    });
+    let usd = asset("USD");
+    ledger.register_asset(usd.clone(), 1).expect("register");
+    ledger
+        .deposit(tid("d1"), usd.clone(), Decimal::MAX)
+        .expect("deposit");
+    let before = ledger.snapshot();
+
+    // MAX - 0.1 needs 29 digits: it is not a Decimal.
+    let hold = ReservationId::new("r1").expect("id");
+    assert!(matches!(
+        ledger.reserve(hold, usd.clone(), dec!(0.1)),
+        Err(MarginError::Arithmetic { .. })
+    ));
+    assert_eq!(ledger.snapshot(), before);
+    let balance = ledger.balance(&usd).expect("balance");
+    assert_eq!(
+        (balance.total, balance.reserved, balance.available),
+        (Decimal::MAX, dec!(0), Decimal::MAX)
+    );
+    assert!(ledger.overdrafts().is_empty());
     ledger.reconcile().expect("reconciles");
 }

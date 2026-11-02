@@ -21,14 +21,23 @@ const LIMBS: usize = 12;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct U768([u64; LIMBS]);
 
+/// The low and high 64 bit halves of `value`.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the split itself: the low half is masked to 64 bits and the high half is shifted down 64 bits, so no bit is lost"
+)]
+const fn halves(value: u128) -> (u64, u64) {
+    ((value & (u64::MAX as u128)) as u64, (value >> 64) as u64)
+}
+
 impl U768 {
     pub(crate) const ZERO: Self = Self([0; LIMBS]);
 
     pub(crate) fn from_u128(value: u128) -> Self {
+        let (low, high) = halves(value);
         let mut limbs = [0; LIMBS];
-        // Truncations are intended: low and high halves of the u128.
-        limbs[0] = value as u64;
-        limbs[1] = (value >> 64) as u64;
+        limbs[0] = low;
+        limbs[1] = high;
         Self(limbs)
     }
 
@@ -42,66 +51,77 @@ impl U768 {
 
     /// The value as `u128`, or `None` if it does not fit.
     pub(crate) fn to_u128(self) -> Option<u128> {
-        if self.0[2..].iter().any(|limb| *limb != 0) {
+        let [low, high, rest @ ..] = self.0;
+        if rest.iter().any(|limb| *limb != 0) {
             return None;
         }
-        Some(u128::from(self.0[0]) | (u128::from(self.0[1]) << 64))
+        Some(u128::from(low) | (u128::from(high) << 64))
     }
 
     pub(crate) fn checked_add(self, other: Self) -> Option<Self> {
         let mut out = [0; LIMBS];
-        let mut carry = 0_u64;
-        for (i, slot) in out.iter_mut().enumerate() {
-            let (sum, c1) = self.0[i].overflowing_add(other.0[i]);
-            let (sum, c2) = sum.overflowing_add(carry);
+        let mut carry = false;
+        for ((slot, a), b) in out.iter_mut().zip(self.0).zip(other.0) {
+            let (sum, c1) = a.overflowing_add(b);
+            let (sum, c2) = sum.overflowing_add(u64::from(carry));
             *slot = sum;
-            carry = u64::from(c1) + u64::from(c2);
+            // At most one of the two additions carries.
+            carry = c1 || c2;
         }
-        (carry == 0).then_some(Self(out))
+        (!carry).then_some(Self(out))
     }
 
     /// `self - other`, or `None` if `other > self`.
     pub(crate) fn checked_sub(self, other: Self) -> Option<Self> {
         let mut out = [0; LIMBS];
-        let mut borrow = 0_u64;
-        for (i, slot) in out.iter_mut().enumerate() {
-            let (diff, b1) = self.0[i].overflowing_sub(other.0[i]);
-            let (diff, b2) = diff.overflowing_sub(borrow);
+        let mut borrow = false;
+        for ((slot, a), b) in out.iter_mut().zip(self.0).zip(other.0) {
+            let (diff, b1) = a.overflowing_sub(b);
+            let (diff, b2) = diff.overflowing_sub(u64::from(borrow));
             *slot = diff;
-            borrow = u64::from(b1) + u64::from(b2);
+            // At most one of the two subtractions borrows.
+            borrow = b1 || b2;
         }
-        (borrow == 0).then_some(Self(out))
+        (!borrow).then_some(Self(out))
     }
 
     pub(crate) fn checked_mul(self, other: Self) -> Option<Self> {
         let mut wide = [0_u64; 2 * LIMBS];
-        for i in 0..LIMBS {
-            if self.0[i] == 0 {
+        for (i, a) in self.0.into_iter().enumerate() {
+            if a == 0 {
                 continue;
             }
+            let row = wide.get_mut(i..)?;
             let mut carry = 0_u128;
-            for j in 0..LIMBS {
-                let current = u128::from(wide[i + j])
-                    + u128::from(self.0[i]) * u128::from(other.0[j])
-                    + carry;
+            for (slot, b) in row.iter_mut().zip(other.0) {
+                // (2^64 - 1) + (2^64 - 1)^2 + (2^64 - 1) = 2^128 - 1: these
+                // never overflow, and a failure would return `None`.
+                let current = u128::from(a)
+                    .checked_mul(u128::from(b))?
+                    .checked_add(u128::from(*slot))?
+                    .checked_add(carry)?;
                 // Low 64 bits stay in the limb, the rest carries.
-                wide[i + j] = current as u64;
-                carry = current >> 64;
+                let (low, high) = halves(current);
+                *slot = low;
+                carry = u128::from(high);
             }
-            let mut k = i + LIMBS;
-            while carry != 0 {
-                let current = u128::from(wide[k]) + carry;
-                wide[k] = current as u64;
-                carry = current >> 64;
-                k += 1;
+            for slot in row.iter_mut().skip(LIMBS) {
+                if carry == 0 {
+                    break;
+                }
+                let (low, high) = halves(u128::from(*slot).checked_add(carry)?);
+                *slot = low;
+                carry = u128::from(high);
+            }
+            if carry != 0 {
+                return None;
             }
         }
-        if wide[LIMBS..].iter().any(|limb| *limb != 0) {
+        let (low, high) = wide.split_first_chunk::<LIMBS>()?;
+        if high.iter().any(|limb| *limb != 0) {
             return None;
         }
-        let mut out = [0; LIMBS];
-        out.copy_from_slice(&wide[..LIMBS]);
-        Some(Self(out))
+        Some(Self(*low))
     }
 
     /// `10^exponent`, or `None` if it does not fit.
@@ -114,29 +134,37 @@ impl U768 {
         Some(out)
     }
 
-    fn bit_length(&self) -> usize {
-        for i in (0..LIMBS).rev() {
-            if self.0[i] != 0 {
-                return i * 64 + (64 - self.0[i].leading_zeros() as usize);
+    /// Number of significant bits, or `None` if it does not fit `usize`.
+    fn bit_length(&self) -> Option<usize> {
+        for (i, limb) in self.0.iter().enumerate().rev() {
+            if *limb != 0 {
+                let significant =
+                    usize::try_from(u64::BITS.checked_sub(limb.leading_zeros())?).ok()?;
+                return i.checked_mul(64)?.checked_add(significant);
             }
         }
-        0
+        Some(0)
     }
 
     fn bit(&self, index: usize) -> bool {
-        (self.0[index / 64] >> (index % 64)) & 1 == 1
+        self.0
+            .get(index / 64)
+            .is_some_and(|limb| (limb >> (index % 64)) & 1 == 1)
     }
 
-    fn set_bit(&mut self, index: usize) {
-        self.0[index / 64] |= 1 << (index % 64);
+    /// Sets bit `index`; `None` if it is past the 768 bits.
+    fn set_bit(&mut self, index: usize) -> Option<()> {
+        let limb = self.0.get_mut(index / 64)?;
+        *limb |= 1 << (index % 64);
+        Some(())
     }
 
     fn shl1(self) -> Self {
         let mut out = [0; LIMBS];
         let mut carry = 0;
-        for (i, slot) in out.iter_mut().enumerate() {
-            *slot = (self.0[i] << 1) | carry;
-            carry = self.0[i] >> 63;
+        for (slot, limb) in out.iter_mut().zip(self.0) {
+            *slot = (limb << 1) | carry;
+            carry = limb >> 63;
         }
         Self(out)
     }
@@ -149,7 +177,7 @@ impl U768 {
         }
         let mut quotient = Self::ZERO;
         let mut remainder = Self::ZERO;
-        for index in (0..self.bit_length()).rev() {
+        for index in (0..self.bit_length()?).rev() {
             remainder = remainder.shl1();
             if self.bit(index) {
                 remainder.0[0] |= 1;
@@ -157,7 +185,7 @@ impl U768 {
             if remainder >= divisor {
                 // remainder >= divisor, so this cannot fail.
                 remainder = remainder.checked_sub(divisor)?;
-                quotient.set_bit(index);
+                quotient.set_bit(index)?;
             }
         }
         Some((quotient, remainder))
@@ -172,10 +200,10 @@ impl PartialOrd for U768 {
 
 impl Ord for U768 {
     fn cmp(&self, other: &Self) -> Ordering {
-        for i in (0..LIMBS).rev() {
-            match self.0[i].cmp(&other.0[i]) {
-                Ordering::Equal => continue,
-                unequal => return unequal,
+        for (a, b) in self.0.iter().zip(other.0.iter()).rev() {
+            let order = a.cmp(b);
+            if order != Ordering::Equal {
+                return order;
             }
         }
         Ordering::Equal
@@ -239,6 +267,17 @@ impl Wide {
         ))
     }
 
+    /// `self`, given at scale `from`, rescaled to the scale `to >= from`:
+    /// `self * 10^(to - from)`. `None` if `to < from` or on overflow.
+    pub(crate) fn align(self, from: u32, to: u32) -> Option<Self> {
+        self.scale_up(to.checked_sub(from)?)
+    }
+
+    /// `self` with its sign flipped. Exact.
+    pub(crate) fn negated(self) -> Self {
+        Self::new(!self.negative, self.magnitude)
+    }
+
     /// `self * 10^exponent`.
     pub(crate) fn scale_up(self, exponent: u32) -> Option<Self> {
         Some(Self::new(
@@ -283,18 +322,35 @@ impl Wide {
                 return None;
             }
             magnitude = quotient;
-            scale -= 1;
+            scale = scale.checked_sub(1)?;
         }
         let mantissa = magnitude.to_u128()?;
-        // Split the 96 bit mantissa into the three 32 bit parts.
-        let lo = mantissa as u32;
-        let mid = (mantissa >> 32) as u32;
-        let hi = (mantissa >> 64) as u32;
+        let (lo, mid, hi) = parts(mantissa);
         Some(Decimal::from_parts(lo, mid, hi, self.negative, scale))
     }
 }
 
+/// The three 32 bit parts of a 96 bit mantissa, low first.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the split itself: each part is masked to 32 bits after its shift, and the caller passes at most 96 bits"
+)]
+const fn parts(mantissa: u128) -> (u32, u32, u32) {
+    let mask = u32::MAX as u128;
+    (
+        (mantissa & mask) as u32,
+        ((mantissa >> 32) & mask) as u32,
+        ((mantissa >> 64) & mask) as u32,
+    )
+}
+
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 

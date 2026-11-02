@@ -1,5 +1,12 @@
 //! Collateral fixtures (M3-03A), hand calculated.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+
 use margin_rs::collateral::{BalanceBasis, CollateralPolicy, StalePolicy, value_collateral};
 use margin_rs::ledger::{Execution, Ledger, Side};
 use margin_rs::valuation::{Mark, MarkSet, MarkStatus, PriceSource};
@@ -235,8 +242,8 @@ fn debts_count_in_full() {
     assert_eq!(v.lines[&asset("BTC")].haircut, None);
     assert_eq!(v.total, Some(dec!(53500)));
 
-    let stale = fresh().with(asset("BTC"), mark(dec!(60000), 0));
-    let v = value_collateral(&snapshot, &stale, &policy()).expect("value");
+    let old_marks = fresh().with(asset("BTC"), mark(dec!(60000), 0));
+    let v = value_collateral(&snapshot, &old_marks, &policy()).expect("value");
     assert_eq!(v.lines[&asset("BTC")].value, None);
     assert_eq!(v.total, None);
 
@@ -244,7 +251,7 @@ fn debts_count_in_full() {
         stale: StalePolicy::ExtraHaircut { extra: dec!(0.1) },
         ..policy()
     };
-    let v = value_collateral(&snapshot, &stale, &extra).expect("value");
+    let v = value_collateral(&snapshot, &old_marks, &extra).expect("value");
     assert_eq!(v.lines[&asset("BTC")].value, Some(dec!(-33000)));
     assert_eq!(v.total, Some(dec!(50500)));
 

@@ -29,7 +29,7 @@
 
 use rust_decimal::Decimal;
 
-use crate::decimal::sub;
+use crate::decimal::{neg, sub};
 use crate::error::{MarginError, Result};
 use crate::ids::Asset;
 use crate::initial_margin::{MarginRequirement, RuleId};
@@ -191,7 +191,7 @@ pub fn assess(
         initial: requirement.initial,
         maintenance,
         excess,
-        maintenance_shortfall: excess.map(|e| (-e).max(Decimal::ZERO)),
-        debt: (-view.cash).max(Decimal::ZERO),
+        maintenance_shortfall: excess.map(|e| neg(e).max(Decimal::ZERO)),
+        debt: neg(view.cash).max(Decimal::ZERO),
     })
 }

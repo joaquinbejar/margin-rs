@@ -63,7 +63,7 @@ use crate::risk::RiskGate;
 
 use rust_decimal::Decimal;
 
-use crate::decimal::{add, sub, sum};
+use crate::decimal::{add, neg, sub, sum};
 use crate::error::{MarginError, Result};
 use crate::ids::{AccountId, Asset, ExecutionId, InstrumentId, OrderId, VenueId};
 use crate::initial_margin::{
@@ -336,12 +336,10 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
             .get(&order.instrument)
             .copied()
             .unwrap_or_default();
-        let reducing_side = if position > Decimal::ZERO {
-            Side::Sell
-        } else if position < Decimal::ZERO {
-            Side::Buy
-        } else {
-            return Ok(false);
+        let reducing_side = match position.cmp(&Decimal::ZERO) {
+            core::cmp::Ordering::Greater => Side::Sell,
+            core::cmp::Ordering::Less => Side::Buy,
+            core::cmp::Ordering::Equal => return Ok(false),
         };
         if order.side != reducing_side {
             return Ok(false);
@@ -353,7 +351,7 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
             .map(|p| p.remaining)
             .collect();
         let room = sum(
-            &[position.abs(), -sum(&resting, "resting reducing")?],
+            &[position.abs(), neg(sum(&resting, "resting reducing")?)],
             "reducing room",
         )?;
         Ok(order.contracts <= room)
@@ -467,7 +465,7 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
         };
         let signed = match pending.order.side {
             Side::Buy => contracts,
-            Side::Sell => -contracts,
+            Side::Sell => neg(contracts),
         };
         let position = self
             .positions

@@ -260,8 +260,13 @@ fn main() -> margin_rs::Result<()> {
 - The only rounding steps are explicit and documented (notional, released
   cost, margin per position, fees, valuation), each from the exact value
   with a declared `Rounding` mode.
-- Binary floating point is banned crate wide (`clippy::float_arithmetic =
-  deny`), and there is no `unsafe` code.
+- No panics and no unchecked arithmetic in library code. Clippy runs
+  pedantic, with `unwrap_used`, `expect_used`, `panic`, `unreachable`,
+  `todo`, `unimplemented`, `indexing_slicing` and `float_arithmetic` (no
+  binary floating point) denied, and `arithmetic_side_effects` as a
+  warning, which `make lint` turns into an error. `unsafe` code is
+  forbidden. The few documented exceptions are `#[expect]`s with their
+  reason.
 
 See [docs/exact-arithmetic.md](docs/exact-arithmetic.md).
 
