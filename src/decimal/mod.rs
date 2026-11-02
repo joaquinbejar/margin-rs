@@ -146,6 +146,22 @@ pub(crate) fn sum_terms_round(
     round_ratio(sum, denominator, scale, rounding).ok_or_else(error)
 }
 
+/// Exact sum of any number of values. Partial sums are kept in wide
+/// integers, so only the final sum must be representable, whatever the
+/// order of the values.
+pub(crate) fn sum(values: &[Decimal], operation: &'static str) -> Result<Decimal> {
+    let error = || MarginError::arithmetic(operation);
+    let common = values.iter().map(Decimal::scale).max().unwrap_or(0);
+    let mut total = Wide::ZERO;
+    for value in values {
+        let (wide, scale) = Wide::from_decimal(*value);
+        total = total
+            .checked_add(wide.scale_up(common - scale).ok_or_else(error)?)
+            .ok_or_else(error)?;
+    }
+    total.to_decimal(common).ok_or_else(error)
+}
+
 /// Quadratic form `e' C e` where `e_i` is the exact sum of `groups[i]`,
 /// rounded once to `scale`. The sums stay in wide integers until the final
 /// rounding, so neither a partial sum nor a net `e_i` needs to be
@@ -601,6 +617,22 @@ mod tests {
             Err(MarginError::arithmetic("t"))
         );
         assert_eq!(product(&[], "t"), Ok(dec!(1)));
+    }
+
+    #[test]
+    fn exact_sum_in_any_order() {
+        for values in [
+            [Decimal::MAX, Decimal::MIN, dec!(0.5)],
+            [Decimal::MAX, dec!(0.5), Decimal::MIN],
+            [dec!(0.5), Decimal::MAX, Decimal::MIN],
+        ] {
+            assert_eq!(sum(&values, "t"), Ok(dec!(0.5)));
+        }
+        assert_eq!(
+            sum(&[Decimal::MAX, dec!(1)], "t"),
+            Err(MarginError::arithmetic("t"))
+        );
+        assert_eq!(sum(&[], "t"), Ok(Decimal::ZERO));
     }
 
     #[test]

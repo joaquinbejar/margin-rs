@@ -34,7 +34,7 @@ use std::collections::BTreeMap;
 
 use rust_decimal::Decimal;
 
-use crate::decimal::{Rounding, add, sub, sum_terms_round};
+use crate::decimal::{Rounding, add, sub, sum, sum_terms_round};
 use crate::error::{MarginError, Result};
 use crate::ids::Asset;
 use crate::ledger::LedgerSnapshot;
@@ -192,7 +192,7 @@ pub fn value_collateral(
 
     let mut lines = BTreeMap::new();
     let mut flags = BTreeMap::new();
-    let mut total = Some(Decimal::ZERO);
+    let mut line_values = Vec::new();
     for (asset, balance) in &snapshot.balances {
         let amount = match policy.basis {
             BalanceBasis::Available => balance.available,
@@ -261,10 +261,7 @@ pub fn value_collateral(
             Some(f) if f.is_empty() => Some(Decimal::ZERO),
             Some(f) => Some(floor(&[f.as_slice()], scale)?),
         };
-        total = match (total, value) {
-            (Some(t), Some(v)) => Some(add(t, v, "collateral total")?),
-            _ => None,
-        };
+        line_values.push(value);
         lines.insert(
             asset.clone(),
             CollateralLine {
@@ -282,8 +279,18 @@ pub fn value_collateral(
         as_of_ms: marks.as_of_ms,
         lines,
         flags,
-        total,
+        total: total_of(&line_values)?,
     })
+}
+
+/// Exact sum of the lines, independent of order (partial sums need not be
+/// representable); `None` if any line is unknown.
+fn total_of(lines: &[Option<Decimal>]) -> Result<Option<Decimal>> {
+    let known: Option<Vec<Decimal>> = lines.iter().copied().collect();
+    match known {
+        Some(values) => Ok(Some(sum(&values, "collateral total")?)),
+        None => Ok(None),
+    }
 }
 
 /// `sum(product(term))` rounded once toward negative infinity.
@@ -293,5 +300,26 @@ fn floor(terms: &[&[Decimal]], scale: u32) -> Result<Decimal> {
         Ok(away)
     } else {
         sum_terms_round(terms, scale, Rounding::TowardZero, "collateral line")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    /// MAX + (-MAX) + x sums to x in any order; an unknown line makes the
+    /// total unknown.
+    #[test]
+    fn total_is_an_exact_sum() {
+        for lines in [
+            [Some(Decimal::MAX), Some(Decimal::MIN), Some(dec!(12.5))],
+            [Some(Decimal::MAX), Some(dec!(12.5)), Some(Decimal::MIN)],
+            [Some(dec!(12.5)), Some(Decimal::MAX), Some(Decimal::MIN)],
+        ] {
+            assert_eq!(total_of(&lines), Ok(Some(dec!(12.5))));
+        }
+        assert_eq!(total_of(&[Some(dec!(1)), None]), Ok(None));
+        assert_eq!(total_of(&[]), Ok(Some(Decimal::ZERO)));
     }
 }
