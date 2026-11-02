@@ -8,6 +8,18 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Fees charged in the base asset in the risk gate** (#37):
+  `InstrumentLimits::fee_asset` (`FeeAsset::Quote` by default, or
+  `FeeAsset::Base`) declares where a venue charges fees, fixed per order
+  at admission. A sell with fees in base reserves its quantity plus
+  `round_up(max_fee_rate * lot)` per lot in base (twice the quantity when
+  the lot is the base grid). A buy with fees in base reserves the notional
+  only: the fill pays its fee from the base it credits, in the same
+  booking, so it never draws on base held for other orders.
+  `set_limits` refuses fees in base with `max_fee_rate >= 1`. A real fee
+  above the bound or in another asset is still booked from the free
+  balance, and an overdraft halts the gate.
+
 - **Margin for inverse futures and perpetuals** (#26, part B):
   `ProductKind::InverseFuture` / `ProductKind::InversePerpetual` and the
   rule `TieredInverseIm` (`inverse-im/1`: 10 % / 5 % of the notional
@@ -112,6 +124,9 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** `InstrumentLimits` has a new field, `fee_asset`: struct
+  literals that name every field must add it (`..Default::default()` is
+  unaffected) (#37).
 - **Breaking:** `ExposurePosition::multiplier` and
   `MarginInstrument::multiplier` are replaced by `size: ContractSize`,
   validated against the product. `PositionRequirement::notional` and

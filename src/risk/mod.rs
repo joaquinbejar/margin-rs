@@ -63,10 +63,19 @@
 //! # Reservation size
 //!
 //! Fixed per order at admission ([`ReservationTerms`]): a whole number of
-//! lots times a per lot bound. For buys the bound covers the quote debited
-//! by any fragmentation of the order at the limit price or better,
-//! including the per fill rounding of the notional and a fee of up to
-//! `max_fee_rate` rounded up; for sells it is the base quantity itself.
+//! lots times a per lot bound, in the asset the order pays. A fee is
+//! reserved in the asset it is charged in when the order pays that asset,
+//! and netted from the fill when the order receives it
+//! ([`InstrumentLimits::fee_asset`]):
+//!
+//! - buys reserve quote: the bound covers the quote debited by any
+//!   fragmentation of the order at the limit price or better, including the
+//!   per fill rounding of the notional and, for a fee in quote, a fee of up
+//!   to `max_fee_rate` rounded up. A fee in base is paid from the base the
+//!   fill credits, in the same booking, so nothing is reserved for it;
+//! - sells reserve base: the base quantity itself, plus, for a fee in base,
+//!   a fee of up to `max_fee_rate` of each lot rounded up. A fee in quote is
+//!   paid from the quote the fill credits.
 //!
 //! # Limits on joint exposure
 //!
@@ -98,7 +107,9 @@ pub use decision::{
     ExecutionAnomaly, FillReport, HaltReason, OrderPurpose, OrderRequest, RiskDecision, RiskReason,
 };
 
-use crate::decimal::{Rounding, add, check_scale, mul, mul_div_round, neg, sub, sum, sum_products};
+use crate::decimal::{
+    Rounding, add, check_scale, mul, mul_div_round, neg, sub, sum, sum_products, sum_terms_round,
+};
 use crate::direction::Dir;
 use crate::error::{MarginError, Result};
 use crate::ids::{Asset, InstrumentId, OrderId, ReservationId, TransferId};
@@ -107,6 +118,18 @@ use crate::ledger::{
     Action, Booking, Execution, ExpiryCashflow, ExpirySettlement, FundingCashflow, FundingPayment,
     Ledger, OverdraftBooking, PostingBooking,
 };
+
+/// The asset a venue charges the fees of an instrument in, for the risk
+/// gate's reservations. See [`InstrumentLimits::fee_asset`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum FeeAsset {
+    /// The quote asset. The default.
+    #[default]
+    Quote,
+    /// The base asset.
+    Base,
+}
 
 /// Hard limits for one instrument. `None` disables a limit.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -122,12 +145,27 @@ pub struct InstrumentLimits {
     pub max_open_orders: Option<usize>,
     /// Minimum order quantity; defaults to one lot (`10^-quantity_scale`).
     pub min_quantity: Option<Decimal>,
-    /// Highest fee rate the venue may charge on a buy, as a fraction (0.001
-    /// is 10 bp). Zero by default. The gate assumes that the fee of a fill is
-    /// at most `max_fee_rate` times the fill's booked notional, rounded up to
-    /// the quote grid, and charged in the quote asset. Fixed per order at
-    /// admission: later changes do not affect live orders.
+    /// Highest fee rate the venue may charge, as a fraction (0.001 is
+    /// 10 bp). Zero by default. The gate assumes that the fee of a fill is
+    /// charged in [`InstrumentLimits::fee_asset`] and is at most:
+    ///
+    /// - with [`FeeAsset::Quote`], `max_fee_rate` times the fill's booked
+    ///   notional, rounded up to the quote grid. It is reserved for buys;
+    ///   sells pay it from the quote they receive;
+    /// - with [`FeeAsset::Base`], `max_fee_rate` times the fill's quantity,
+    ///   rounded up to the base grid. It is reserved for sells, per lot:
+    ///   `lot + round_up(max_fee_rate * lot)`; buys pay it from the base
+    ///   they receive, so it must be below 1.
+    ///
+    /// Rounding up per fill makes a fine lot expensive: with a lot equal to
+    /// the base grid (1e-8 BTC on an 8 digit grid) and any positive rate,
+    /// every lot can be charged one more unit, so a sell reserves twice its
+    /// quantity (a venue fee rounding of its own is margin-rs#38). Fixed per
+    /// order at admission: later changes do not affect live orders.
     pub max_fee_rate: Decimal,
+    /// Asset fees are charged in. Quote by default. Fixed per order at
+    /// admission, like `max_fee_rate`.
+    pub fee_asset: FeeAsset,
     /// Maximum relative distance between the limit price and the last mark
     /// (0.05 is 5 %). Requires market data.
     pub price_band: Option<Decimal>,
@@ -158,6 +196,19 @@ impl InstrumentLimits {
                 "max_fee_rate",
                 "must not be negative",
             ));
+        }
+        match self.fee_asset {
+            FeeAsset::Quote => {}
+            // A buy pays a base fee from the base it receives: the fee must
+            // stay below the quantity.
+            FeeAsset::Base => {
+                if self.max_fee_rate >= Decimal::ONE {
+                    return Err(MarginError::invalid_input(
+                        "max_fee_rate",
+                        "must be below 1 for fees charged in the base asset",
+                    ));
+                }
+            }
         }
         if self.max_open_orders == Some(0) {
             return Err(MarginError::invalid_input(
@@ -214,11 +265,14 @@ impl OrderState {
 /// The reservation of `remaining` is `round_up(remaining / lot * per_lot)`
 /// on the asset grid:
 ///
-/// - sell: `per_lot = lot` of the base asset, so the reservation is the
-///   remaining quantity itself;
+/// - sell: `per_lot` of the base asset is `lot` with a fee in quote (the
+///   reservation is the remaining quantity itself), and
+///   `lot + round_up(r * lot)` with a fee in base, `r = max_fee_rate`;
 /// - buy: `per_lot` bounds the quote debited per lot by any fill at the
-///   limit price or better, whatever the fragmentation. It is the smaller
-///   of two valid bounds, with `x = price * lot` and `r = max_fee_rate`:
+///   limit price or better, whatever the fragmentation. With a fee in base
+///   the fee is paid from the base the fill credits and `r` is 0 here. It
+///   is the smaller of two valid bounds, with `x = price * lot` and
+///   `r = max_fee_rate`:
 ///   - `round_up(x) + round_up(r * round_up(x))`, on the grid (rounding up
 ///     is subadditive);
 ///   - `(1 + r) * (x + h) + (ulp if r > 0)`, exact, where `h` is the largest
@@ -851,16 +905,43 @@ impl RiskGate {
                 })
         };
         match Dir::from_action(side, "side")? {
-            Dir::Sell => Ok(ReservationTerms {
-                asset: spot.base().clone(),
-                scale: scale_of(spot.base())?,
-                lot,
-                per_lot: lot,
-            }),
+            Dir::Sell => {
+                let scale = scale_of(spot.base())?;
+                let per_lot = match limits.fee_asset {
+                    // The fee is paid from the quote the fill credits.
+                    FeeAsset::Quote => lot,
+                    // A fill of k lots is charged at most round_up(r * k *
+                    // lot) <= k * round_up(r * lot) (rounding up is
+                    // subadditive). The lot is on the base grid
+                    // (quantity_scale <= base scale), so this is also never
+                    // above the exact bound lot * (1 + r) + ulp:
+                    // round_up(r * lot) < r * lot + ulp.
+                    // As the lot is on the grid, lot + round_up(r * lot) is
+                    // round_up(lot + r * lot): one exact sum, rounded once.
+                    FeeAsset::Base => sum_terms_round(
+                        &[&[lot], &[limits.max_fee_rate, lot]],
+                        scale,
+                        Rounding::AwayFromZero,
+                        "lot + round up lot base fee",
+                    )?,
+                };
+                Ok(ReservationTerms {
+                    asset: spot.base().clone(),
+                    scale,
+                    lot,
+                    per_lot,
+                })
+            }
             Dir::Buy => {
                 let scale = scale_of(spot.quote())?;
                 let ulp = Decimal::new(1, scale);
-                let rate = limits.max_fee_rate;
+                // A fee in base is paid from the base the fill credits, in
+                // the same booking: the quote reservation covers the
+                // notional only.
+                let rate = match limits.fee_asset {
+                    FeeAsset::Quote => limits.max_fee_rate,
+                    FeeAsset::Base => Decimal::ZERO,
+                };
                 let up = |value: Decimal, op| {
                     mul_div_round(&[value], &[], scale, Rounding::AwayFromZero, op)
                 };
