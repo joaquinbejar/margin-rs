@@ -347,3 +347,22 @@ fn unrepresentable_covariance_is_invalid() {
         })
     );
 }
+
+/// M302-C3: many exposures net per factor first, so cost is linear in the
+/// number of exposures. 100000 exposures of +1 and -1 on two factors plus
+/// one of 1000 on A: net (1000, 0), variance 1000^2 * 0.0004 = 400.
+#[test]
+fn many_exposures_net_first() {
+    let cov = two_factor(dec!(0.5));
+    let mut exposures = Vec::with_capacity(100_001);
+    for i in 0..100_000 {
+        let factor = if i % 2 == 0 { "BTC" } else { "ETH" };
+        let sign = if (i / 2) % 2 == 0 { dec!(1) } else { dec!(-1) };
+        exposures.push(delta(factor, sign));
+    }
+    exposures.push(delta("BTC", dec!(1000)));
+    let result = portfolio_variance(&exposures, &cov, 6).expect("variance");
+    assert_eq!(result.net_exposures[&fid("BTC")], dec!(1000));
+    assert_eq!(result.net_exposures[&fid("ETH")], dec!(0));
+    assert_eq!(result.variance, dec!(400));
+}

@@ -32,7 +32,7 @@ The covariance is per horizon, in each factor's units. Cross-covariances, for ex
 
 ## Variance
 
-Exposures to the same factor net, so offsetting positions offset. The function computes `e' C e` exactly by expanding it over the exposures themselves, `sum over pairs (a, b) of e_a * e_b * C[f(a)][f(b)]`. The result is therefore independent of the order of the exposures, and partial sums never need to be representable. It rounds the result **up** once to `scale`. The reported net exposure per factor is an exact sum. Because `C` is positive semidefinite, the exact value is never negative, so the result is never negative either. A negative value would be reported as an error, never returned.
+Exposures to the same factor net, so offsetting positions offset. The net per factor is an exact sum in wide integers: it is independent of the order of the exposures, partial sums never need to be representable, and only the net itself must be. The function then computes `e' C e` over at most `n * n` terms, exactly, and rounds it **up** once to `scale`. Time is O(exposures) and memory is bounded by the number of factors. Because `C` is positive semidefinite, the exact value is never negative, so the result is never negative either. A negative value would be reported as an error, never returned.
 
 Scenario revaluation is a separate interface (`scenarios`, M2-08).
 

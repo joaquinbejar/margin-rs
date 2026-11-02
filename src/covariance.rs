@@ -237,30 +237,28 @@ pub fn portfolio_variance(
         slots.push(i);
     }
 
-    // e' C e expanded over the exposures themselves:
-    // sum over pairs (a, b) of e_a * e_b * C[f(a)][f(b)], exact and
-    // independent of the order, so partial net exposures never need to be
-    // representable. Rounded up once.
-    let mut terms: Vec<[Decimal; 3]> = Vec::with_capacity(exposures.len() * exposures.len());
-    for (a, ea) in exposures.iter().enumerate() {
-        for (b, eb) in exposures.iter().enumerate() {
-            terms.push([ea.amount, eb.amount, covariance.matrix[slots[a]][slots[b]]]);
+    // Net exposure per factor, summed exactly in wide integers: partial
+    // sums never need to be representable and the order does not matter.
+    // O(exposures) time, memory bounded by the number of factors.
+    let n = covariance.factors.len();
+    let mut per_factor: Vec<Vec<Decimal>> = vec![Vec::new(); n];
+    for (exposure, slot) in exposures.iter().zip(&slots) {
+        per_factor[*slot].push(exposure.amount);
+    }
+    let mut net = Vec::with_capacity(n);
+    for amounts in &per_factor {
+        net.push(sum(amounts, "net exposure")?);
+    }
+
+    // e' C e over at most n * n terms, exact, rounded up once.
+    let mut terms: Vec<[Decimal; 3]> = Vec::with_capacity(n * n);
+    for (i, ei) in net.iter().enumerate() {
+        for (j, ej) in net.iter().enumerate() {
+            terms.push([*ei, *ej, covariance.matrix[i][j]]);
         }
     }
     let slices: Vec<&[Decimal]> = terms.iter().map(|t| t.as_slice()).collect();
     let variance = sum_terms_round(&slices, scale, Rounding::AwayFromZero, "e' C e")?;
-
-    // Net exposure per factor, summed exactly.
-    let mut net = Vec::with_capacity(covariance.factors.len());
-    for i in 0..covariance.factors.len() {
-        let amounts: Vec<Decimal> = exposures
-            .iter()
-            .zip(&slots)
-            .filter(|(_, slot)| **slot == i)
-            .map(|(e, _)| e.amount)
-            .collect();
-        net.push(sum(&amounts, "net exposure")?);
-    }
     if variance < Decimal::ZERO {
         // Unreachable for a validated matrix; reported rather than hidden.
         return Err(MarginError::InvalidCovariance {
