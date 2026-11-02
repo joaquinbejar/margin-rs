@@ -740,45 +740,25 @@ mod edge_cases {
         );
     }
 
-    /// A step of 0.5 on `Decimal::MAX` contracts has more grid points
-    /// than a Decimal can count, and bisection midpoints above MAX / 2.
-    /// Notional 79228162514.264338 (basis equal, so upnl 0), mm 5 %; with
-    /// cash 2e9 the plan must close about MAX - 4e28 contracts.
-    ///
-    /// Here one step changes the excess by 2.5e-20 while the cash quantum
-    /// is 1e-6: rounding leaves about 1e14 counts whose outcome only an
-    /// exact evaluation can tell, more than the search budget. The plan
-    /// takes the first count certified to meet the target, reports
-    /// `minimal == false`, and stops within 6 quanta of the target.
+    /// A step of 0.5 on `Decimal::MAX` contracts: counts near MAX would have
+    /// 29 digits and a half, which no `Decimal` holds exactly, so the grid
+    /// is refused before anything is planned. A step of 2 fits (see the
+    /// exact minimum near `Decimal::MAX` in `tests/closeout_search.rs`).
     #[test]
-    fn half_steps_on_decimal_max_find_a_certified_count() {
+    fn half_steps_on_decimal_max_are_refused() {
         let mut target = policy(CloseoutTarget::Maintenance);
         target.fee_rate = Decimal::ZERO;
         target.contract_step = dec!(0.5);
         let account = tiny(Decimal::MAX, dec!(79228162514.264338), dec!(2000000000));
-        let result = plan(&account, &at_mark(Decimal::MAX), &target);
-        assert_eq!(result.before.collateral, dec!(2000000000));
-        assert_eq!(result.outcome, CloseoutOutcome::TargetMet);
-        assert!(!result.minimal);
-        let taken = result.reductions[0].contracts;
-        assert!(taken > dec!(39000000000000000000000000000));
-        assert!(taken < dec!(40000000000000000000000000000));
-        let excess = result.after.collateral - result.after.maintenance;
-        assert!(excess >= dec!(0));
-        assert!(excess < dec!(0.000006), "excess {excess}");
-        // With one count less of liquidity no count is certified, and the
-        // ambiguous counts exceed the budget: a typed error, no plan.
-        assert!(matches!(
-            plan_liquidation(&rule(), &account, &at_mark(taken - Decimal::ONE), &target),
-            Err(MarginError::CloseoutSearchLimit { level: 0, .. })
-        ));
+        assert_eq!(
+            plan_liquidation(&rule(), &account, &at_mark(Decimal::MAX), &target).map(|_| ()),
+            Err(MarginError::invalid_input(
+                "contract_step",
+                "some count below the cap is not exact at the step's scale"
+            ))
+        );
     }
 
-    /// Single tier: A long 10 at 110 marked
-    /// 100, B long 1 at 31 marked 100, cash 67: collateral 36 < mm 55.
-    /// Selling n of A at 99: cash 67 - 11.0495n, collateral 36 - 1.0495n,
-    /// mm 55 - 5n. The target holds for n in [5, 6]; closing all 10 would
-    /// leave a debt of 43.495.
     #[test]
     fn feasible_window_inside_the_level_flat_rule() {
         let account = LiquidationAccount {

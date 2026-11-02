@@ -148,7 +148,7 @@ The booked figures, however, are rounded: half-even fill value and released basi
    Both are intervals of the grid: the cash is linear and the excess concave, peaking at an end of the level or next to a tier floor. Their ends are found by exact bisection; a floor is crossed at `n = |Qc| - floor / (M * mark)`, or `|Qc| - floor * mark / CV`, kept in wide integers.
 3. **Walk.** The plan walks `J` upward, from its start to the start of `J'`, evaluating each count exactly as it would be booked, and takes the first that meets the target: the smallest on the level.
    - If `J` is empty, no count meets the target, and the plan takes the whole level.
-   - A count that would leave a position no `Decimal` can hold cannot be booked. The walk jumps over such counts to the next one that can be booked, arithmetically and without visiting them: one linear congruence per number of decimals the contracts left can have. For example, with `Decimal::MAX` contracts and a step of `1e-26`, only whole contracts can be booked, `1e26` steps apart.
+   - A count that would leave a position no `Decimal` can hold cannot be booked. The walk jumps over such counts to the next one that can be booked, arithmetically and without visiting them: one linear congruence per number of decimals the contracts left can have. For example, with `Decimal::MAX` contracts and a step of `1e-26` on a level of 100, only whole contracts can be booked, `1e26` steps apart.
 
 The walk is short when the quantum is fine against what one step changes: a few counts for real cash quanta. All levels of one call share a budget of `SEARCH_BUDGET` = 4096 exact evaluations, which costs a few tens of milliseconds in an optimized build. When the budget runs out:
 
@@ -159,7 +159,13 @@ The walk is short when the quantum is fine against what one step changes: a few 
 
 `tests/closeout_oracle.rs` checks the search against an exhaustive oracle that tries every count on the grid. It covers 19 200 cases: linear and inverse, with cash at 0, 1, 2 and 8 decimals, one to three levels (including levels where no count meets the target), one and two tiers, fees of 0 and 0.3 %, long and short positions, and cash swept across the target. The plan matches the oracle on every case. `tests/closeout_search.rs` names the two rounding windows (inverse and linear), the breakpoints whose numerator overflows a `Decimal`, and an exact minimum near `Decimal::MAX`.
 
-Counts sit on the `contract_step` grid. Grid indices are wide integers, so `k * step`, `ceil(available / step)` and the bisection midpoints never overflow, even for `Decimal::MAX` contracts with a step of 0.5. Near the limits of `Decimal`, a fractional count with too many digits is rounded down to the scale of the cap.
+Counts sit on the `contract_step` grid. Grid indices are wide integers, so `k * step`, `ceil(available / step)` and the bisection midpoints never overflow.
+
+Every count a level can take must be exact at the step's scale. That means every `k * step` below the level's size, or the position's size if smaller; the last count is the size itself, whether or not it is a multiple of the step. Otherwise `plan_liquidation` refuses the policy with `InvalidInput` for `contract_step`, before planning anything. The check is exact and immediate. With the step normalized (`m` is its smallest mantissa), it requires `(ceil(size / step) - 1) * m <= 2^96 - 1`: the last regular index times the mantissa. It is a sufficient condition, needing no product to be normalized. Counts are then exact multiples of the step, and grow with the index.
+
+At a step of 0.5, a size of 7922816251426433759354395034 is the largest accepted: its last regular count is `(2 * size - 1) * 5 = 2^96 - 1` units of 0.1.
+
+For example, a step of `1 + 1e-28` on 100 contracts is refused, because from 8 contracts on, `k * step` no longer fits a `Decimal`. A step of 0.5 on `Decimal::MAX` contracts is refused too. A step of 2 on `Decimal::MAX`, or of `1e-26` on 100, is accepted.
 
 ## Ledger round trip
 

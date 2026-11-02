@@ -162,7 +162,16 @@
 //!
 //! Counts live on the grid of [`LiquidationPolicy::contract_step`],
 //! indexed in wide integers, so no product of a step count or bisection
-//! midpoint can overflow.
+//! midpoint can overflow. Every count a level can take, `k * step` below
+//! the level's size (or the position's, if smaller), must be exact at the
+//! step's scale: [`plan_liquidation`] refuses the policy with
+//! [`MarginError::InvalidInput`] for `contract_step` before planning
+//! anything otherwise. The check is exact and immediate: with the step
+//! normalized (`m` its smallest mantissa), the last regular index,
+//! `ceil(size / step) - 1`, times `m` must not exceed `2^96 - 1`. It is a
+//! sufficient condition, needing no product to be normalized. So counts are
+//! exact multiples of the step, and grow with the index; the last count of
+//! a level is its size itself, a multiple of the step or not.
 
 use core::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -730,25 +739,24 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
         };
         // Only counts whose remaining position a Decimal can hold can be
         // booked; the walk jumps to them arithmetically.
-        let holding =
-            |from: GridIndex, to: GridIndex| grid.first_holding(size, (from, to), self.limit);
+        let limit = || MarginError::CloseoutSearchLimit {
+            instrument: exposure.instrument.clone(),
+            level,
+            limit: self.limit,
+        };
+        let holding = |from: GridIndex, to: GridIndex| grid.first_holding(size, (from, to));
         let certified = |k: GridIndex| certain.is_some_and(|(low, high)| low <= k && k <= high);
         let mut k = start;
         while let Some(next) = holding(k, end)? {
             k = next;
             let left = self.budget.get();
             if left == 0 {
-                let limit = MarginError::CloseoutSearchLimit {
-                    instrument: exposure.instrument.clone(),
-                    level,
-                    limit: self.limit,
-                };
                 // Every count of J' that can be booked meets the target.
                 let Some((low, high)) = certain else {
-                    return Err(limit);
+                    return Err(limit());
                 };
                 let Some(count) = holding(k.max(low), high)? else {
-                    return Err(limit);
+                    return Err(limit());
                 };
                 // Minimal when no count that can be booked lies between
                 // the last one evaluated and this one.
@@ -794,7 +802,7 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
         last: GridIndex,
         at: &dyn Fn(GridIndex) -> Result<(State, ForcedReduction, AccountSummary)>,
     ) -> Result<(State, ForcedReduction, AccountSummary)> {
-        if grid.first_holding(size, (last, last), 0)?.is_none() {
+        if grid.first_holding(size, (last, last))? != Some(last) {
             return Err(MarginError::invalid_input(
                 "liquidity",
                 "closing the whole level leaves a position no Decimal can hold",
@@ -1000,6 +1008,9 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
                     ));
                 }
                 check_scale(level.price, MAX_SCALE, "liquidity price")?;
+                // Every count the level can take must be exact at the step's
+                // scale; the largest cap a level can have is the position.
+                ContractGrid::new(policy.contract_step, level.contracts.min(contracts.abs()))?;
             }
             // Best level first: highest bid to sell a long, lowest ask to
             // buy back a short.
@@ -1028,7 +1039,9 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
 /// # Errors
 ///
 /// - [`MarginError::InvalidInput`] for an invalid policy (fee rate outside
-///   `[0, 1)`, non positive step), a basis missing for an open position,
+///   `[0, 1)`, non positive step, or a step whose multiples are not exact
+///   below a level's size: field `contract_step`), a basis missing for an
+///   open position,
 ///   given for a closed one, or of the opposite sign to the position,
 ///   repeated resting orders, or liquidity levels that are not positive or
 ///   not ordered from the best price.
@@ -1652,7 +1665,7 @@ mod tests {
     /// and the plan falls back to J'. With a step of 0.5 the first count of
     /// J' (9861932938915187.5) leaves 1e28 - n.5 contracts, which no
     /// `Decimal` holds: it cannot be booked, and the plan takes the next
-    /// count. At a step of 1e-12 the jump finds the same count; when no
+    /// count. At a step of 1e-11 the jump finds the same count; when no
     /// count of J' can be booked, the plan is refused.
     #[test]
     fn the_fallback_skips_counts_it_cannot_book() {
@@ -1676,11 +1689,14 @@ mod tests {
             }],
         )
         .unwrap();
+        // A level of 1e17 contracts: every count it allows is exact at the
+        // steps used here, but not the contracts left from 1e28.
+        let level_size = dec!(100000000000000000);
         let liquidity = BTreeMap::from([(
             iid("A"),
             vec![LiquidityLevel {
                 price,
-                contracts: held,
+                contracts: level_size,
             }],
         )]);
         let policy = |step| LiquidationPolicy {
@@ -1707,7 +1723,7 @@ mod tests {
                 basis: account.basis[&iid("A")],
             }],
         };
-        let grid = ContractGrid::new(dec!(0.5), held).unwrap();
+        let grid = ContractGrid::new(dec!(0.5), level_size).unwrap();
         let first = grid.next(GridIndex::ZERO).unwrap();
         let (_, certain) = planner
             .continuous(&state, 0, price)
@@ -1718,7 +1734,7 @@ mod tests {
         let start = grid.contracts(first_certified).unwrap();
         assert_eq!(start.fract(), dec!(0.5));
         assert_eq!(
-            grid.first_holding(held, (first_certified, first_certified), 0)
+            grid.first_holding(held, (first_certified, first_certified))
                 .unwrap(),
             None
         );
@@ -1728,14 +1744,14 @@ mod tests {
         assert_eq!(plan.reductions[0].contracts, start + dec!(0.5));
         assert_eq!(plan.outcome, CloseoutOutcome::TargetMet);
 
-        // At a step of 1e-12 the counts that can be booked are 1e12 steps
+        // At a step of 1e-11 the counts that can be booked are 1e11 steps
         // apart: the walk jumps to them arithmetically and finds the same
         // count, with no loop over the others.
         let fine = plan_with_budget(
             &model,
             &account,
             &liquidity,
-            &policy(dec!(0.000000000001)),
+            &policy(dec!(0.00000000001)),
             16,
         )
         .unwrap();

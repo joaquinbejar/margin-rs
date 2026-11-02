@@ -447,23 +447,27 @@ fn near_decimal_max_a_coarse_step_is_exact() {
 ///   level of either 100 or 2.5.
 /// - The short mirror, bought back at 1e-18: no count of the 100 meets the
 ///   target, and the plan takes the whole level.
+///
+/// At a step of 1.0000000000000000000000000001 the grid is refused instead:
+/// see `grids_with_inexact_counts_are_refused`.
 #[test]
 fn counts_that_cannot_be_booked_are_jumped_over() {
     let rule = TieredLinearIm::new(RuleId::new("coarse", 1), asset("USD"), 0, one_tier()).unwrap();
     let tiny = dec!(0.0000000000000000000000000001);
     let step = dec!(0.00000000000000000000000001);
     let cases = [
-        (Decimal::MAX, dec!(8), dec!(1), dec!(100), dec!(1)),
-        (Decimal::MAX, dec!(8), dec!(1), dec!(2.5), dec!(1)),
+        (Decimal::MAX, dec!(8), dec!(1), dec!(100), step, dec!(1)),
+        (Decimal::MAX, dec!(8), dec!(1), dec!(2.5), step, dec!(1)),
         (
             -Decimal::MAX,
             dec!(-8),
             dec!(0.000000000000000001),
             dec!(100),
+            step,
             dec!(100),
         ),
     ];
-    for (contracts, basis, price, cap, taken) in cases {
+    for (contracts, basis, price, cap, step, taken) in cases {
         let account = account(
             ProductKind::LinearPerpetual,
             &asset("USD"),
@@ -492,5 +496,57 @@ fn counts_that_cannot_be_booked_are_jumped_over() {
             CloseoutOutcome::LiquidityExhausted
         };
         assert_eq!(plan.outcome, expected);
+    }
+}
+
+/// A step whose multiples stop being exact below the level's size is
+/// refused before anything is planned, whatever the side, and whether or
+/// not the level is a multiple of the step: 1 + 1e-28 on 100 contracts
+/// (index 8 no longer fits), and 2e-21 on 2225678670.67026.
+#[test]
+fn grids_with_inexact_counts_are_refused() {
+    let rule = TieredLinearIm::new(RuleId::new("coarse", 1), asset("USD"), 0, one_tier()).unwrap();
+    let tiny = dec!(0.0000000000000000000000000001);
+    let refused = margin_rs::MarginError::invalid_input(
+        "contract_step",
+        "some count below the cap is not exact at the step's scale",
+    );
+    for (contracts, basis, step, cap) in [
+        (
+            Decimal::MAX,
+            dec!(8),
+            dec!(1.0000000000000000000000000001),
+            dec!(100),
+        ),
+        (
+            -Decimal::MAX,
+            dec!(-8),
+            dec!(1.0000000000000000000000000001),
+            dec!(100.5),
+        ),
+        (
+            dec!(2225678670.67026),
+            dec!(3),
+            dec!(0.000000000000000000002),
+            dec!(2225678670.67026),
+        ),
+    ] {
+        let account = account(
+            ProductKind::LinearPerpetual,
+            &asset("USD"),
+            (contracts, ContractSize::Multiplier(dec!(1)), tiny),
+            basis,
+            dec!(0),
+        );
+        assert_eq!(
+            plan_liquidation(
+                &rule,
+                &account,
+                &level(dec!(1), cap),
+                &policy(CloseoutTarget::Initial, step),
+            )
+            .map(|_| ()),
+            Err(refused.clone())
+        );
     }
 }

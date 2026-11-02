@@ -8,15 +8,21 @@
 //! midpoints of a bisection never overflow; only counts, which are at most
 //! `cap`, become `Decimal`s.
 //!
-//! Near the limits of `Decimal` a fractional count may have too many
-//! digits to be represented (for example `k * 0.5` close to
-//! `Decimal::MAX`). Such a count is rounded down to the scale of the cap,
-//! which keeps counts non decreasing in `k` and the remainder of an integer
-//! position representable.
+//! Every count below the cap must be exact at the step's scale. With the
+//! step normalized (`m` its smallest mantissa, at scale `s`), `k * step`
+//! has mantissa `k * m` at scale `s`, and the grid is refused when the
+//! largest index before the cap's, `last - 1`, gives `(last - 1) * m`
+//! above the largest `Decimal` mantissa, `2^96 - 1`. The cap's own index
+//! is the cap itself, already a `Decimal`. This is a sufficient condition:
+//! it holds for every count below the cap without normalizing any product.
+//! Counts are then exact multiples of the step, and increase with `k`.
 
 use rust_decimal::Decimal;
 
 use super::wide::{U768, Wide};
+
+/// The largest `Decimal` mantissa, `2^96 - 1`.
+const MAX_MANTISSA: u128 = (1 << 96) - 1;
 use super::wide_product;
 use crate::error::{MarginError, Result};
 
@@ -48,6 +54,10 @@ impl ContractGrid {
     /// # Errors
     ///
     /// [`MarginError::InvalidInput`] unless `step > 0` and `cap >= 0`.
+    ///
+    /// [`MarginError::InvalidInput`] for `contract_step` when some count
+    /// `k * step` below the cap is not exactly representable at the step's
+    /// scale (see the [module docs](self)).
     pub(crate) fn new(step: Decimal, cap: Decimal) -> Result<Self> {
         if step <= Decimal::ZERO || cap < Decimal::ZERO {
             return Err(MarginError::invalid_input(
@@ -56,6 +66,7 @@ impl ContractGrid {
             ));
         }
         let error = || MarginError::arithmetic("contract grid");
+        let step = step.normalize();
         // cap / step = (mc / 10^sc) / (ms / 10^ss) = mc * 10^ss / (ms * 10^sc).
         let numerator = magnitude(cap)
             .checked_mul(U768::pow10(step.scale()).ok_or_else(error)?)
@@ -69,6 +80,17 @@ impl ContractGrid {
         } else {
             quotient.checked_add(U768::from_u128(1)).ok_or_else(error)?
         };
+        // The largest index before the cap's, last - 1, has the largest
+        // regular count, with mantissa (last - 1) * m at the step's scale;
+        // every smaller one fits if it does.
+        let regular = last.checked_sub(U768::from_u128(1)).unwrap_or(U768::ZERO);
+        let largest = regular.checked_mul(magnitude(step)).ok_or_else(error)?;
+        if largest > U768::from_u128(MAX_MANTISSA) {
+            return Err(MarginError::invalid_input(
+                "contract_step",
+                "some count below the cap is not exact at the step's scale",
+            ));
+        }
         Ok(Self {
             step: magnitude(step),
             step_scale: step.scale(),
@@ -82,13 +104,12 @@ impl ContractGrid {
         GridIndex(self.last)
     }
 
-    /// `min(k * step, cap)` contracts, rounded down to the scale of the
-    /// cap when the exact count cannot be represented (see the
-    /// [module docs](self)).
+    /// `min(k * step, cap)` contracts, exact (see the [module docs](self)).
     ///
     /// # Errors
     ///
-    /// [`MarginError::Arithmetic`] only if even the rounded count cannot be
+    /// [`MarginError::Arithmetic`] if the count cannot be represented, which
+    /// [`ContractGrid::new`] rules out for every index of the grid; never
     /// represented.
     pub(crate) fn contracts(&self, index: GridIndex) -> Result<Decimal> {
         if index.0 >= self.last {
@@ -96,21 +117,8 @@ impl ContractGrid {
         }
         let error = || MarginError::arithmetic("k * step");
         let product = index.0.checked_mul(self.step).ok_or_else(error)?;
-        if let Some(exact) = Wide::new(false, product).to_decimal(self.step_scale) {
-            return Ok(exact);
-        }
-        let scale = self.cap.scale();
-        if scale >= self.step_scale {
-            return Err(error());
-        }
-        let (truncated, _) = product
-            .div_rem(
-                U768::pow10(self.step_scale.checked_sub(scale).ok_or_else(error)?)
-                    .ok_or_else(error)?,
-            )
-            .ok_or_else(error)?;
-        Wide::new(false, truncated)
-            .to_decimal(scale)
+        Wide::new(false, product)
+            .to_decimal(self.step_scale)
             .ok_or_else(error)
     }
 
@@ -170,26 +178,26 @@ impl ContractGrid {
     /// a `Decimal` can hold, when `held` contracts are reduced by it (the
     /// contracts left, `held - count`, are exact); `None` if there is none.
     ///
-    /// Found arithmetically, not by walking the grid. With `W` the larger of
-    /// the scales of `held` and the step, `R(k) = (held - k * step) * 10^W`
-    /// is an integer, and the contracts left can be held with `c`
-    /// decimals when `R(k) <= MAXM * 10^(W - c)` (they are small enough)
-    /// and `10^(W - c)` divides `R(k)` (they have at most `c` decimals),
-    /// for some `c <= W`. For each `c` the first condition holds from some
-    /// index on and the second is a linear congruence in `k`; the answer is
-    /// the smallest solution over every `c`. A candidate is confirmed with
-    /// the grid's actual count (which is rounded down near the limits of a
-    /// `Decimal`), and when that rounding makes it differ, at most
-    /// `fallback` further indices are checked one by one.
+    /// Found arithmetically, without walking the grid. Counts below the cap
+    /// are exact multiples of the step (see the [module docs](self)). With
+    /// `W` the larger of the scales of `held` and the step, `R(k) = (held -
+    /// k * step) * 10^W` is an integer, and the contracts left can be held
+    /// with `c` decimals when `R(k) <= MAXM * 10^(W - c)` (they are small
+    /// enough) and `10^(W - c)` divides `R(k)` (they have at most `c`
+    /// decimals), for some `c <= W`. For each `c` the first condition holds
+    /// from some index on and the second is a linear congruence in `k`; the
+    /// first such index is the smallest solution over every `c`. The last
+    /// index, the cap itself, is checked on its own.
     ///
     /// # Errors
     ///
-    /// [`MarginError::Arithmetic`] on an overflow of the wide integers.
+    /// [`MarginError::Arithmetic`] on an overflow of the wide integers, or
+    /// if the grid's count disagrees with the algebra (a defence: the
+    /// construction rules it out).
     pub(crate) fn first_holding(
         &self,
         held: Decimal,
         (from, to): (GridIndex, GridIndex),
-        fallback: u32,
     ) -> Result<Option<GridIndex>> {
         let holds = |k: GridIndex| -> Result<bool> {
             let count = self.contracts(k)?;
@@ -198,9 +206,31 @@ impl ContractGrid {
         if from > to {
             return Ok(None);
         }
-        if holds(from)? {
-            return Ok(Some(from));
+        let error = || MarginError::arithmetic("grid holding index");
+        let before_cap = self
+            .last
+            .checked_sub(U768::from_u128(1))
+            .unwrap_or(U768::ZERO);
+        let exact_to = to.0.min(before_cap);
+        if from.0 <= exact_to
+            && let Some(k) = self.first_holding_exact(held, (from.0, exact_to))?
+        {
+            if holds(GridIndex(k))? {
+                return Ok(Some(GridIndex(k)));
+            }
+            return Err(error());
         }
+        // The cap itself.
+        if to == self.last() && holds(to)? {
+            return Ok(Some(to));
+        }
+        Ok(None)
+    }
+
+    /// The first index in `[from, to]`, all of whose counts are exact
+    /// multiples of the step, that leaves contracts a `Decimal` can hold.
+    /// See [`ContractGrid::first_holding`].
+    fn first_holding_exact(&self, held: Decimal, (from, to): (U768, U768)) -> Result<Option<U768>> {
         let error = || MarginError::arithmetic("grid holding index");
         let held_scale = held.scale();
         let wide_scale = held_scale.max(self.step_scale);
@@ -222,7 +252,7 @@ impl ContractGrid {
                     .ok_or_else(error)?,
             )
             .ok_or_else(error)?;
-        let max_mantissa = U768::from_u128((1_u128 << 96) - 1);
+        let max_mantissa = U768::from_u128(MAX_MANTISSA);
         let mut best: Option<U768> = None;
         for decimals in 0..=wide_scale {
             let shift = wide_scale.checked_sub(decimals).ok_or_else(error)?;
@@ -235,8 +265,8 @@ impl ContractGrid {
                 Some(excess) if excess.is_zero() => U768::ZERO,
                 Some(excess) => ceil_div(excess, a).ok_or_else(error)?,
             };
-            let low = from_index.max(from.0);
-            if low > to.0 {
+            let low = from_index.max(from);
+            if low > to {
                 continue;
             }
             // At most `decimals` decimals: 10^shift divides q - k * a.
@@ -247,27 +277,13 @@ impl ContractGrid {
                 first_solution(a, q, modulus, low)?
             };
             if let Some(candidate) = candidate
-                && candidate <= to.0
+                && candidate <= to
                 && best.is_none_or(|b| candidate < b)
             {
                 best = Some(candidate);
             }
         }
-        let mut k = match best {
-            Some(k) => GridIndex(k),
-            // The last index is the cap itself, not a multiple of the step.
-            None => return Ok(holds(to)?.then_some(to)),
-        };
-        for _ in 0..=fallback {
-            if holds(k)? {
-                return Ok(Some(k));
-            }
-            match self.next(k) {
-                Some(next) if next <= to => k = next,
-                _ => break,
-            }
-        }
-        Ok(None)
+        Ok(best)
     }
 
     /// `index + 1`, if it is still on the grid.
@@ -403,20 +419,20 @@ mod tests {
     }
 
     /// `Decimal::MAX` with step 2: ceil(MAX / 2) * 2 exceeds MAX, but the last
-    /// count is the cap.
+    /// count is the cap, and the midpoint of 4e28 indices is about MAX / 2.
+    /// At a step of 0.5 the counts near MAX would not be exact: refused.
     #[test]
     fn huge_cap_and_tiny_step_do_not_overflow() {
         let grid = ContractGrid::new(dec!(2), Decimal::MAX).expect("grid");
         assert_eq!(grid.contracts(grid.last()).expect("count"), Decimal::MAX);
-        // MAX / 0.5 has more indices than a Decimal can count.
-        let grid = ContractGrid::new(dec!(0.5), Decimal::MAX).expect("grid");
         let middle = ContractGrid::midpoint(GridIndex::ZERO, grid.last());
         let count = grid.contracts(middle).expect("count");
         assert_eq!(count.scale(), 0);
-        assert!(count >= Decimal::MAX / dec!(2) - Decimal::ONE);
-        assert!(count <= Decimal::MAX / dec!(2) + Decimal::ONE);
+        assert!(count >= Decimal::MAX / dec!(2) - dec!(2));
+        assert!(count <= Decimal::MAX / dec!(2) + dec!(2));
         assert_eq!(grid.next(grid.last()), None);
         assert!(ContractGrid::adjacent(grid.last(), grid.last()));
+        assert!(ContractGrid::new(dec!(0.5), Decimal::MAX).is_err());
     }
 
     #[test]
@@ -474,20 +490,21 @@ mod tests {
     /// 9]`.
     #[test]
     fn first_holding_jumps_to_counts_that_fit() {
-        let grid = ContractGrid::new(dec!(0.1), Decimal::MAX).expect("grid");
+        let cap = dec!(1000000000000000000000000000);
+        let grid = ContractGrid::new(dec!(0.1), cap).expect("grid");
         assert_eq!(
-            grid.first_holding(Decimal::MAX, (index(1), grid.last()), 0)
+            grid.first_holding(Decimal::MAX, (index(1), grid.last()))
                 .expect("index"),
             Some(index(10))
         );
         assert_eq!(
-            grid.first_holding(Decimal::MAX, (index(1), index(9)), 0)
+            grid.first_holding(Decimal::MAX, (index(1), index(9)))
                 .expect("index"),
             None
         );
         let grid = ContractGrid::new(Decimal::new(1, 26), dec!(100)).expect("grid");
         let k = grid
-            .first_holding(Decimal::MAX, (index(1), grid.last()), 0)
+            .first_holding(Decimal::MAX, (index(1), grid.last()))
             .expect("index")
             .expect("a count");
         assert_eq!(grid.contracts(k).expect("count"), dec!(1));
@@ -502,15 +519,55 @@ mod tests {
         let held = dec!(1000000000000000000000000000.5);
         let grid = ContractGrid::new(dec!(0.25), dec!(10)).expect("grid");
         assert_eq!(
-            grid.first_holding(held, (index(1), grid.last()), 0)
+            grid.first_holding(held, (index(1), grid.last()))
                 .expect("index"),
             Some(index(2))
         );
         let grid = ContractGrid::new(dec!(0.5), dec!(10)).expect("grid");
         assert_eq!(
-            grid.first_holding(held, (index(1), grid.last()), 0)
+            grid.first_holding(held, (index(1), grid.last()))
                 .expect("index"),
             Some(index(1))
         );
+    }
+
+    /// A grid with a count below the cap that is not exact at the step's
+    /// scale is refused: 99 * (1 + 1e-28) on a cap of 100, 2e-21 on 2.2e9,
+    /// and 0.5 on `Decimal::MAX`. A step of 1e-26 on 100 (1e28 units) and
+    /// of 2 on `Decimal::MAX` fit, and so does a cap that is not a multiple
+    /// of the step (the last count is the cap itself). The step is
+    /// normalized (0.50 is 0.5).
+    #[test]
+    fn grids_with_inexact_counts_are_refused() {
+        let refused = MarginError::invalid_input(
+            "contract_step",
+            "some count below the cap is not exact at the step's scale",
+        );
+        for (step, cap) in [
+            (dec!(1.0000000000000000000000000001), dec!(100)),
+            (dec!(0.000000000000000000002), dec!(2225678670.67026)),
+            (dec!(0.5), Decimal::MAX),
+        ] {
+            assert_eq!(
+                ContractGrid::new(step, cap).map(|_| ()),
+                Err(refused.clone())
+            );
+        }
+        // At a step of 0.5 the cap 7922816251426433759354395034 is the
+        // largest admitted: its regular counts end at (2 * cap - 1) * 5 =
+        // MAX units of 0.1. One contract more is refused.
+        assert_eq!(
+            ContractGrid::new(dec!(0.5), dec!(7922816251426433759354395035)).map(|_| ()),
+            Err(refused.clone())
+        );
+        for (step, cap) in [
+            (Decimal::new(1, 26), dec!(100)),
+            (dec!(2), Decimal::MAX),
+            (dec!(0.3), dec!(10)),
+            (dec!(0.50), dec!(7922816251426433759354395034)),
+        ] {
+            let grid = ContractGrid::new(step, cap).expect("grid");
+            assert_eq!(grid.contracts(grid.last()).expect("cap"), cap);
+        }
     }
 }

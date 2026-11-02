@@ -34,8 +34,10 @@ follows [Semantic Versioning](https://semver.org/).
   plan. Beyond it the plan takes the first certified count and reports
   `LiquidationPlan::minimal == false`, or fails with
   `MarginError::CloseoutSearchLimit` when no count is certified.
-  Breakpoint numerators stay in wide integers. Checked against an
-  exhaustive oracle on 19 200 cases (`tests/closeout_oracle.rs`).
+  Counts that would leave a position no `Decimal` can hold are jumped
+  over arithmetically. Breakpoint numerators stay in wide integers.
+  Checked against an exhaustive oracle on 19 200 cases
+  (`tests/closeout_oracle.rs`).
 
 - **Margin for inverse futures and perpetuals** (#26, part B):
   `ProductKind::InverseFuture` / `ProductKind::InversePerpetual` and the
@@ -144,6 +146,11 @@ follows [Semantic Versioning](https://semver.org/).
 - **Breaking:** `InstrumentLimits` has a new field, `fee_asset`: struct
   literals that name every field must add it (`..Default::default()` is
   unaffected) (#37).
+- **Breaking:** `plan_liquidation` refuses, with `InvalidInput` for
+  `contract_step`, a step whose multiples below a level's size (or the
+  position's) are not exact at the step's scale, such as 0.5 on
+  `Decimal::MAX` contracts. Contract counts used to be rounded down there,
+  which made them stop growing with the index.
 - **Breaking:** `PiecewiseLinearMargin::notional_breakpoints` is replaced
   by `margin_tiers`, the tiers that give the unrounded margin exactly.
   `LiquidationPlan` has the new field `minimal`, and `plan_liquidation` can
