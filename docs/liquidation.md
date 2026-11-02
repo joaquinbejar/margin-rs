@@ -50,7 +50,7 @@ plan_liquidation(&model, &LiquidationAccount { view, basis, cash, resting_orders
 `model` implements `PiecewiseLinearMargin`, which every `TieredLinearIm` does. The trait's contract has three parts:
 
 - margins are additive across positions;
-- each position's IM and MM are convex, non-decreasing, piecewise linear functions of its notional, and the slope changes only at `notional_breakpoints` (the tier floors);
+- each position's IM and MM are convex, non-decreasing, piecewise linear functions of its notional, given exactly (before rounding) by `margin_tiers`;
 - every amount is rounded to `cash_scale`, which the plan uses as its cash quantum, so cash, PnL and margins always share one scale.
 
 Each open position needs a non-zero `basis` with the sign of the position.
@@ -107,6 +107,17 @@ Each open position needs a non-zero `basis` with the sign of the position.
 
 Marks stay those of the `ExposureView` for the whole plan. The scenario prices for the closeout are the liquidity levels.
 
+An **inverse** position (contract value `CV` in quote units, settled in the base, which is then the plan's currency, under `TieredInverseIm`) uses its value in the base:
+
+| Figure | Formula |
+|---|---|
+| basis | signed value in the base at entry prices (a long is positive) |
+| unrealized PnL | `basis - round_half_even(Qc * CV / mark, c)` |
+| fill value, `n` at `p` | `+round_half_even(n * CV / p, c)` when selling, negative when buying (`ForcedReduction::fill_cash`) |
+| released basis | as above |
+| realized PnL | `released - fill value` |
+| fee | `trunc(fee_rate * n * CV / p, c)`, in the base |
+
 ### Search within a level
 
 On one level, let `n` be the number of contracts closed.
@@ -114,30 +125,54 @@ On one level, let `n` be the number of contracts closed.
 - `cash(n)` is linear in `n`: the price, the released basis and the fee are all proportional to `n`.
 - `excess(n) = collateral(n) - margin(n)` is concave. Collateral is linear in `n`, and the margin is convex in the notional, which falls linearly in `n`.
 
-So `min(cash, excess)` is concave, and the counts that meet the target form an interval `[a, b]`. That interval need not reach the end of the level, because closing more can push cash below zero. The two cases below are both of this kind:
+Unrounded, `min(cash, excess)` is concave, and the counts that meet the target form an interval. That interval need not reach the end of the level, because closing more can push cash below zero. The two cases below are both of this kind:
 
 - two positions under a single-tier rule;
 - one position under two increasing tiers.
 
 In each, the plan must close 5 contracts. Closing all 10 would leave debt that could have been avoided.
 
-The plan finds `a` exactly, up to the rounding of single cash quanta, in three steps:
+The same holds for inverse positions. Their PnL is convex in the **price**, but within a level the price is fixed, so the fill value `n * CV / p`, the fee and the remaining notional `(|Qc| - n) * CV / mark` are linear in `n`.
 
-1. It evaluates the target exactly at the points where a concave piecewise linear function can peak:
-   - both ends of the level;
-   - the grid points on either side of each margin breakpoint;
-   - the grid points on either side of each sign change of `excess - cash` within a linear segment, found by bisecting on that sign.
-2. If none of these points meets the target, no count on the level does, and the plan takes the whole level.
-3. Otherwise it bisects between 0, which does not meet the target, and the smallest candidate that does. The result is a count that meets the target while the count one grid step below it does not.
+The booked figures, however, are rounded: half-even fill value and released basis, a truncated fee, and a margin rounded up. With a coarse cash quantum, rounding can open windows of counts that meet the target where the unrounded figures do not. For example, in BTC at whole units, a long of 13 inverse contracts meets the initial margin after closing 4, but not after 6, and only again at 13. The plan finds the smallest count that meets the target **as booked**, with a certified search.
 
-Counts sit on the `contract_step` grid. Grid indices are wide integers, so `k * step`, `ceil(available / step)` and the bisection midpoints never overflow, even for `Decimal::MAX` contracts with a step of 0.5. Near the limits of `Decimal`, a fractional count with too many digits is rounded down to the scale of the cap.
+1. **Error bounds.** With `q` the cash quantum:
+   - the booked cash differs from the unrounded one by less than `2q`: half a quantum for the fill value, half for the released basis, and under one for the fee;
+   - the booked excess differs by less than `3q`: half a quantum for the fill value, half for the remaining value, under one for the fee and under one for the margin. The released basis cancels.
+
+   Only the position being reduced changes; the others enter with their booked figures.
+2. **Exact bounds.** The unrounded cash and excess are evaluated exactly, in wide integers, from the contract terms and the rule's tiers (`PiecewiseLinearMargin::margin_tiers`), never from the rounded margin.
+   - `J = {cash >= -2q and excess >= -3q}` contains every count that meets the target.
+   - `J' = {cash >= 2q and excess >= 3q}` contains only counts that meet it.
+
+   Both are intervals of the grid: the cash is linear and the excess concave, peaking at an end of the level or next to a tier floor. Their ends are found by exact bisection; a floor is crossed at `n = |Qc| - floor / (M * mark)`, or `|Qc| - floor * mark / CV`, kept in wide integers.
+3. **Walk.** The plan walks `J` upward, from its start to the start of `J'`, evaluating each count exactly as it would be booked, and takes the first that meets the target: the smallest on the level.
+   - If `J` is empty, no count meets the target, and the plan takes the whole level.
+   - A count that would leave a position no `Decimal` can hold cannot be booked. The walk jumps over such counts to the next one that can be booked, arithmetically and without visiting them: one linear congruence per number of decimals the contracts left can have. For example, with `Decimal::MAX` contracts and a step of `1e-26` on a level of 100, only whole contracts can be booked, `1e26` steps apart.
+
+The walk is short when the quantum is fine against what one step changes: a few counts for real cash quanta. All levels of one call share a budget of `SEARCH_BUDGET` = 4096 exact evaluations, which costs a few tens of milliseconds in an optimized build. When the budget runs out:
+
+- **`J'` not empty.** The plan takes the first count of `J'` that can be booked, which meets the target, and reports `LiquidationPlan::minimal == false`.
+  - The count just before the start of `J'` is not certified: unrounded, its cash is below `2q` or its excess below `3q`. This bound is in money, not in contracts. With a step that changes almost nothing, the certified count can be many contracts above the smallest.
+  - Counts that cannot be booked (for example `1e28 - n.5` contracts) are jumped over as in the walk. If no count that can be booked lies between the last one evaluated and the certified one, the certified count is the smallest, and `minimal` stays true. The certified count is evaluated once more and must meet the target.
+- **Otherwise.** If `J'` is empty, or none of its counts can be booked, the plan fails with `CloseoutSearchLimit { instrument, level, limit }`, and nothing is planned.
+
+`tests/closeout_oracle.rs` checks the search against an exhaustive oracle that tries every count on the grid. It covers 19 200 cases: linear and inverse, with cash at 0, 1, 2 and 8 decimals, one to three levels (including levels where no count meets the target), one and two tiers, fees of 0 and 0.3 %, long and short positions, and cash swept across the target. The plan matches the oracle on every case. `tests/closeout_search.rs` names the two rounding windows (inverse and linear), the breakpoints whose numerator overflows a `Decimal`, and an exact minimum near `Decimal::MAX`.
+
+Counts sit on the `contract_step` grid. Grid indices are wide integers, so `k * step`, `ceil(available / step)` and the bisection midpoints never overflow.
+
+Every count a level can take must be exact at the step's scale. That means every `k * step` below the level's size, or the position's size if smaller; the last count is the size itself, whether or not it is a multiple of the step. Otherwise `plan_liquidation` refuses the policy with `InvalidInput` for `contract_step`, before planning anything. The check is exact and immediate. With the step normalized (`m` is its smallest mantissa), it requires `(ceil(size / step) - 1) * m <= 2^96 - 1`: the last regular index times the mantissa. It is a sufficient condition, needing no product to be normalized. Counts are then exact multiples of the step, and grow with the index.
+
+At a step of 0.5, a size of 7922816251426433759354395034 is the largest accepted: its last regular count is `(2 * size - 1) * 5 = 2^96 - 1` units of 0.1.
+
+For example, a step of `1 + 1e-28` on 100 contracts is refused, because from 8 contracts on, `k * step` no longer fits a `Decimal`. A step of 0.5 on `Decimal::MAX` contracts is refused too. A step of 2 on `Decimal::MAX`, or of `1e-26` on 100, is accepted.
 
 ## Ledger round trip
 
 When the futures and perpetuals are held in the margin-rs `Ledger`:
 
 1. `LiquidationAccount::from_ledger(model, snapshot, account, venue, currency, marks, as_of_ms)` builds the account. The caller sets `resting_orders` afterwards.
-   - **Positions.** Every open linear future and perpetual, with its contracts, the multiplier of the ledger's instrument and its instrument mark. The snapshot's instrument definitions are authoritative; marks never change them.
+   - **Positions.** Every open future and perpetual, linear or inverse, with its contracts, the contract size of the ledger's instrument (multiplier or contract value) and its instrument mark. An inverse plan's currency is the base asset. The snapshot's instrument definitions are authoritative; marks never change them.
    - **Basis.** Each position's cost basis. A basis of zero (an entry notional rounded to zero) is valid; a non zero basis must have the sign of the position.
    - **Cash.** The **total** balance of `currency`, reservations included: a closeout is not limited to the available part.
    - **Left out.** Spot holdings, in `currency` or any other asset, are not part of the plan. Flat and settled derivatives take no part.
@@ -150,7 +185,8 @@ The ledger books a derivative fill with the cash conventions above, so the booke
 - the fixture below (sell 3 at 94: cash 71.859, 7 contracts, basis 700);
 - a closeout into debt (cash -150.35, `overdrafts` equal to `plan.debt`);
 - half-quantum rounding at 2 decimals, long and short, with a partial close (released `rhe(100 / 3) = 33.33`) followed by a full close (the rest of the basis);
-- a basis of zero.
+- a basis of zero;
+- inverse closeouts in `tests/inverse_closeout.rs`, long and short (a long of 100 BTC-INV at 50000 marked at 45000 closes 30 at 44900 and 3 at 44500, leaving 67 contracts with basis 0.134 and cash 0.02240652 BTC).
 
 ## Ledger postings for positions outside the ledger
 

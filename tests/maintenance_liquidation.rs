@@ -740,35 +740,25 @@ mod edge_cases {
         );
     }
 
-    /// A step of 0.5 on `Decimal::MAX` contracts has more grid points
-    /// than a Decimal can count, and bisection midpoints above MAX / 2.
-    /// Notional 79228162514.264338 (basis equal, so upnl 0), mm 5 %; with
-    /// cash 2e9 the plan must close about MAX - 4e28 contracts, the
-    /// smallest count that meets the target.
+    /// A step of 0.5 on `Decimal::MAX` contracts: counts near MAX would have
+    /// 29 digits and a half, which no `Decimal` holds exactly, so the grid
+    /// is refused before anything is planned. A step of 2 fits (see the
+    /// exact minimum near `Decimal::MAX` in `tests/closeout_search.rs`).
     #[test]
-    fn half_steps_on_decimal_max_find_the_smallest_count() {
+    fn half_steps_on_decimal_max_are_refused() {
         let mut target = policy(CloseoutTarget::Maintenance);
         target.fee_rate = Decimal::ZERO;
         target.contract_step = dec!(0.5);
         let account = tiny(Decimal::MAX, dec!(79228162514.264338), dec!(2000000000));
-        let result = plan(&account, &at_mark(Decimal::MAX), &target);
-        assert_eq!(result.before.collateral, dec!(2000000000));
-        assert_eq!(result.outcome, CloseoutOutcome::TargetMet);
-        let taken = result.reductions[0].contracts;
-        assert!(taken > dec!(39000000000000000000000000000));
-        assert!(taken < dec!(40000000000000000000000000000));
-        assert!(result.after.collateral >= result.after.maintenance);
-        // One count less on the grid (rounded to an integer at this size)
-        // does not meet the target.
-        let short = plan(&account, &at_mark(taken - Decimal::ONE), &target);
-        assert_eq!(short.outcome, CloseoutOutcome::LiquidityExhausted);
+        assert_eq!(
+            plan_liquidation(&rule(), &account, &at_mark(Decimal::MAX), &target).map(|_| ()),
+            Err(MarginError::invalid_input(
+                "contract_step",
+                "some count below the cap is not exact at the step's scale"
+            ))
+        );
     }
 
-    /// Single tier: A long 10 at 110 marked
-    /// 100, B long 1 at 31 marked 100, cash 67: collateral 36 < mm 55.
-    /// Selling n of A at 99: cash 67 - 11.0495n, collateral 36 - 1.0495n,
-    /// mm 55 - 5n. The target holds for n in [5, 6]; closing all 10 would
-    /// leave a debt of 43.495.
     #[test]
     fn feasible_window_inside_the_level_flat_rule() {
         let account = LiquidationAccount {

@@ -162,7 +162,7 @@ Booking, funding, expiry, late fills, ids and mandatory cash follow the linear r
 
 `PositionSnapshot::size` and `DerivativeFill::size` give the `ContractSize`: `Multiplier(M)` (1 for spot) or `ContractValue(CV)`.
 
-Margin reservations margin and value inverse positions with an inverse rule (`TieredInverseIm`, see `docs/initial-margin.md`). Until the closeout plans cover them, `LiquidationAccount::from_ledger`, `plan_liquidation`, the stress scenarios and the risk gate refuse an open inverse position with `UnsupportedInstrument`, never skipping it.
+Margin reservations margin and value inverse positions with an inverse rule (`TieredInverseIm`, see `docs/initial-margin.md`), and `LiquidationAccount::from_ledger` and `plan_liquidation` close them out (see `docs/liquidation.md`). The stress scenarios and the risk gate refuse an open inverse position with `UnsupportedInstrument`, never skipping it.
 
 `valuation::value` and `collateral::value_collateral` value open derivative positions at instrument marks (see `docs/valuation.md`); the stress scenarios shock instrument marks and book hypothetical derivative fills with the rules above. The risk gate handles spot orders only and refuses a derivative with `UnsupportedInstrument` at every entry point.
 

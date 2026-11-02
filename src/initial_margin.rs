@@ -220,14 +220,17 @@ pub trait InitialMarginModel {
 /// - a position's initial and maintenance margin are, up to the final
 ///   rounding to [`PiecewiseLinearMargin::cash_scale`], continuous, convex,
 ///   non decreasing and piecewise linear functions of its notional (see
-///   the [module docs](self#notional)), with slope changes only at
-///   [`PiecewiseLinearMargin::notional_breakpoints`].
+///   the [module docs](self#notional)), given exactly by
+///   [`PiecewiseLinearMargin::margin_tiers`]: before the final rounding,
+///   each margin is `sum over tiers k of rate_k * slice_k` with
+///   `slice_k = max(0, min(notional, floor_{k+1}) - floor_k)`.
 pub trait PiecewiseLinearMargin: InitialMarginModel {
     /// Number of decimals every requirement is rounded to: the cash
     /// quantum of the rule's currency.
     fn cash_scale(&self) -> u32;
 
-    /// Notionals at which the margin of `position` changes slope,
-    /// ascending and positive; empty for a single linear rate.
-    fn notional_breakpoints(&self, position: &ExposurePosition) -> Vec<Decimal>;
+    /// The tiers that define the margins of `position` before rounding:
+    /// floors ascending from 0, with rates that never decrease. The
+    /// closeout planner reads the exact, unrounded margin from them.
+    fn margin_tiers(&self, position: &ExposurePosition) -> Vec<crate::rules::MarginTier>;
 }

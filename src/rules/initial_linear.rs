@@ -172,16 +172,16 @@ impl TieredLinearIm {
     }
 }
 
-/// The tier floors above 0. Rates never decrease from one tier to the
-/// next ([`TieredLinearIm::new`] rejects such a table), so each margin is
-/// convex in the notional.
+/// The rule's tier table. Rates never decrease from one tier to the next
+/// ([`TieredLinearIm::new`] rejects such a table), so each margin is convex
+/// in the notional.
 impl PiecewiseLinearMargin for TieredLinearIm {
     fn cash_scale(&self) -> u32 {
         self.scale
     }
 
-    fn notional_breakpoints(&self, _position: &ExposurePosition) -> Vec<Decimal> {
-        self.tiers.iter().skip(1).map(|tier| tier.floor).collect()
+    fn margin_tiers(&self, _position: &ExposurePosition) -> Vec<MarginTier> {
+        self.tiers.clone()
     }
 }
 
