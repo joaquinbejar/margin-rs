@@ -3,10 +3,6 @@ debug/
 target/
 **/target/
 
-# Library crate: Cargo.lock is not committed
-Cargo.lock
-**/Cargo.lock
-
 # rustfmt backups
 **/*.rs.bk
 

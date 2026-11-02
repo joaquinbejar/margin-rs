@@ -6,7 +6,10 @@
 //! add variants without a breaking change, and callers must keep a wildcard
 //! arm.
 
+use rust_decimal::Decimal;
 use thiserror::Error;
+
+use crate::ids::{Asset, InstrumentId};
 
 /// Result alias used by every fallible function in this crate.
 pub type Result<T> = core::result::Result<T, MarginError>;
@@ -36,6 +39,105 @@ pub enum MarginError {
     Arithmetic {
         /// Operation that failed, for example `"cash + fee"`.
         operation: &'static str,
+    },
+
+    /// A value has more fractional digits than allowed.
+    ///
+    /// Inputs are never truncated: a price, quantity or amount finer than
+    /// its instrument or asset precision is rejected.
+    #[error("`{field}` has {scale} fractional digits, at most {max_scale} allowed")]
+    PrecisionExceeded {
+        /// Name of the offending input.
+        field: &'static str,
+        /// Significant fractional digits of the value.
+        scale: u32,
+        /// Maximum allowed.
+        max_scale: u32,
+    },
+
+    /// The asset is not registered in the ledger.
+    #[error("unknown asset {asset}")]
+    UnknownAsset {
+        /// Asset code.
+        asset: Asset,
+    },
+
+    /// The instrument is not registered in the ledger.
+    #[error("unknown instrument {instrument}")]
+    UnknownInstrument {
+        /// Instrument identifier.
+        instrument: InstrumentId,
+    },
+
+    /// An asset or instrument is already registered with a different
+    /// definition.
+    #[error("{kind} {id} is already registered with a different definition")]
+    AlreadyRegistered {
+        /// `"asset"` or `"instrument"`.
+        kind: &'static str,
+        /// Identifier.
+        id: String,
+    },
+
+    /// An identifier was already used for an entry with different content.
+    ///
+    /// Repeating an identical entry is not an error: it is ignored, which
+    /// makes booking idempotent.
+    #[error("{kind} {id} already exists with different content")]
+    ConflictingEntry {
+        /// `"execution"`, `"transfer"` or `"reservation"`.
+        kind: &'static str,
+        /// Identifier.
+        id: String,
+    },
+
+    /// No open reservation has this identifier.
+    #[error("unknown reservation {id}")]
+    UnknownReservation {
+        /// Identifier.
+        id: String,
+    },
+
+    /// The operation would leave the available balance of an asset
+    /// negative.
+    #[error("insufficient {asset}: {required} required, {available} available")]
+    InsufficientBalance {
+        /// Asset debited.
+        asset: Asset,
+        /// Amount the operation debits.
+        required: Decimal,
+        /// Available balance before the operation.
+        available: Decimal,
+    },
+
+    /// An open position has no mark price.
+    #[error("missing mark price for {instrument}")]
+    MissingMark {
+        /// Instrument identifier.
+        instrument: InstrumentId,
+    },
+
+    /// A conversion between two assets has no rate.
+    #[error("missing conversion rate from {from} to {to}")]
+    MissingConversionRate {
+        /// Source asset.
+        from: Asset,
+        /// Target asset.
+        to: Asset,
+    },
+
+    /// A reconciliation check failed: stored state differs from the state
+    /// recomputed from the journal.
+    #[error("reconciliation failed: {check} for {key}: expected {expected}, found {actual}")]
+    ReconciliationMismatch {
+        /// Name of the check.
+        check: &'static str,
+        /// Asset or instrument checked.
+        key: String,
+        /// Value recomputed from the journal.
+        expected: Decimal,
+        /// Value stored in the ledger.
+        actual: Decimal,
     },
 }
 

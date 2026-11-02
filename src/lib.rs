@@ -5,9 +5,14 @@
 //!
 //! ## Status
 //!
-//! Bootstrap only. The crate currently exports the typed error boundary,
-//! [`MarginError`] and the [`Result`] alias. It does not yet implement a
-//! ledger, pretrade risk checks or any margin model.
+//! - [`ledger`]: the single accounting authority for one account. Spot
+//!   instruments, available and reserved balances per asset, positions with
+//!   signed average cost, fees per asset, idempotent booking by execution
+//!   identifier, per execution cashflow reconciliation, snapshots and an
+//!   explicit mark to market policy.
+//! - [`MarginError`] and [`Result`]: the typed error boundary.
+//!
+//! Pretrade risk checks and margin models are not implemented yet.
 //!
 //! ## Policies
 //!
@@ -15,8 +20,9 @@
 //! - Small default dependency set; the crate never depends on
 //!   market-maker-rs or tessera-rl (they depend on it).
 //! - No binary floating point arithmetic: the `clippy::float_arithmetic`
-//!   lint is denied crate wide, and money, prices and quantities will use
-//!   exact decimals with checked operations.
+//!   lint is denied crate wide. Money, prices and quantities are
+//!   [`Decimal`]s; every operation is checked and exact, and the few
+//!   rounding steps are explicit (see [`decimal`]).
 //! - No `unsafe` code.
 //!
 //! ## Example
@@ -42,9 +48,17 @@
 //! );
 //! ```
 
+pub mod decimal;
 pub mod error;
+pub mod ids;
+pub mod instrument;
+pub mod ledger;
 
+pub use decimal::Rounding;
 pub use error::{MarginError, Result};
+pub use ids::{Asset, ExecutionId, InstrumentId, ReservationId, TransferId};
+pub use instrument::{Instrument, SpotInstrument};
+pub use rust_decimal::Decimal;
 
 // Compiles and runs the Rust examples in README.md as doctests, so the README
 // cannot drift from the exported API.
