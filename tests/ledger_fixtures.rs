@@ -983,3 +983,34 @@ fn set_reservation_is_atomic_even_when_overdrawn() {
     assert_eq!(ledger.balance(&usdc).expect("balance").reserved, dec!(0));
     ledger.reconcile().expect("reconciles");
 }
+
+/// A balance whose `total - reserved` cannot be represented is refused when
+/// it is booked, with the ledger unchanged; reading balances never does
+/// arithmetic.
+#[test]
+fn test_reserve_unrepresentable_available_is_arithmetic_error() {
+    let mut ledger = Ledger::new(LedgerConfig {
+        rounding: Rounding::HalfEven,
+    });
+    let usd = asset("USD");
+    ledger.register_asset(usd.clone(), 1).expect("register");
+    ledger
+        .deposit(tid("d1"), usd.clone(), Decimal::MAX)
+        .expect("deposit");
+    let before = ledger.snapshot();
+
+    // MAX - 0.1 needs 29 digits: it is not a Decimal.
+    let hold = ReservationId::new("r1").expect("id");
+    assert!(matches!(
+        ledger.reserve(hold, usd.clone(), dec!(0.1)),
+        Err(MarginError::Arithmetic { .. })
+    ));
+    assert_eq!(ledger.snapshot(), before);
+    let balance = ledger.balance(&usd).expect("balance");
+    assert_eq!(
+        (balance.total, balance.reserved, balance.available),
+        (Decimal::MAX, dec!(0), Decimal::MAX)
+    );
+    assert!(ledger.overdrafts().is_empty());
+    ledger.reconcile().expect("reconciles");
+}
