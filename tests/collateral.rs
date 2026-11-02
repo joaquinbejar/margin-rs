@@ -311,7 +311,7 @@ fn policy_validation() {
     );
 }
 
-/// M303A-C1: the total is the exact sum of the rounded lines, whatever the
+/// The total is the exact sum of the rounded lines, whatever the
 /// asset names and their order.
 ///
 /// Balances MAX, 0.1 and MIN (a debt), all at a fresh mark of 1 with no

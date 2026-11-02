@@ -697,10 +697,10 @@ mod plan {
     }
 }
 
-/// Review round 2: C1 (step arithmetic near the Decimal limits),
-/// C2 (the feasible counts on a level are an interval that need not reach
-/// its end) and n1 (basis sign).
-mod review {
+/// Edge cases: step arithmetic near the Decimal limits, the feasible
+/// counts on a level as an interval that need not reach its end, and the
+/// sign of the basis.
+mod edge_cases {
     use super::*;
 
     fn tiny(contracts: Decimal, basis: Decimal, cash: Decimal) -> LiquidationAccount {
@@ -720,7 +720,7 @@ mod review {
         bids(&[(dec!(0.000000000000000001), contracts)])
     }
 
-    /// C1: closing `Decimal::MAX` contracts with a step of 2 used to compute
+    /// Closing `Decimal::MAX` contracts with a step of 2 used to compute
     /// ceil(MAX / 2) * 2 and overflow; the last count is the cap.
     #[test]
     fn step_two_closes_decimal_max() {
@@ -740,7 +740,7 @@ mod review {
         );
     }
 
-    /// C1: a step of 0.5 on `Decimal::MAX` contracts has more grid points
+    /// A step of 0.5 on `Decimal::MAX` contracts has more grid points
     /// than a Decimal can count, and bisection midpoints above MAX / 2.
     /// Notional 79228162514.264338 (basis equal, so upnl 0), mm 5 %; with
     /// cash 2e9 the plan must close about MAX - 4e28 contracts, the
@@ -764,7 +764,7 @@ mod review {
         assert_eq!(short.outcome, CloseoutOutcome::LiquidityExhausted);
     }
 
-    /// C2 (single tier): A long 10 at 110 marked
+    /// Single tier: A long 10 at 110 marked
     /// 100, B long 1 at 31 marked 100, cash 67: collateral 36 < mm 55.
     /// Selling n of A at 99: cash 67 - 11.0495n, collateral 36 - 1.0495n,
     /// mm 55 - 5n. The target holds for n in [5, 6]; closing all 10 would
@@ -798,7 +798,7 @@ mod review {
         assert_eq!(plan.debt, dec!(0));
     }
 
-    /// C2 (two tiers): rates 10 % below a notional of 500 and 90 %
+    /// Two tiers: rates 10 % below a notional of 500 and 90 %
     /// above. Long 10 at 100 marked 100, cash 140, bid 85: closing 4 gives
     /// collateral 80 < mm 140, closing 5 gives 65 >= 50.
     #[test]
@@ -840,7 +840,7 @@ mod review {
         assert_eq!(plan.debt, dec!(0));
     }
 
-    /// n1: a non zero basis must have the sign of the position. A basis
+    /// A non zero basis must have the sign of the position. A basis
     /// of zero (an entry notional rounded to zero) is valid.
     #[test]
     fn basis_sign_must_match_the_position() {

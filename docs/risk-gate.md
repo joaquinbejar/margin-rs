@@ -64,7 +64,7 @@ The reservation for `remaining` is `round_up(remaining / lot * per_lot)` on the 
 
 - **Sell.** With fees in quote, `per_lot = lot` of the base asset, so the reservation is the remaining quantity itself; the fee is paid from the proceeds. With fees in base, `per_lot = lot + round_up(r * lot)` on the base grid, `r = max_fee_rate`, assuming that a fill's fee is at most `r` times its quantity, rounded up to the base grid. A fill of `k` lots is charged at most `round_up(r * k * lot) <= k * round_up(r * lot)`, because rounding up is subadditive. The lot is on the base grid (quantity scale at most the base scale), so this single bound is never above the exact one, `lot * (1 + r) + ulp`.
   - **Cost on a fine lot.** When the lot is the base grid itself (1e-8 BTC on an 8 digit grid), any positive rate rounds up to one unit per lot, so `per_lot = 2 * lot`: a sell of 2 BTC reserves 4 BTC. That is the worst case of the round up fee model (every one lot fill charged one unit). A venue that rounds its fee to nearest or toward zero needs a fee rounding of its own; that is not modelled yet (#38).
-- **Buy.** `per_lot` bounds the quote that one lot can cost in **any** fill at the limit price or better, however the order is fragmented (M105-1). With `x = price * lot` and `r = max_fee_rate`, it is the smaller of two valid bounds:
+- **Buy.** `per_lot` bounds the quote that one lot can cost in **any** fill at the limit price or better, however the order is fragmented. With `x = price * lot` and `r = max_fee_rate`, it is the smaller of two valid bounds:
   - `round_up(x) + round_up(r * round_up(x))`, on the grid, valid because rounding up is subadditive;
   - `(1 + r) * (x + h) + (one ulp if r > 0)`, exact, where `h` is the largest error of the ledger's notional rounding: half an ulp for the half modes, 0 toward zero, one ulp away from zero.
 
@@ -83,7 +83,7 @@ The lifecycle changes the reservation as follows:
 | `request_cancel` | **unchanged**; the order may still fill until the venue confirms |
 | `on_cancel_confirmed` | the rest is released; repeated or late confirmations release 0 |
 | `on_venue_rejected` | the rest is released (only before any fill) |
-| `on_fill` on a canceled or filled order (late report) | none left: booked against the free balance (M105-2) |
+| `on_fill` on a canceled or filled order (late report) | none left: booked against the free balance |
 
 ### Fill reports: a real execution is never lost
 

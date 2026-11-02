@@ -687,7 +687,7 @@ fn registration_rules() {
     );
 }
 
-/// M104-1: a deposit whose sum `rust_decimal` would round is rejected and
+/// A deposit whose sum `rust_decimal` would round is rejected and
 /// leaves the balance unchanged, in both orders.
 #[test]
 fn deposits_that_would_lose_digits_are_rejected() {
@@ -707,7 +707,7 @@ fn deposits_that_would_lose_digits_are_rejected() {
     }
 }
 
-/// M104-2: the cost released by a partial close is rounded once from the
+/// The cost released by a partial close is rounded once from the
 /// exact ratio.
 ///
 /// Quote scale 18, base scale 0, price scale 18. Buy 2e18 units at 1e-18
@@ -743,7 +743,7 @@ fn partial_close_releases_cost_rounded_once() {
     ledger.reconcile().expect("reconciles");
 }
 
-/// M104-4: an 18/18 position (ETH quantity scale 18 against DAI scale 18)
+/// An 18/18 position (ETH quantity scale 18 against DAI scale 18)
 /// can be opened, reduced and valued, with price scales 2 and 18.
 ///
 /// Buy 1.123456789012345678 ETH at 3000.12: notional 3370.505181851718515481

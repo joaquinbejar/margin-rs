@@ -151,7 +151,7 @@ mod tests {
         }
     }
 
-    /// M104-3: the conversion is exact before its single rounding.
+    /// The conversion is exact before its single rounding.
     /// A = MAX, B = 0.1, USD = -MAX at rate 1 sum to 0.1, not 0.
     #[test]
     fn net_in_is_exact_before_rounding() {

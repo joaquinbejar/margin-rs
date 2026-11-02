@@ -158,7 +158,7 @@ fn two_orders_cannot_spend_the_same_balance() {
 /// 99 arrives: cash 1000 - 198 = 802, reservation 3 * 100 = 300. The cancel
 /// is confirmed: 300 released, 802 available.
 ///
-/// M105-2: a fill of 1 at 99 reported after the confirmation (cumulative
+/// A fill of 1 at 99 reported after the confirmation (cumulative
 /// 3) already happened at the venue: it is booked against the free
 /// balance (802 - 99 = 703). Its duplicate changes nothing; an
 /// inconsistent cumulative quantity or more than the canceled 2 is
@@ -322,7 +322,7 @@ fn partial_fill_adjusts_the_reservation_exactly_once() {
     gate.ledger().reconcile().expect("reconciles");
 }
 
-/// M105-1: the buy reservation covers any fragmentation of the order.
+/// The buy reservation covers any fragmentation of the order.
 ///
 /// Lot 1e-8 at 150.01 costs 1.5001e-6, booked as 2e-6 on the 6 digit
 /// grid, so each lot reserves 2e-6. With 5e-6 USDC a buy of 3 lots
@@ -368,7 +368,7 @@ fn reservation_covers_single_lot_fills() {
     gate.ledger().reconcile().expect("reconciles");
 }
 
-/// M105-1: mixed fill sizes with no free balance.
+/// Mixed fill sizes with no free balance.
 ///
 /// 1e-5 USDC, buy 5 lots at 150.01: reserved 5 * 2e-6 = 1e-5, nothing
 /// free. Fills of 2, 1 and 2 lots debit 3e-6, 2e-6 and 3e-6 (the
@@ -433,7 +433,7 @@ fn reservation_includes_the_rounded_up_fee_per_lot() {
     assert_eq!(terms.per_lot, dec!(0.000003));
 }
 
-/// M105-3: the reservation terms are fixed when an order is admitted.
+/// The reservation terms are fixed when an order is admitted.
 ///
 /// Lot 0.01. 110 USDC, fee bound 10 %: a buy of 1 at 100 reserves
 /// 100 lots times 1.1, that is 110. Lowering the bound to 0 does not free the fee buffer:
