@@ -1,4 +1,6 @@
-//! Linear futures and perpetuals held in the ledger.
+//! Linear and inverse futures and perpetuals held in the ledger.
+//!
+//! # Linear contracts
 //!
 //! A position is signed contracts `Q` with a signed **basis**: the cash value
 //! of the open contracts at their entry prices, in the settlement asset (a
@@ -19,6 +21,33 @@
 //! (realized PnL, basis, cash) must fit a `Decimal`. Every execution is
 //! mandatory: it is booked even when it overdraws the account
 //! ([`Ledger::book_execution_allowing_overdraft`](crate::ledger::Ledger::book_execution_allowing_overdraft)).
+//!
+//! # Inverse contracts
+//!
+//! An inverse contract settles in the base asset: with contract value `CV`
+//! (quote units per contract), base scale `c` and prices in the quote
+//! currency of `CV`, a fill of `n` contracts at `p` has the virtual value
+//! `V = rhe(n * CV / p)` in the base. The basis is the signed value at entry
+//! prices (a long has a positive basis) and evolves exactly as above with
+//! `V` in place of `N`; the realized PnL has the opposite sign, because a
+//! long gains when its value in the base falls:
+//!
+//! | Fill of `n` contracts at `p` | Effect |
+//! |---|---|
+//! | open or increase | `basis += V` for a buy, `-V` for a sell |
+//! | reduce, `n <= abs(Q)` | `released = rhe(basis * n / abs(Q))` (all of it on a full close); realized `= released - V` for a sell (a long), `released + V` for a buy (a short) |
+//! | cross zero, `n > abs(Q)` | `C = rhe(abs(Q) * CV / p)`, `O = V - C` exactly; realized `= basis - C` (sell) or `basis + C` (buy); new basis `= -O` (sell) or `+O` (buy) |
+//! | cash | `+ realized - fee`, in the base |
+//!
+//! So `realized = Q * CV * (1/entry - 1/exit)` for each closed contract, up
+//! to the half-even rounding of each value. Every value `V` (and `C`, and
+//! the values of an expiry or a late fill) is a quotient rounded once; its
+//! exact rest is recorded as an [`InverseResidual`], with
+//! `n * CV / p = V + numerator / denominator` exactly. The released basis
+//! is an allocation of the basis, as for linear contracts, and has no
+//! residual. Funding is booked as an amount already computed by the caller
+//! ([`FundingPayment`]); half-even at the base scale is this ledger's
+//! policy for every value it computes.
 
 use rust_decimal::Decimal;
 
@@ -27,27 +56,49 @@ use crate::decimal::{
     Rounding, Wide, add, decimal_to_wide, mul_div_round, mul_div_round_wide, neg, wide_to_decimal,
 };
 use crate::direction::Dir;
-use crate::error::Result;
+use crate::error::{MarginError, Result};
 use crate::ids::{Asset, ExecutionId, InstrumentId};
+use crate::instrument::ContractSize;
+
+/// The exact rest of an inverse value rounded to the settlement scale:
+/// `n * CV / p = V + numerator / denominator`, exactly, for the booked
+/// value `V` of `n` contracts at `p`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InverseResidual {
+    /// `n * CV - V * p`, exact and signed: positive when the booked value
+    /// is below the exact quotient. Zero only when the quotient is exact.
+    pub numerator: Decimal,
+    /// The price `p` of the quotient, positive.
+    pub denominator: Decimal,
+}
 
 /// Derivative details of a booked execution
 /// ([`ExecutionCashflow::derivative`](crate::ledger::ExecutionCashflow::derivative)).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DerivativeFill {
-    /// Contract multiplier.
-    pub multiplier: Decimal,
-    /// The fill's virtual notional `rhe(p * n * M)`: the exposure it trades,
-    /// never exchanged in cash. `None` only when it is out of a `Decimal`'s
-    /// range; it is then still exact in the booking, and can be rebuilt in
-    /// wide integers from the execution and the instrument.
+    /// Contract size: the multiplier of a linear contract, the contract
+    /// value of an inverse one.
+    pub size: ContractSize,
+    /// The fill's virtual value in the settlement asset: `rhe(p * n * M)`
+    /// for a linear contract, `rhe(n * CV / p)` for an inverse one. It is
+    /// the exposure the fill trades, never exchanged in cash. `None` only
+    /// when it is out of a `Decimal`'s range; it is then still exact in the
+    /// booking, and can be rebuilt in wide integers from the execution and
+    /// the instrument.
     pub virtual_notional: Option<Decimal>,
-    /// The closing part `rhe(p * abs(Q) * M)` of a fill that crosses zero,
-    /// or, for a late fill on a settled future
-    /// ([`DerivativeFill::closed_at_settlement`]), its close at the
-    /// settlement price `rhe(P * n * M)`. `None` when the fill does not
-    /// cross zero and is not late, or (as above) only when it is out of a
-    /// `Decimal`'s range.
+    /// The closing part (`rhe(p * abs(Q) * M)`, or `rhe(abs(Q) * CV / p)`
+    /// for an inverse contract) of a fill that crosses zero, or, for a late
+    /// fill on a settled future ([`DerivativeFill::closed_at_settlement`]),
+    /// its close at the settlement price `P` (`rhe(P * n * M)` or
+    /// `rhe(n * CV / P)`). `None` when the fill does not cross zero and is
+    /// not late, or (as above) only when it is out of a `Decimal`'s range.
     pub closing_notional: Option<Decimal>,
+    /// For an inverse contract, the exact rest of `virtual_notional`;
+    /// `None` for a linear one, whose value is an exact product.
+    pub residual: Option<InverseResidual>,
+    /// For an inverse contract, the exact rest of `closing_notional` when
+    /// there is one; `None` otherwise.
+    pub closing_residual: Option<InverseResidual>,
     /// Basis released by the fill, signed like the basis before the fill
     /// (positive for a long): the whole basis on a full close or a crossing,
     /// zero when the fill opens or increases, and zero for a late fill on a
@@ -155,26 +206,88 @@ pub(crate) struct FillEffect {
 /// The half-even rounding every derivative figure uses.
 const DERIVATIVE_ROUNDING: Rounding = Rounding::HalfEven;
 
+/// The virtual value of `contracts` at `price`, rounded once to `scale`:
+/// `rhe(price * contracts * M)` or `rhe(contracts * CV / price)`, signed
+/// like `contracts`, as a wide integer.
+pub(crate) fn value_wide(
+    size: ContractSize,
+    price: Decimal,
+    contracts: Decimal,
+    scale: u32,
+) -> Result<Wide> {
+    match size {
+        ContractSize::Multiplier(multiplier) => mul_div_round_wide(
+            &[price, contracts, multiplier],
+            &[],
+            scale,
+            DERIVATIVE_ROUNDING,
+            "price * contracts * multiplier",
+        ),
+        ContractSize::ContractValue(contract_value) => mul_div_round_wide(
+            &[contracts, contract_value],
+            &[price],
+            scale,
+            DERIVATIVE_ROUNDING,
+            "contracts * contract value / price",
+        ),
+    }
+}
+
+/// The exact rest of the inverse value `value` (at `scale`) of `contracts`
+/// at `price`; `None` for a linear contract.
+pub(crate) fn residual(
+    size: ContractSize,
+    price: Decimal,
+    contracts: Decimal,
+    value: Wide,
+    scale: u32,
+) -> Result<Option<InverseResidual>> {
+    let ContractSize::ContractValue(contract_value) = size else {
+        return Ok(None);
+    };
+    let error = || MarginError::arithmetic("inverse residual");
+    let (n, n_scale) = Wide::from_decimal(contracts.normalize());
+    let (cv, cv_scale) = Wide::from_decimal(contract_value.normalize());
+    let (p, p_scale) = Wide::from_decimal(price.normalize());
+    // n * CV and V * p, exact, aligned to one scale.
+    let exact = n.checked_mul(cv).ok_or_else(error)?;
+    let exact_scale = n_scale.checked_add(cv_scale).ok_or_else(error)?;
+    let booked = value.checked_mul(p).ok_or_else(error)?;
+    let booked_scale = scale.checked_add(p_scale).ok_or_else(error)?;
+    let common = exact_scale.max(booked_scale);
+    let exact = exact.align(exact_scale, common).ok_or_else(error)?;
+    let booked = booked.align(booked_scale, common).ok_or_else(error)?;
+    let numerator = add_wide(exact, booked.negated(), "inverse residual")?;
+    Ok(Some(InverseResidual {
+        numerator: wide_to_decimal(numerator, common, "inverse residual")?,
+        denominator: price,
+    }))
+}
+
+/// The realized PnL of an inverse contract is the opposite of the linear
+/// formula applied to its values.
+fn signed_pnl(size: ContractSize, linear: Wide) -> Wide {
+    match size {
+        ContractSize::Multiplier(_) => linear,
+        ContractSize::ContractValue(_) => linear.negated(),
+    }
+}
+
 /// Applies a fill of `contracts > 0` at `price` in direction `dir` to
-/// `position`, with multiplier `multiplier` and settlement scale `scale`.
+/// `position`, with contract size `size` and settlement scale `scale`.
 /// Only the stored results must fit a `Decimal`.
 pub(crate) fn apply_derivative_fill(
     position: Position,
     dir: Dir,
     price: Decimal,
     contracts: Decimal,
-    multiplier: Decimal,
+    size: ContractSize,
     scale: u32,
 ) -> Result<FillEffect> {
     let held = position.quantity;
     let basis = position.cost_basis;
-    let notional = mul_div_round_wide(
-        &[price, contracts, multiplier],
-        &[],
-        scale,
-        DERIVATIVE_ROUNDING,
-        "price * contracts * multiplier",
-    )?;
+    let notional = value_wide(size, price, contracts, scale)?;
+    let fill_residual = residual(size, price, contracts, notional, scale)?;
     // Signed like a buy: + for a buy, - for a sell.
     let (signed_contracts, signed_value) = match dir {
         Dir::Buy => (contracts, notional),
@@ -196,9 +309,11 @@ pub(crate) fn apply_derivative_fill(
             },
             realized: Decimal::ZERO,
             fill: DerivativeFill {
-                multiplier,
+                size,
                 virtual_notional,
                 closing_notional: None,
+                residual: fill_residual,
+                closing_residual: None,
                 released_basis: Decimal::ZERO,
                 closed_at_settlement: None,
             },
@@ -219,10 +334,11 @@ pub(crate) fn apply_derivative_fill(
                 "released basis",
             )?
         };
-        // realized = -signed_value - released.
+        // Linear: realized = -signed_value - released; inverse: the
+        // opposite.
         let released_w = decimal_to_wide(released, scale, "released basis")?;
-        let realized_w = add_wide(signed_value.negated(), released_w.negated(), "realized pnl")?;
-        let realized = wide_to_decimal(realized_w, scale, "realized pnl")?;
+        let linear = add_wide(signed_value.negated(), released_w.negated(), "realized pnl")?;
+        let realized = wide_to_decimal(signed_pnl(size, linear), scale, "realized pnl")?;
         return Ok(FillEffect {
             position: Position {
                 quantity,
@@ -231,9 +347,11 @@ pub(crate) fn apply_derivative_fill(
             },
             realized,
             fill: DerivativeFill {
-                multiplier,
+                size,
                 virtual_notional,
                 closing_notional: None,
+                residual: fill_residual,
+                closing_residual: None,
                 released_basis: released,
                 closed_at_settlement: None,
             },
@@ -242,13 +360,8 @@ pub(crate) fn apply_derivative_fill(
 
     // Cross zero: close abs(Q) (one rounding), open the rest as the exact
     // difference, so the fill as a whole keeps its single rounding.
-    let closing = mul_div_round_wide(
-        &[price, held_abs, multiplier],
-        &[],
-        scale,
-        DERIVATIVE_ROUNDING,
-        "price * held * multiplier",
-    )?;
+    let closing = value_wide(size, price, held_abs, scale)?;
+    let closing_residual = residual(size, price, held_abs, closing, scale)?;
     let signed_close = if signed_value.negative {
         closing.negated()
     } else {
@@ -256,8 +369,9 @@ pub(crate) fn apply_derivative_fill(
     };
     let opening = add_wide(signed_value, signed_close.negated(), "opening notional")?;
     let basis_w = decimal_to_wide(basis, scale, "basis")?;
-    let realized_w = add_wide(signed_close.negated(), basis_w.negated(), "realized pnl")?;
-    let realized = wide_to_decimal(realized_w, scale, "realized pnl")?;
+    // Linear: realized = -signed_close - basis; inverse: the opposite.
+    let linear = add_wide(signed_close.negated(), basis_w.negated(), "realized pnl")?;
+    let realized = wide_to_decimal(signed_pnl(size, linear), scale, "realized pnl")?;
     Ok(FillEffect {
         position: Position {
             quantity,
@@ -266,9 +380,11 @@ pub(crate) fn apply_derivative_fill(
         },
         realized,
         fill: DerivativeFill {
-            multiplier,
+            size,
             virtual_notional,
             closing_notional: closing.to_decimal(scale),
+            residual: fill_residual,
+            closing_residual,
             released_basis: basis,
             closed_at_settlement: None,
         },
@@ -276,9 +392,11 @@ pub(crate) fn apply_derivative_fill(
 }
 
 /// A late fill of `contracts` at `price` on a flat, settled future, closed
-/// at once at `settlement_price`: realized `= rhe(P * n * M) - rhe(p * n *
-/// M)` for a buy and the opposite for a sell, computed in wide integers so
-/// that only the realized PnL must fit a `Decimal`. The position stays flat.
+/// at once at `settlement_price`. Linear: realized `= rhe(P * n * M) -
+/// rhe(p * n * M)` for a buy and the opposite for a sell. Inverse: realized
+/// `= rhe(n * CV / p) - rhe(n * CV / P)` for a buy (a long) and the
+/// opposite for a sell. Computed in wide integers, so that only the
+/// realized PnL must fit a `Decimal`. The position stays flat.
 ///
 /// # Errors
 ///
@@ -290,7 +408,7 @@ pub(crate) fn close_late_fill(
     dir: Dir,
     price: Decimal,
     contracts: Decimal,
-    multiplier: Decimal,
+    size: ContractSize,
     (settlement_price, scale): (Decimal, u32),
 ) -> Result<FillEffect> {
     if !position.quantity.is_zero() {
@@ -299,25 +417,13 @@ pub(crate) fn close_late_fill(
             "a settled future has no open position",
         ));
     }
-    let traded = mul_div_round_wide(
-        &[price, contracts, multiplier],
-        &[],
-        scale,
-        DERIVATIVE_ROUNDING,
-        "price * contracts * multiplier",
-    )?;
-    let settled = mul_div_round_wide(
-        &[settlement_price, contracts, multiplier],
-        &[],
-        scale,
-        DERIVATIVE_ROUNDING,
-        "settlement price * contracts * multiplier",
-    )?;
-    let realized_w = match dir {
+    let traded = value_wide(size, price, contracts, scale)?;
+    let settled = value_wide(size, settlement_price, contracts, scale)?;
+    let linear = match dir {
         Dir::Buy => add_wide(settled, traded.negated(), "realized pnl")?,
         Dir::Sell => add_wide(traded, settled.negated(), "realized pnl")?,
     };
-    let realized = wide_to_decimal(realized_w, scale, "realized pnl")?;
+    let realized = wide_to_decimal(signed_pnl(size, linear), scale, "realized pnl")?;
     Ok(FillEffect {
         position: Position {
             quantity: position.quantity,
@@ -326,53 +432,74 @@ pub(crate) fn close_late_fill(
         },
         realized,
         fill: DerivativeFill {
-            multiplier,
+            size,
             virtual_notional: traded.to_decimal(scale),
             closing_notional: settled.to_decimal(scale),
+            residual: residual(size, price, contracts, traded, scale)?,
+            closing_residual: residual(size, settlement_price, contracts, settled, scale)?,
             released_basis: Decimal::ZERO,
             closed_at_settlement: Some(settlement_price),
         },
     })
 }
 
-/// The virtual notional `rhe(p * n * M)` signed as the cash a fill would
+/// The virtual value of a fill signed as the cash a linear fill would
 /// exchange (negative for a buy), as a wide integer at `scale`: the term of
-/// the virtual reconciliation identity `sum == realized_pnl - basis`.
+/// the virtual reconciliation identity, `sum == realized_pnl - basis` for a
+/// linear contract and `sum == -realized_pnl - basis` for an inverse one.
 pub(crate) fn signed_virtual_cash(
     dir: Dir,
     price: Decimal,
     contracts: Decimal,
-    multiplier: Decimal,
+    size: ContractSize,
     scale: u32,
 ) -> Result<Wide> {
-    let notional = mul_div_round_wide(
-        &[price, contracts, multiplier],
-        &[],
-        scale,
-        DERIVATIVE_ROUNDING,
-        "price * contracts * multiplier",
-    )?;
+    let notional = value_wide(size, price, contracts, scale)?;
     Ok(match dir {
         Dir::Buy => notional.negated(),
         Dir::Sell => notional,
     })
 }
 
-/// `rhe(quantity * multiplier * mark)`: the market value of a derivative
-/// position, signed like the contracts.
+/// The market value of a derivative position at `mark`, signed like the
+/// contracts: `rhe(quantity * M * mark)` for a linear contract,
+/// `rhe(quantity * CV / mark)` (its value in the base) for an inverse one.
 pub(crate) fn market_value(
     quantity: Decimal,
-    multiplier: Decimal,
+    size: ContractSize,
     mark: Decimal,
     scale: u32,
 ) -> Result<Decimal> {
-    mul_div_round(
-        &[quantity, multiplier, mark],
-        &[],
-        scale,
-        DERIVATIVE_ROUNDING,
-        "contracts * multiplier * mark",
-    )
+    match size {
+        ContractSize::Multiplier(multiplier) => mul_div_round(
+            &[quantity, multiplier, mark],
+            &[],
+            scale,
+            DERIVATIVE_ROUNDING,
+            "contracts * multiplier * mark",
+        ),
+        ContractSize::ContractValue(contract_value) => mul_div_round(
+            &[quantity, contract_value],
+            &[mark],
+            scale,
+            DERIVATIVE_ROUNDING,
+            "contracts * contract value / mark",
+        ),
+    }
+}
+
+/// The unrealized PnL of a position with `basis` and `market_value`:
+/// `market_value - basis` for a linear contract, `basis - market_value`
+/// for an inverse one (a long gains when its value in the base falls).
+pub(crate) fn unrealized_pnl(
+    size: ContractSize,
+    market_value: Decimal,
+    basis: Decimal,
+) -> Result<Decimal> {
+    match size {
+        ContractSize::Multiplier(_) => crate::decimal::sub(market_value, basis, "value - basis"),
+        ContractSize::ContractValue(_) => crate::decimal::sub(basis, market_value, "basis - value"),
+    }
 }
 
 pub(crate) fn add_wide(a: Wide, b: Wide, operation: &'static str) -> Result<Wide> {

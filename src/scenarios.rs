@@ -148,7 +148,12 @@ pub fn stress(
     for (id, position) in &snapshot.positions {
         let derivative = match snapshot.instruments.get(id) {
             Some(Instrument::Spot(_)) | None => false,
-            Some(Instrument::LinearFuture(_) | Instrument::LinearPerpetual(_)) => true,
+            Some(
+                Instrument::LinearFuture(_)
+                | Instrument::LinearPerpetual(_)
+                | Instrument::InverseFuture(_)
+                | Instrument::InversePerpetual(_),
+            ) => true,
         };
         if derivative && !position.quantity.is_zero() {
             return Err(MarginError::UnsupportedInstrument {
@@ -254,7 +259,12 @@ fn apply_hypothetical(
 ) -> Result<()> {
     let spot = match snapshot.instruments.get(&fill.instrument).cloned() {
         Some(Instrument::Spot(spot)) => spot,
-        Some(Instrument::LinearFuture(_) | Instrument::LinearPerpetual(_)) => {
+        Some(
+            Instrument::LinearFuture(_)
+            | Instrument::LinearPerpetual(_)
+            | Instrument::InverseFuture(_)
+            | Instrument::InversePerpetual(_),
+        ) => {
             return Err(MarginError::UnsupportedInstrument {
                 rule: "stress".to_string(),
                 instrument: fill.instrument.clone(),

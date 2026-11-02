@@ -5,6 +5,12 @@
 //!   multiplier: its position has a signed basis in the settlement asset,
 //!   and only realized PnL and fees move cash (see
 //!   [`Ledger`](crate::ledger::Ledger)).
+//! - An inverse future or perpetual settles in the **base** asset: each
+//!   contract is worth a fixed contract value `CV` in quote units, so `Q`
+//!   contracts at price `p` are worth `Q * CV / p` of the base. Prices and
+//!   marks of an inverse instrument are in the quote currency of `CV` per
+//!   unit of the base; that currency is not an asset of the ledger and is
+//!   never inferred.
 //!
 //! Options are not ledger instruments yet.
 
@@ -167,6 +173,157 @@ impl LinearTerms {
     }
 }
 
+/// Size of one contract of a derivative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ContractSize {
+    /// Units of the underlying per contract: a linear contract (1 for spot).
+    Multiplier(Decimal),
+    /// Quote units per contract: an inverse contract, settled in the base.
+    ContractValue(Decimal),
+}
+
+/// Terms shared by inverse futures and perpetuals: contracts settled in the
+/// base asset, each worth `contract_value` units of the quote currency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InverseTerms {
+    id: InstrumentId,
+    settlement: Asset,
+    contract_value: Decimal,
+    price_scale: u32,
+    contract_scale: u32,
+}
+
+impl InverseTerms {
+    /// Defines the terms of an inverse derivative settled in `settlement`
+    /// (the base asset), each contract worth `contract_value` units of the
+    /// quote currency in which its prices are quoted.
+    ///
+    /// `price_scale` and `contract_scale` are the largest number of
+    /// fractional digits accepted for execution prices and contract
+    /// quantities. `contract_scale` plus the decimals of `contract_value`
+    /// (trailing zeros ignored) must not exceed 28, so that `n * CV` is an
+    /// exact `Decimal` product for every valid contract count `n`.
+    ///
+    /// # Errors
+    ///
+    /// [`MarginError::InvalidInput`] if `contract_value` is not positive, a
+    /// scale exceeds [`MAX_SCALE`](crate::decimal::MAX_SCALE), or
+    /// `contract_scale` plus the decimals of `contract_value` exceeds 28.
+    pub fn new(
+        id: InstrumentId,
+        settlement: Asset,
+        contract_value: Decimal,
+        price_scale: u32,
+        contract_scale: u32,
+    ) -> Result<Self> {
+        if contract_value <= Decimal::ZERO {
+            return Err(MarginError::invalid_input(
+                "contract_value",
+                "must be positive",
+            ));
+        }
+        check_configured_scale(price_scale, "price_scale")?;
+        check_configured_scale(contract_scale, "contract_scale")?;
+        if contract_scale.saturating_add(contract_value.normalize().scale()) > DECIMAL_DIGITS {
+            return Err(MarginError::invalid_input(
+                "contract_value",
+                "its decimals plus contract_scale must not exceed 28",
+            ));
+        }
+        Ok(Self {
+            id,
+            settlement,
+            contract_value,
+            price_scale,
+            contract_scale,
+        })
+    }
+
+    /// Instrument identifier.
+    #[must_use]
+    pub fn id(&self) -> &InstrumentId {
+        &self.id
+    }
+
+    /// Asset the contracts settle in, the base: basis, PnL, funding and
+    /// fees.
+    #[must_use]
+    pub fn settlement(&self) -> &Asset {
+        &self.settlement
+    }
+
+    /// Quote units per contract (`CV`).
+    #[must_use]
+    pub fn contract_value(&self) -> Decimal {
+        self.contract_value
+    }
+
+    /// Maximum fractional digits of an execution price.
+    #[must_use]
+    pub fn price_scale(&self) -> u32 {
+        self.price_scale
+    }
+
+    /// Maximum fractional digits of a contract quantity.
+    #[must_use]
+    pub fn contract_scale(&self) -> u32 {
+        self.contract_scale
+    }
+}
+
+/// The largest scale of a `Decimal`.
+pub(crate) const DECIMAL_DIGITS: u32 = 28;
+
+/// An inverse future: settled in the base asset at its expiry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InverseFuture {
+    terms: InverseTerms,
+    expiry_ms: u64,
+}
+
+impl InverseFuture {
+    /// An inverse future expiring at `expiry_ms` (milliseconds since the
+    /// epoch), settled with
+    /// [`Ledger::settle_expiry`](crate::ledger::Ledger::settle_expiry).
+    #[must_use]
+    pub fn new(terms: InverseTerms, expiry_ms: u64) -> Self {
+        Self { terms, expiry_ms }
+    }
+
+    /// The contract terms.
+    #[must_use]
+    pub fn terms(&self) -> &InverseTerms {
+        &self.terms
+    }
+
+    /// Expiry, in milliseconds since the epoch.
+    #[must_use]
+    pub fn expiry_ms(&self) -> u64 {
+        self.expiry_ms
+    }
+}
+
+/// An inverse perpetual: no expiry; funding in the base asset
+/// ([`Ledger::book_funding`](crate::ledger::Ledger::book_funding)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InversePerpetual {
+    terms: InverseTerms,
+}
+
+impl InversePerpetual {
+    /// An inverse perpetual with `terms`.
+    #[must_use]
+    pub fn new(terms: InverseTerms) -> Self {
+        Self { terms }
+    }
+
+    /// The contract terms.
+    #[must_use]
+    pub fn terms(&self) -> &InverseTerms {
+        &self.terms
+    }
+}
+
 /// A linear future: settled in cash at its expiry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinearFuture {
@@ -227,6 +384,10 @@ pub enum PositionKind {
     LinearFuture,
     /// Contracts of a linear perpetual.
     LinearPerpetual,
+    /// Contracts of an inverse future.
+    InverseFuture,
+    /// Contracts of an inverse perpetual.
+    InversePerpetual,
 }
 
 /// An instrument the ledger can book executions for.
@@ -239,6 +400,10 @@ pub enum Instrument {
     LinearFuture(LinearFuture),
     /// Linear perpetual, with funding.
     LinearPerpetual(LinearPerpetual),
+    /// Inverse future, settled in the base asset at expiry.
+    InverseFuture(InverseFuture),
+    /// Inverse perpetual, with funding in the base asset.
+    InversePerpetual(InversePerpetual),
 }
 
 impl Instrument {
@@ -249,17 +414,22 @@ impl Instrument {
             Self::Spot(spot) => spot.id(),
             Self::LinearFuture(future) => future.terms().id(),
             Self::LinearPerpetual(perpetual) => perpetual.terms().id(),
+            Self::InverseFuture(future) => future.terms().id(),
+            Self::InversePerpetual(perpetual) => perpetual.terms().id(),
         }
     }
 
     /// Asset in which positions, cost basis and PnL are measured: the quote
-    /// asset of a spot instrument, the settlement asset of a derivative.
+    /// asset of a spot instrument, the settlement asset of a derivative
+    /// (the base asset of an inverse one).
     #[must_use]
     pub fn quote(&self) -> &Asset {
         match self {
             Self::Spot(spot) => spot.quote(),
             Self::LinearFuture(future) => future.terms().settlement(),
             Self::LinearPerpetual(perpetual) => perpetual.terms().settlement(),
+            Self::InverseFuture(future) => future.terms().settlement(),
+            Self::InversePerpetual(perpetual) => perpetual.terms().settlement(),
         }
     }
 
@@ -270,26 +440,105 @@ impl Instrument {
             Self::Spot(_) => PositionKind::Spot,
             Self::LinearFuture(_) => PositionKind::LinearFuture,
             Self::LinearPerpetual(_) => PositionKind::LinearPerpetual,
+            Self::InverseFuture(_) => PositionKind::InverseFuture,
+            Self::InversePerpetual(_) => PositionKind::InversePerpetual,
         }
     }
 
-    /// Units of the underlying per unit of position: 1 for spot, the
-    /// contract multiplier for a derivative.
+    /// Size of one unit of position: `Multiplier(1)` for spot, the
+    /// multiplier of a linear derivative, the contract value of an inverse
+    /// one.
     #[must_use]
-    pub fn multiplier(&self) -> Decimal {
-        self.linear_terms()
-            .map_or(Decimal::ONE, LinearTerms::multiplier)
+    pub fn contract_size(&self) -> ContractSize {
+        match self {
+            Self::Spot(_) => ContractSize::Multiplier(Decimal::ONE),
+            Self::LinearFuture(future) => ContractSize::Multiplier(future.terms().multiplier()),
+            Self::LinearPerpetual(perpetual) => {
+                ContractSize::Multiplier(perpetual.terms().multiplier())
+            }
+            Self::InverseFuture(future) => {
+                ContractSize::ContractValue(future.terms().contract_value())
+            }
+            Self::InversePerpetual(perpetual) => {
+                ContractSize::ContractValue(perpetual.terms().contract_value())
+            }
+        }
     }
 
-    /// The contract terms of a derivative, `None` for spot.
+    /// The contract terms of a linear derivative; `None` for spot and
+    /// inverse instruments.
     #[must_use]
     pub fn linear_terms(&self) -> Option<&LinearTerms> {
         match self {
-            Self::Spot(_) => None,
             Self::LinearFuture(future) => Some(future.terms()),
             Self::LinearPerpetual(perpetual) => Some(perpetual.terms()),
+            Self::Spot(_) | Self::InverseFuture(_) | Self::InversePerpetual(_) => None,
         }
     }
+
+    /// The contract terms of an inverse derivative; `None` for spot and
+    /// linear instruments.
+    #[must_use]
+    pub fn inverse_terms(&self) -> Option<&InverseTerms> {
+        match self {
+            Self::InverseFuture(future) => Some(future.terms()),
+            Self::InversePerpetual(perpetual) => Some(perpetual.terms()),
+            Self::Spot(_) | Self::LinearFuture(_) | Self::LinearPerpetual(_) => None,
+        }
+    }
+
+    /// The expiry of a future; `None` for spot and perpetuals.
+    #[must_use]
+    pub fn expiry_ms(&self) -> Option<u64> {
+        match self {
+            Self::LinearFuture(future) => Some(future.expiry_ms()),
+            Self::InverseFuture(future) => Some(future.expiry_ms()),
+            Self::Spot(_) | Self::LinearPerpetual(_) | Self::InversePerpetual(_) => None,
+        }
+    }
+
+    /// The derivative contract: settlement asset, contract size and grids;
+    /// `None` for spot.
+    pub(crate) fn derivative(&self) -> Option<DerivativeContract> {
+        let (settlement, size, price_scale, contract_scale) = match self {
+            Self::Spot(_) => return None,
+            Self::LinearFuture(_) | Self::LinearPerpetual(_) => {
+                let terms = self.linear_terms()?;
+                (
+                    terms.settlement(),
+                    ContractSize::Multiplier(terms.multiplier()),
+                    terms.price_scale(),
+                    terms.contract_scale(),
+                )
+            }
+            Self::InverseFuture(_) | Self::InversePerpetual(_) => {
+                let terms = self.inverse_terms()?;
+                (
+                    terms.settlement(),
+                    ContractSize::ContractValue(terms.contract_value()),
+                    terms.price_scale(),
+                    terms.contract_scale(),
+                )
+            }
+        };
+        Some(DerivativeContract {
+            settlement: settlement.clone(),
+            size,
+            price_scale,
+            contract_scale,
+            expiry_ms: self.expiry_ms(),
+        })
+    }
+}
+
+/// What the ledger needs to book a derivative of either kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DerivativeContract {
+    pub(crate) settlement: Asset,
+    pub(crate) size: ContractSize,
+    pub(crate) price_scale: u32,
+    pub(crate) contract_scale: u32,
+    pub(crate) expiry_ms: Option<u64>,
 }
 
 impl From<SpotInstrument> for Instrument {
@@ -307,6 +556,18 @@ impl From<LinearFuture> for Instrument {
 impl From<LinearPerpetual> for Instrument {
     fn from(perpetual: LinearPerpetual) -> Self {
         Self::LinearPerpetual(perpetual)
+    }
+}
+
+impl From<InverseFuture> for Instrument {
+    fn from(future: InverseFuture) -> Self {
+        Self::InverseFuture(future)
+    }
+}
+
+impl From<InversePerpetual> for Instrument {
+    fn from(perpetual: InversePerpetual) -> Self {
+        Self::InversePerpetual(perpetual)
     }
 }
 
@@ -333,5 +594,35 @@ mod tests {
         assert_eq!(Instrument::from(spot).quote().as_str(), "USDC");
         assert!(SpotInstrument::new(id.clone(), asset("BTC"), asset("BTC"), 2, 8).is_err());
         assert!(SpotInstrument::new(id, asset("BTC"), asset("USDC"), 19, 8).is_err());
+    }
+
+    #[test]
+    fn inverse_terms_validation() {
+        let id = InstrumentId::new("BTC-USD-INV").expect("valid id");
+        let terms = InverseTerms::new(id.clone(), asset("BTC"), Decimal::from(100), 1, 0)
+            .expect("valid terms");
+        let perpetual = Instrument::from(InversePerpetual::new(terms.clone()));
+        assert_eq!(perpetual.quote().as_str(), "BTC");
+        assert_eq!(perpetual.kind(), PositionKind::InversePerpetual);
+        assert_eq!(
+            perpetual.contract_size(),
+            ContractSize::ContractValue(Decimal::from(100))
+        );
+        assert_eq!(perpetual.linear_terms(), None);
+        assert_eq!(perpetual.expiry_ms(), None);
+        let future = Instrument::from(InverseFuture::new(terms, 1000));
+        assert_eq!(future.expiry_ms(), Some(1000));
+        for value in [Decimal::ZERO, Decimal::NEGATIVE_ONE] {
+            assert!(InverseTerms::new(id.clone(), asset("BTC"), value, 1, 0).is_err());
+        }
+        // 18 contract decimals + 10 CV decimals = 28: accepted; trailing
+        // zeros do not count; 29 is refused.
+        let ten = Decimal::new(1, 10);
+        assert!(InverseTerms::new(id.clone(), asset("BTC"), ten, 1, 18).is_ok());
+        let padded = Decimal::new(1_000_000, 16);
+        assert_eq!(padded.scale(), 16);
+        assert!(InverseTerms::new(id.clone(), asset("BTC"), padded, 1, 18).is_ok());
+        let eleven = Decimal::new(1, 11);
+        assert!(InverseTerms::new(id, asset("BTC"), eleven, 1, 18).is_err());
     }
 }

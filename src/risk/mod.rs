@@ -950,13 +950,16 @@ impl RiskGate {
     fn spot(&self, instrument: &InstrumentId) -> Result<SpotInstrument> {
         match self.ledger.instrument(instrument) {
             Some(Instrument::Spot(spot)) => Ok(spot.clone()),
-            Some(Instrument::LinearFuture(_) | Instrument::LinearPerpetual(_)) => {
-                Err(MarginError::UnsupportedInstrument {
-                    rule: "risk-gate".to_string(),
-                    instrument: instrument.clone(),
-                    reason: "the risk gate handles spot orders; derivatives reserve margin with MarginReservationService",
-                })
-            }
+            Some(
+                Instrument::LinearFuture(_)
+                | Instrument::LinearPerpetual(_)
+                | Instrument::InverseFuture(_)
+                | Instrument::InversePerpetual(_),
+            ) => Err(MarginError::UnsupportedInstrument {
+                rule: "risk-gate".to_string(),
+                instrument: instrument.clone(),
+                reason: "the risk gate handles spot orders; derivatives reserve margin with MarginReservationService",
+            }),
             None => Err(MarginError::UnknownInstrument {
                 instrument: instrument.clone(),
             }),

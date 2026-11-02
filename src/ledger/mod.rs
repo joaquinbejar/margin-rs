@@ -74,7 +74,7 @@ use rust_decimal::Decimal;
 
 pub use derivative::{
     DerivativeFill, ExpiryCashflow, ExpirySettlement, FundingCashflow, FundingPayment,
-    PostingBooking,
+    InverseResidual, PostingBooking,
 };
 pub use execution::{Action, Booking, Execution, ExecutionCashflow, Fee};
 pub use settlement::{DerivativeSettlement, SettlementBooking, SettlementCashflow};
@@ -89,7 +89,9 @@ use crate::decimal::{
 use crate::direction::Dir;
 use crate::error::{MarginError, Result};
 use crate::ids::{Asset, ExecutionId, InstrumentId, ReservationId, TransferId};
-use crate::instrument::{Instrument, LinearTerms, PositionKind};
+use crate::instrument::{
+    ContractSize, DECIMAL_DIGITS, DerivativeContract, Instrument, PositionKind,
+};
 
 /// Result of [`Ledger::book_execution_allowing_overdraft`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,6 +292,20 @@ impl Ledger {
             }
             Instrument::LinearPerpetual(perpetual) => {
                 self.asset_scale_or_err(perpetual.terms().settlement())?;
+            }
+            Instrument::InverseFuture(_) | Instrument::InversePerpetual(_) => {
+                let terms = instrument
+                    .inverse_terms()
+                    .ok_or(MarginError::arithmetic("inverse terms"))?;
+                let scale = self.asset_scale_or_err(terms.settlement())?;
+                // Every value's residual `n * CV - V * p` is then an exact
+                // Decimal.
+                if scale.saturating_add(terms.price_scale()) > DECIMAL_DIGITS {
+                    return Err(MarginError::invalid_input(
+                        "price_scale",
+                        "the settlement asset scale plus price_scale must not exceed 28",
+                    ));
+                }
             }
         }
         let id = instrument.id().clone();
@@ -706,22 +722,17 @@ impl Ledger {
         })?;
         let spot = match instrument {
             Instrument::Spot(spot) => spot.clone(),
-            Instrument::LinearFuture(future) => {
-                let (terms, expiry) = (future.terms().clone(), Some(future.expiry_ms()));
+            Instrument::LinearFuture(_)
+            | Instrument::LinearPerpetual(_)
+            | Instrument::InverseFuture(_)
+            | Instrument::InversePerpetual(_) => {
+                let contract = instrument
+                    .derivative()
+                    .ok_or(MarginError::arithmetic("derivative contract"))?;
                 return self.book_derivative(
                     execution,
                     dir,
-                    (&terms, expiry),
-                    reservation,
-                    allow_overdraft,
-                );
-            }
-            Instrument::LinearPerpetual(perpetual) => {
-                let terms = perpetual.terms().clone();
-                return self.book_derivative(
-                    execution,
-                    dir,
-                    (&terms, None),
+                    &contract,
                     reservation,
                     allow_overdraft,
                 );
@@ -899,7 +910,7 @@ impl Ledger {
                 &execution.instrument,
                 spot.quote(),
                 PositionKind::Spot,
-                Decimal::ONE,
+                ContractSize::Multiplier(Decimal::ONE),
                 new_position,
             ),
             derivative: None,
@@ -918,8 +929,8 @@ impl Ledger {
             || self.expiries.contains_key(id)
     }
 
-    /// Books an execution of a linear future or perpetual (see the
-    /// `derivative` module): mandatory, so a debit beyond the available
+    /// Books an execution of a linear or inverse future or perpetual (see
+    /// the `derivative` module): mandatory, so a debit beyond the available
     /// balance is booked and reported as a shortfall.
     #[expect(
         clippy::too_many_lines,
@@ -929,7 +940,7 @@ impl Ledger {
         &mut self,
         execution: &Execution,
         dir: Dir,
-        (terms, expiry_ms): (&LinearTerms, Option<u64>),
+        contract: &DerivativeContract,
         reservation: Option<(&ReservationId, Decimal)>,
         allow_overdraft: bool,
     ) -> Result<(Booking, BTreeMap<Asset, Decimal>)> {
@@ -953,7 +964,7 @@ impl Ledger {
                 "a derivative execution needs its execution time",
             ));
         };
-        if let Some(expiry_ms) = expiry_ms
+        if let Some(expiry_ms) = contract.expiry_ms
             && executed_at_ms >= expiry_ms
         {
             return Err(MarginError::ExecutedAfterExpiry {
@@ -980,13 +991,13 @@ impl Ledger {
         if execution.quantity <= Decimal::ZERO {
             return Err(MarginError::invalid_input("quantity", "must be positive"));
         }
-        check_scale(execution.price, terms.price_scale(), "price")?;
-        check_scale(execution.quantity, terms.contract_scale(), "quantity")?;
+        check_scale(execution.price, contract.price_scale, "price")?;
+        check_scale(execution.quantity, contract.contract_scale, "quantity")?;
         if let Some(fee) = &execution.fee {
             let fee_scale = self.asset_scale_or_err(&fee.asset)?;
             check_scale(fee.amount, fee_scale, "fee")?;
         }
-        let settlement = terms.settlement();
+        let settlement = &contract.settlement;
         let scale = self.asset_scale_or_err(settlement)?;
         let position = self
             .positions
@@ -999,7 +1010,7 @@ impl Ledger {
                 dir,
                 execution.price,
                 execution.quantity,
-                terms.multiplier(),
+                contract.size,
                 scale,
             )?,
             Some(price) => derivative::close_late_fill(
@@ -1007,7 +1018,7 @@ impl Ledger {
                 dir,
                 execution.price,
                 execution.quantity,
-                terms.multiplier(),
+                contract.size,
                 (price, scale),
             )?,
         };
@@ -1082,7 +1093,7 @@ impl Ledger {
                 &execution.instrument,
                 instrument.quote(),
                 instrument.kind(),
-                instrument.multiplier(),
+                contract.size,
                 effect.position,
             ),
             derivative: Some(effect.fill),
@@ -1274,10 +1285,13 @@ impl Ledger {
         }
         let asset = match self.instruments.get(&payment.instrument) {
             Some(Instrument::LinearPerpetual(perpetual)) => perpetual.terms().settlement().clone(),
-            Some(Instrument::Spot(_) | Instrument::LinearFuture(_)) => {
+            Some(Instrument::InversePerpetual(perpetual)) => perpetual.terms().settlement().clone(),
+            Some(
+                Instrument::Spot(_) | Instrument::LinearFuture(_) | Instrument::InverseFuture(_),
+            ) => {
                 return Err(MarginError::invalid_input(
                     "instrument",
-                    "funding is paid on a linear perpetual",
+                    "funding is paid on a perpetual",
                 ));
             }
             None => {
@@ -1386,12 +1400,24 @@ impl Ledger {
                 id: settlement.id.to_string(),
             });
         }
-        let future = match self.instruments.get(&settlement.instrument) {
-            Some(Instrument::LinearFuture(future)) => future.clone(),
-            Some(Instrument::Spot(_) | Instrument::LinearPerpetual(_)) => {
+        let (contract, expiry_ms) = match self.instruments.get(&settlement.instrument) {
+            Some(future @ (Instrument::LinearFuture(_) | Instrument::InverseFuture(_))) => {
+                let contract = future
+                    .derivative()
+                    .ok_or(MarginError::arithmetic("derivative contract"))?;
+                let expiry_ms = contract
+                    .expiry_ms
+                    .ok_or(MarginError::arithmetic("future expiry"))?;
+                (contract, expiry_ms)
+            }
+            Some(
+                Instrument::Spot(_)
+                | Instrument::LinearPerpetual(_)
+                | Instrument::InversePerpetual(_),
+            ) => {
                 return Err(MarginError::invalid_input(
                     "instrument",
-                    "only a linear future expires",
+                    "only a future expires",
                 ));
             }
             None => {
@@ -1400,7 +1426,7 @@ impl Ledger {
                 });
             }
         };
-        if settlement.as_of_ms < future.expiry_ms() {
+        if settlement.as_of_ms < expiry_ms {
             return Err(MarginError::invalid_input(
                 "as_of_ms",
                 "a future is settled at or after its expiry",
@@ -1409,9 +1435,8 @@ impl Ledger {
         if settlement.price <= Decimal::ZERO {
             return Err(MarginError::invalid_input("price", "must be positive"));
         }
-        let terms = future.terms();
-        check_scale(settlement.price, terms.price_scale(), "price")?;
-        let asset = terms.settlement().clone();
+        check_scale(settlement.price, contract.price_scale, "price")?;
+        let asset = contract.settlement.clone();
         let scale = self.asset_scale_or_err(&asset)?;
         let position = self
             .positions
@@ -1424,9 +1449,11 @@ impl Ledger {
                 position,
                 Decimal::ZERO,
                 DerivativeFill {
-                    multiplier: terms.multiplier(),
+                    size: contract.size,
                     virtual_notional: Some(Decimal::ZERO),
                     closing_notional: None,
+                    residual: None,
+                    closing_residual: None,
                     released_basis: Decimal::ZERO,
                     closed_at_settlement: None,
                 },
@@ -1442,7 +1469,7 @@ impl Ledger {
                 dir,
                 settlement.price,
                 contracts.abs(),
-                terms.multiplier(),
+                contract.size,
                 scale,
             )?;
             (effect.position, effect.realized, effect.fill)
@@ -1530,7 +1557,7 @@ impl Ledger {
             instrument,
             registered.quote(),
             registered.kind(),
-            registered.multiplier(),
+            registered.contract_size(),
             *position,
         ))
     }
@@ -1632,31 +1659,15 @@ impl Ledger {
                 let mark = *marks.get(id).ok_or_else(|| MarginError::MissingMark {
                     instrument: id.clone(),
                 })?;
-                if mark <= Decimal::ZERO {
-                    return Err(MarginError::invalid_input("mark", "must be positive"));
-                }
-                check_scale(mark, decimal::MAX_SCALE, "mark")?;
-                let value = match registered {
-                    Instrument::Spot(_) => mul_div_round(
-                        &[position.quantity, mark],
-                        &[],
-                        quote_scale,
-                        rounding,
-                        "quantity * mark",
-                    )?,
-                    // Always half-even for derivatives: rhe(Q * M * mark).
-                    Instrument::LinearFuture(_) | Instrument::LinearPerpetual(_) => {
-                        derivative::market_value(
-                            position.quantity,
-                            registered.multiplier(),
-                            mark,
-                            quote_scale,
-                        )?
-                    }
-                };
+                let value =
+                    position_value(registered, position.quantity, mark, quote_scale, rounding)?;
                 (Some(mark), value)
             };
-            let unrealized_pnl = sub(market_value, position.cost_basis, "market_value - cost")?;
+            let unrealized_pnl = derivative::unrealized_pnl(
+                registered.contract_size(),
+                market_value,
+                position.cost_basis,
+            )?;
             let terms = asset_terms.entry(quote.clone()).or_default();
             terms.0.push(position.realized_pnl);
             terms.1.push(unrealized_pnl);
@@ -1825,7 +1836,7 @@ impl Ledger {
                     dir,
                     cashflow.price,
                     cashflow.quantity,
-                    fill.multiplier,
+                    fill.size,
                     scale,
                 )?;
                 add_virtual(&mut virtual_cash, &cashflow.instrument, term)?;
@@ -1840,7 +1851,7 @@ impl Ledger {
                         opposite,
                         price,
                         cashflow.quantity,
-                        fill.multiplier,
+                        fill.size,
                         scale,
                     )?;
                     add_virtual(&mut virtual_cash, &cashflow.instrument, term)?;
@@ -1882,7 +1893,7 @@ impl Ledger {
                     dir,
                     expiry.price,
                     expiry.contracts.abs(),
-                    expiry.derivative.multiplier,
+                    expiry.derivative.size,
                     scale,
                 )?;
                 add_virtual(&mut virtual_cash, &expiry.instrument, term)?;
@@ -1935,18 +1946,30 @@ impl Ledger {
                 expected,
                 position.quantity,
             )?;
-            let derivative_scale = match self.instruments.get(id) {
+            let derivative = match self.instruments.get(id) {
                 Some(Instrument::Spot(_)) | None => None,
                 Some(
-                    registered @ (Instrument::LinearFuture(_) | Instrument::LinearPerpetual(_)),
-                ) => Some(self.asset_scale_or_err(registered.quote())?),
+                    registered @ (Instrument::LinearFuture(_)
+                    | Instrument::LinearPerpetual(_)
+                    | Instrument::InverseFuture(_)
+                    | Instrument::InversePerpetual(_)),
+                ) => Some((
+                    self.asset_scale_or_err(registered.quote())?,
+                    registered.contract_size(),
+                )),
             };
-            if let Some(scale) = derivative_scale {
+            if let Some((scale, size)) = derivative {
                 // Virtual identity, in wide integers: sum of the signed
-                // virtual notionals == realized - basis.
+                // virtual values == realized - basis for a linear contract,
+                // -realized - basis for an inverse one.
                 let expected = virtual_cash.get(id).copied().unwrap_or(Wide::ZERO);
+                let realized = decimal_to_wide(position.realized_pnl, scale, "realized pnl")?;
+                let realized = match size {
+                    ContractSize::Multiplier(_) => realized,
+                    ContractSize::ContractValue(_) => realized.negated(),
+                };
                 let actual = derivative::add_wide(
-                    decimal_to_wide(position.realized_pnl, scale, "realized pnl")?,
+                    realized,
                     decimal_to_wide(position.cost_basis, scale, "basis")?.negated(),
                     "realized - basis",
                 )?;
@@ -1979,6 +2002,28 @@ impl Ledger {
     }
 }
 
+/// The market value of `quantity` of `instrument` at a positive `mark`:
+/// `round(quantity * mark)` for spot (under the ledger's rounding), and for
+/// a derivative always half-even: `rhe(Q * M * mark)`, or `rhe(Q * CV /
+/// mark)` in the base for an inverse one.
+fn position_value(
+    instrument: &Instrument,
+    quantity: Decimal,
+    mark: Decimal,
+    scale: u32,
+    rounding: Rounding,
+) -> Result<Decimal> {
+    if mark <= Decimal::ZERO {
+        return Err(MarginError::invalid_input("mark", "must be positive"));
+    }
+    check_scale(mark, decimal::MAX_SCALE, "mark")?;
+    if let Instrument::Spot(_) = instrument {
+        mul_div_round(&[quantity, mark], &[], scale, rounding, "quantity * mark")
+    } else {
+        derivative::market_value(quantity, instrument.contract_size(), mark, scale)
+    }
+}
+
 fn add_virtual<'a>(
     sums: &mut BTreeMap<&'a InstrumentId, Wide>,
     instrument: &'a InstrumentId,
@@ -2006,14 +2051,14 @@ fn position_snapshot(
     instrument: &InstrumentId,
     quote: &Asset,
     kind: PositionKind,
-    multiplier: Decimal,
+    size: ContractSize,
     position: Position,
 ) -> PositionSnapshot {
     PositionSnapshot {
         instrument: instrument.clone(),
         quote: quote.clone(),
         kind,
-        multiplier,
+        size,
         quantity: position.quantity,
         cost_basis: position.cost_basis,
         realized_pnl: position.realized_pnl,

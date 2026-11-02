@@ -8,6 +8,23 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Inverse futures and perpetuals in the ledger** (#26, part A):
+  `InverseTerms` (settlement in the base asset, contract value `CV` in
+  quote units), `InverseFuture`, `InversePerpetual`, the
+  `Instrument::InverseFuture` / `Instrument::InversePerpetual` and
+  `PositionKind` variants, `ContractSize` and
+  `Instrument::{contract_size, inverse_terms, expiry_ms}`. A fill is worth
+  `V = rhe(n * CV / p)` in the base; the basis is the signed entry value
+  and the realized PnL `Q * CV * (1/entry - 1/exit)`. Funding, expiry and
+  late fills follow the linear rules. Each value's exact rest is recorded
+  as an `InverseResidual` (`DerivativeFill::residual`,
+  `DerivativeFill::closing_residual`). `valuation::value`,
+  `collateral::value_collateral` and `Ledger::valuation` value inverse
+  positions (`upnl = basis - rhe(Q * CV / mark)`). Margin reservations on
+  the ledger, `LiquidationAccount::from_ledger`, the stress scenarios and
+  the risk gate refuse an open inverse position with
+  `UnsupportedInstrument` until parts B and C. See `docs/ledger.md`.
+
 - **Liquidation and margin reservations read the ledger** (#23, part C):
   `LiquidationAccount::from_ledger` builds the closeout account from a
   `LedgerSnapshot` (every open future and perpetual in the plan's currency,
@@ -70,6 +87,12 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** `PositionSnapshot::multiplier` and `DerivativeFill::multiplier`
+  are replaced by `size: ContractSize`, and `Instrument::multiplier` by
+  `Instrument::contract_size`; `DerivativeFill` has the new fields
+  `residual` and `closing_residual`. `Instrument` and `PositionKind` have
+  new variants (both are `non_exhaustive`). Registering an inverse
+  instrument requires the base scale plus its price scale to be at most 28.
 - **Breaking:** `Execution` has the new field `executed_at_ms` (and
   `Execution::with_executed_at`); it is part of the execution, so a repeat
   must carry the same time. It is optional for spot and required for a
