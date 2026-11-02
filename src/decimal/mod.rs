@@ -110,10 +110,25 @@ pub(crate) fn sum_products_round(
     rounding: Rounding,
     operation: &'static str,
 ) -> Result<Decimal> {
+    let terms: Vec<[Decimal; 2]> = terms.iter().map(|(a, b)| [*a, *b]).collect();
+    let terms: Vec<&[Decimal]> = terms.iter().map(|t| t.as_slice()).collect();
+    sum_terms_round(&terms, scale, rounding, operation)
+}
+
+/// `sum(product(term_i))` over terms of any length, computed exactly and
+/// rounded once to `scale` digits. An empty term is the product 1.
+///
+/// Fails if the rounded result cannot be represented.
+pub(crate) fn sum_terms_round(
+    terms: &[&[Decimal]],
+    scale: u32,
+    rounding: Rounding,
+    operation: &'static str,
+) -> Result<Decimal> {
     let error = || MarginError::arithmetic(operation);
     let mut products = Vec::with_capacity(terms.len());
-    for (a, b) in terms {
-        products.push(wide_product(&[*a, *b]).ok_or_else(error)?);
+    for term in terms {
+        products.push(wide_product(term).ok_or_else(error)?);
     }
     let common = products.iter().map(|(_, s)| *s).max().unwrap_or(0);
     let mut sum = Wide::ZERO;

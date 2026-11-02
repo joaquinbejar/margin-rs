@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use rust_decimal::Decimal;
 
 use crate::ids::{Asset, InstrumentId, ReservationId};
+use crate::instrument::Instrument;
 
 /// Balance of one asset.
 ///
@@ -65,8 +66,19 @@ impl PositionSnapshot {
 }
 
 /// Copy of the full accounting state, with deterministic ordering.
+///
+/// A snapshot is immutable and self contained: it carries the asset scales
+/// and instrument definitions, so valuation and stress functions
+/// ([`crate::valuation::value`], [`crate::scenarios::stress`]) work on it
+/// without touching the ledger.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LedgerSnapshot {
+    /// Registered assets and their scales.
+    pub assets: BTreeMap<Asset, u32>,
+    /// Registered instruments.
+    pub instruments: BTreeMap<InstrumentId, Instrument>,
+    /// Deposits minus withdrawals, per asset.
+    pub net_transfers: BTreeMap<Asset, Decimal>,
     /// Balance per asset, for every registered asset.
     pub balances: BTreeMap<Asset, BalanceSnapshot>,
     /// Position per instrument, for every registered instrument.
