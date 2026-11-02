@@ -12,10 +12,21 @@
 //! When a venue keeps its own account state, it owns the trigger, that
 //! state and the cancellation of resting orders; margin-rs owns the plan: what to close, in what order, how much, and
 //! what is left. The [maintenance assessment](crate::maintenance) tells the
-//! core where the account stands; the plan tells it what to do. The cash a
-//! plan moves is posted, fill by fill, as
-//! [`DerivativeSettlement`]s in the [`Ledger`](crate::ledger::Ledger)
-//! ([`ForcedReduction::settlement`]).
+//! core where the account stands; the plan tells it what to do.
+//!
+//! # From and back to the ledger
+//!
+//! When the positions live in the [`Ledger`](crate::ledger::Ledger) as
+//! linear futures and perpetuals, [`LiquidationAccount::from_ledger`] reads
+//! the account from a [`LedgerSnapshot`] and each forced fill is booked back
+//! as an [`Execution`] ([`ForcedReduction::execution`]) with
+//! [`Ledger::book_execution_allowing_overdraft`](crate::ledger::Ledger::book_execution_allowing_overdraft).
+//! The ledger books derivatives with the
+//! [cash conventions](self#cash-conventions) below, so booking the plan
+//! leaves exactly the cash, contracts and basis of
+//! [`LiquidationPlan::after`]. For positions kept outside the ledger, the
+//! account is built by hand and the cash of each fill is posted as a
+//! [`DerivativeSettlement`] ([`ForcedReduction::settlement`]).
 //!
 //! # Stages
 //!
@@ -107,9 +118,10 @@ use crate::direction::Dir;
 use crate::error::{MarginError, Result};
 use crate::ids::{AccountId, Asset, ExecutionId, InstrumentId, OrderId, VenueId};
 use crate::initial_margin::{
-    ExposurePosition, ExposureView, MarginRequirement, PiecewiseLinearMargin, RuleId,
+    ExposurePosition, ExposureView, MarginRequirement, PiecewiseLinearMargin, ProductKind, RuleId,
 };
-use crate::ledger::{Action, DerivativeSettlement};
+use crate::instrument::Instrument;
+use crate::ledger::{Action, DerivativeSettlement, Execution, LedgerSnapshot};
 
 /// When the closeout stops.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -150,13 +162,147 @@ pub struct LiquidationAccount {
     /// Positions and marks.
     pub view: ExposureView,
     /// Signed basis of each open position (see the
-    /// [cash conventions](self#cash-conventions)).
+    /// [cash conventions](self#cash-conventions)): zero, or of the sign of
+    /// the position.
     pub basis: BTreeMap<InstrumentId, Decimal>,
     /// Cash in the rule's currency: collateral other than the unrealized
     /// PnL of the positions in `view`.
     pub cash: Decimal,
     /// The account's resting orders, all cancelled by the plan.
     pub resting_orders: Vec<OrderId>,
+}
+
+impl LiquidationAccount {
+    /// The account of `snapshot`'s ledger in `currency`, at instrument
+    /// `marks` (per unit of the underlying, in `currency`), with no resting
+    /// orders: set [`LiquidationAccount::resting_orders`] before planning.
+    ///
+    /// - Positions: every open linear future and perpetual, with its
+    ///   contracts, the multiplier of the ledger's instrument and its mark;
+    ///   the instrument definitions of the snapshot are authoritative and
+    ///   marks never change them.
+    /// - Basis: each position's cost basis.
+    /// - Cash: the **total** balance of `currency`, reservations included
+    ///   (a closeout is not limited to the available part); zero without a
+    ///   balance row.
+    ///
+    /// Spot holdings, in `currency` or any other asset, are not part of the
+    /// plan: the plan closes derivatives only, and its collateral is the
+    /// cash plus their unrealized PnL. Every open derivative must settle in
+    /// `currency`; one in another asset is an error, never left out.
+    ///
+    /// `as_of_ms` is when the closeout runs: a future whose expiry is at or
+    /// before it can no longer trade (a forced fill would be
+    /// [`MarginError::ExecutedAfterExpiry`]) and must be settled first with
+    /// [`Ledger::settle_expiry`](crate::ledger::Ledger::settle_expiry);
+    /// settled futures are flat and take no part.
+    ///
+    /// # Errors
+    ///
+    /// - [`MarginError::UnknownAsset`] if `currency` is not registered.
+    /// - [`MarginError::InvalidInput`] if the scale of `currency` is not the
+    ///   rule's [`cash_scale`](PiecewiseLinearMargin::cash_scale) (the plan
+    ///   and the ledger must round to the same quantum), or a mark is not
+    ///   positive.
+    /// - [`MarginError::CurrencyMismatch`] for an open derivative settled in
+    ///   another asset.
+    /// - [`MarginError::ExecutedAfterExpiry`] for an open future whose
+    ///   expiry is at or before `as_of_ms`.
+    /// - [`MarginError::MissingMark`] for an open derivative without a mark.
+    /// - [`MarginError::PrecisionExceeded`] for a mark with more than 18
+    ///   decimals.
+    /// - [`MarginError::UnknownInstrument`] for a position whose instrument
+    ///   the snapshot does not define.
+    pub fn from_ledger<M: PiecewiseLinearMargin>(
+        model: &M,
+        snapshot: &LedgerSnapshot,
+        account: AccountId,
+        venue: VenueId,
+        currency: &Asset,
+        marks: &BTreeMap<InstrumentId, Decimal>,
+        as_of_ms: u64,
+    ) -> Result<Self> {
+        let scale = *snapshot
+            .assets
+            .get(currency)
+            .ok_or_else(|| MarginError::UnknownAsset {
+                asset: currency.clone(),
+            })?;
+        if scale != model.cash_scale() {
+            return Err(MarginError::invalid_input(
+                "currency",
+                "its ledger scale must be the rule's cash scale",
+            ));
+        }
+        let mut positions = Vec::new();
+        let mut basis = BTreeMap::new();
+        for (id, position) in &snapshot.positions {
+            if position.quantity.is_zero() {
+                continue;
+            }
+            let (product, terms) = match snapshot.instruments.get(id) {
+                Some(Instrument::Spot(_)) => continue,
+                Some(Instrument::LinearFuture(future)) => {
+                    if future.expiry_ms() <= as_of_ms {
+                        return Err(MarginError::ExecutedAfterExpiry {
+                            instrument: id.clone(),
+                            executed_at_ms: as_of_ms,
+                            expiry_ms: future.expiry_ms(),
+                        });
+                    }
+                    (ProductKind::LinearFuture, future.terms())
+                }
+                Some(Instrument::LinearPerpetual(perpetual)) => {
+                    (ProductKind::LinearPerpetual, perpetual.terms())
+                }
+                None => {
+                    return Err(MarginError::UnknownInstrument {
+                        instrument: id.clone(),
+                    });
+                }
+            };
+            if terms.settlement() != currency {
+                return Err(MarginError::CurrencyMismatch {
+                    field: "settlement",
+                    expected: currency.clone(),
+                    found: terms.settlement().clone(),
+                });
+            }
+            let mark = *marks.get(id).ok_or_else(|| MarginError::MissingMark {
+                instrument: id.clone(),
+            })?;
+            if mark <= Decimal::ZERO {
+                return Err(MarginError::invalid_input(
+                    "instrument mark",
+                    "must be positive",
+                ));
+            }
+            check_scale(mark, MAX_SCALE, "instrument mark")?;
+            positions.push(ExposurePosition {
+                instrument: id.clone(),
+                product,
+                settlement: currency.clone(),
+                contracts: position.quantity,
+                multiplier: terms.multiplier(),
+                mark,
+            });
+            basis.insert(id.clone(), position.cost_basis);
+        }
+        let cash = snapshot
+            .balances
+            .get(currency)
+            .map_or(Decimal::ZERO, |b| b.total);
+        Ok(Self {
+            view: ExposureView {
+                account,
+                venue,
+                positions,
+            },
+            basis,
+            cash,
+            resting_orders: Vec::new(),
+        })
+    }
 }
 
 /// One forced fill of the plan.
@@ -185,8 +331,30 @@ pub struct ForcedReduction {
 }
 
 impl ForcedReduction {
-    /// The ledger posting of this fill, under the execution id the venue
-    /// gave it, in the plan's currency.
+    /// This fill as a ledger execution of a linear future or perpetual,
+    /// under the execution id the venue gave it: side, price, contracts and
+    /// a fee in the plan's `currency`, executed at `executed_at_ms`. Booked
+    /// with
+    /// [`Ledger::book_execution_allowing_overdraft`](crate::ledger::Ledger::book_execution_allowing_overdraft)
+    /// (it is mandatory), it moves cash by exactly `realized_pnl - fee` and
+    /// releases `released_basis`, as the plan does. See
+    /// [from and back to the ledger](self#from-and-back-to-the-ledger).
+    #[must_use]
+    pub fn execution(&self, id: ExecutionId, currency: Asset, executed_at_ms: u64) -> Execution {
+        Execution::new(
+            id,
+            self.instrument.clone(),
+            self.side,
+            self.price,
+            self.contracts,
+        )
+        .with_fee(currency, self.fee)
+        .with_executed_at(executed_at_ms)
+    }
+
+    /// The cash of this fill as a [`DerivativeSettlement`], for positions
+    /// kept outside the ledger, under the execution id the venue gave it,
+    /// in the plan's currency.
     #[must_use]
     pub fn settlement(&self, id: ExecutionId, currency: Asset) -> DerivativeSettlement {
         DerivativeSettlement {
@@ -667,11 +835,12 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
                     "given for an instrument without an open position",
                 ));
             };
-            // A long is bought at positive prices, a short sold at them.
-            if basis.is_zero() || basis.is_sign_negative() != contracts.is_sign_negative() {
+            // A long is bought at positive prices, a short sold at them; a
+            // basis rounded to zero is possible.
+            if !basis.is_zero() && basis.is_sign_negative() != contracts.is_sign_negative() {
                 return Err(MarginError::invalid_input(
                     "basis",
-                    "must be non zero and have the sign of the position",
+                    "must be zero or have the sign of the position",
                 ));
             }
             check_scale(*basis, self.scale, "basis")?;
@@ -723,7 +892,7 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
 ///
 /// - [`MarginError::InvalidInput`] for an invalid policy (fee rate outside
 ///   `[0, 1)`, non positive step), a basis missing for an open position,
-///   given for a closed one, zero or of the opposite sign to the position,
+///   given for a closed one, or of the opposite sign to the position,
 ///   repeated resting orders, or liquidity levels that are not positive or
 ///   not ordered from the best price.
 /// - [`MarginError::PrecisionExceeded`] if cash or a basis has more digits

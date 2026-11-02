@@ -11,7 +11,8 @@
   - `request_cancel`, `on_cancel_confirmed`;
   - `on_fill`;
   - `trip`, `resume`;
-  - `deposit`, `withdraw`.
+  - `deposit`, `withdraw`;
+  - `book_derivative_execution`, `book_funding`, `settle_expiry`: postings of linear futures and perpetuals, which are mandatory and do not go through orders (a spot execution is refused by `book_derivative_execution`).
 - Every order is decided again on every submission. A policy that keeps proposing an invalid order gets it rejected every time.
 - An order id is recorded together with its decision, including when the decision is a rejection. A repeated id is rejected with `DuplicateOrderId` and never reserves twice.
 

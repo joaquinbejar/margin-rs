@@ -8,6 +8,22 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Liquidation and margin reservations read the ledger** (#23, part C):
+  `LiquidationAccount::from_ledger` builds the closeout account from a
+  `LedgerSnapshot` (every open future and perpetual in the plan's currency,
+  the total cash, the ledger's basis; spot left out; derivatives in another
+  asset, missing or non positive marks and expired futures are errors), and
+  `ForcedReduction::execution` books each forced fill back as a mandatory
+  `Execution`, so the booked plan leaves exactly `plan.after`.
+  `MarginReservationService::on_ledger` reads positions from the gate's
+  ledger, counts the unrealized PnL of every open derivative in the
+  settlement asset as collateral, uses its own fixed hold, and takes fills
+  already booked (`apply_booked_fill`, `requirement_with_gate`).
+  `RiskGate::book_derivative_execution`, `RiskGate::book_funding` and
+  `RiskGate::settle_expiry` post derivative executions, funding and expiries
+  through the gate. New errors: `MarginError::FillNotBooked` and
+  `MarginError::WrongReservationMode`.
+
 - **Valuation and collateral of open futures and perpetuals** (#23, part
   B): instrument marks (`MarkSet::instruments`, `MarkSet::with_instrument`;
   per unit of the underlying in the settlement asset). `valuation::value`
@@ -84,6 +100,11 @@ follows [Semantic Versioning](https://semver.org/).
   `set_limits`, `on_market_data` and `submit` (as `RiskReason::InvalidOrder`).
 - `book_settlement` is kept for derivatives that are not registered in the
   ledger (legacy; documented, not deprecated in code).
+- `plan_liquidation` accepts a basis of zero (an entry notional rounded to
+  zero); a non zero basis must still have the sign of the position.
+- `MarginReservationService::reserve_with_gate` refuses an order side other
+  than `Buy` or `Sell` before reading the gate, and a hold in another asset
+  than the settlement asset is `CurrencyMismatch`.
 
 - **Breaking:** the order and execution direction is `financial_types::Action`
   (0.3), shared with the other crates of the stack, re-exported as

@@ -49,6 +49,34 @@ Spot reservations therefore reduce what margin can use, and the margin hold redu
 
 Fills are idempotent by execution id. Reusing an id with another order or quantity returns `ConflictingEntry` and changes nothing.
 
+## Positions read from the ledger
+
+`MarginReservationService::on_ledger(model, account, venue, hold)` builds a service that keeps no positions. Every call reads them from the ledger of the `RiskGate` it is given, where the futures and perpetuals are registered and their fills booked. The service's hold is the `ReservationId` fixed at construction.
+
+| Call | Effect |
+|---|---|
+| `reserve_with_gate(order, &mut gate, &hold, marks)` | As above, with the positions of the ledger and `collateral = available + own hold + sum(upnl)` in the settlement asset, one exact sum. `hold` must be the service's own |
+| `apply_booked_fill(&gate, order, execution_id)` | The fill must already be booked in the gate's ledger; its contracts are the booking's. Only the order's remaining quantity moves |
+| `sync_hold(&mut gate, &hold, marks)` | The hold follows the ledger's positions |
+| `requirement_with_gate(&gate, marks)` | The requirement, positions read from the ledger |
+
+**Collateral counts every open derivative.** The unrealized PnL `rhe(Q * M * mark) - basis` covers every open linear future and perpetual in the ledger settled in the service's asset, including the ones this service does not trade. A loss on another strategy's position is never left out. Each needs a mark: a missing one rejects the order with `MissingMark`, never a zero, and a mark that is not positive is `InvalidInput`. Derivatives settled in other assets do not count.
+
+**Own hold once, foreign holds never.** `available` already excludes every reservation. The service adds back its own hold, read by its own id and checked to be in the settlement asset (`CurrencyMismatch` otherwise), and nothing else. On acceptance the hold becomes `min(required, max(available + own hold, 0))`: a hold takes cash only, never unrealized gains.
+
+**Booking protocol.** The caller books each fill first, with `RiskGate::book_derivative_execution` (mandatory: booked even into debt), then reports it:
+
+- not booked yet: `FillNotBooked`, nothing changes;
+- reported again for the same order: `Ok(false)`, nothing changes, so the remaining quantity never moves twice;
+- reported for another order, or booked with another instrument or side than the order: `ConflictingEntry`;
+- otherwise the remaining quantity falls by the booked contracts (an overfill closes the order).
+
+The hold is then synced with `sync_hold`, which reads the position the ledger already holds, so it never follows a stale position.
+
+**Registry.** Every registered instrument must be a linear future or perpetual of the ledger with the same product, settlement asset and multiplier (`UnknownInstrument`, `InvalidInput` or `CurrencyMismatch` otherwise).
+
+**Explicit modes.** On the ledger, `reserve`, `requirement` and `apply_fill` are `WrongReservationMode`, and so is `apply_booked_fill` on a service with its own positions.
+
 ## Account in debt
 
 Cash can go negative after a mandatory debit (a fee, a realized loss or a closeout settlement; see `docs/liquidation.md`). Then collateral, which is the available cash plus the current hold, is negative too:

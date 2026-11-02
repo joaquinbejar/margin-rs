@@ -103,7 +103,10 @@ use crate::direction::Dir;
 use crate::error::{MarginError, Result};
 use crate::ids::{Asset, InstrumentId, OrderId, ReservationId, TransferId};
 use crate::instrument::{Instrument, SpotInstrument};
-use crate::ledger::{Action, Booking, Ledger};
+use crate::ledger::{
+    Action, Booking, Execution, ExpiryCashflow, ExpirySettlement, FundingCashflow, FundingPayment,
+    Ledger, OverdraftBooking, PostingBooking,
+};
 
 /// Hard limits for one instrument. `None` disables a limit.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -389,6 +392,52 @@ impl RiskGate {
     /// As [`Ledger::withdraw`].
     pub fn withdraw(&mut self, id: TransferId, asset: Asset, amount: Decimal) -> Result<bool> {
         self.ledger.withdraw(id, asset, amount)
+    }
+
+    /// Books an execution of a linear future or perpetual that already
+    /// happened at a venue, through
+    /// [`Ledger::book_execution_allowing_overdraft`] with no reservation: it
+    /// is mandatory and booked even if it overdraws the account, and a
+    /// repeated identical execution changes nothing. Spot executions go
+    /// through the gate's orders ([`RiskGate::on_fill`]).
+    ///
+    /// # Errors
+    ///
+    /// [`MarginError::InvalidInput`] for a spot instrument; otherwise every
+    /// error of [`Ledger::book_execution_allowing_overdraft`].
+    pub fn book_derivative_execution(&mut self, execution: &Execution) -> Result<OverdraftBooking> {
+        if let Some(Instrument::Spot(_)) = self.ledger.instrument(&execution.instrument) {
+            return Err(MarginError::invalid_input(
+                "execution",
+                "spot executions are booked through the gate's orders",
+            ));
+        }
+        self.ledger
+            .book_execution_allowing_overdraft(execution, None)
+    }
+
+    /// Books a perpetual's funding payment. See [`Ledger::book_funding`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Ledger::book_funding`].
+    pub fn book_funding(
+        &mut self,
+        payment: &FundingPayment,
+    ) -> Result<PostingBooking<FundingCashflow>> {
+        self.ledger.book_funding(payment)
+    }
+
+    /// Settles a future at expiry. See [`Ledger::settle_expiry`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Ledger::settle_expiry`].
+    pub fn settle_expiry(
+        &mut self,
+        settlement: &ExpirySettlement,
+    ) -> Result<PostingBooking<ExpiryCashflow>> {
+        self.ledger.settle_expiry(settlement)
     }
 
     /// Sets an external hold: a named ledger reservation of exactly

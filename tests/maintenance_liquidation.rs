@@ -840,19 +840,24 @@ mod review {
         assert_eq!(plan.debt, dec!(0));
     }
 
-    /// n1: the basis must be non zero and have the sign of the position.
+    /// n1: a non zero basis must have the sign of the position. A basis
+    /// of zero (an entry notional rounded to zero) is valid.
     #[test]
     fn basis_sign_must_match_the_position() {
         let liquidity = bids(&[(dec!(94), dec!(10))]);
         let good = policy(CloseoutTarget::Maintenance);
-        for basis in [dec!(0), dec!(-1000)] {
-            let mut account = long_btc(dec!(90));
-            account.basis.insert(iid("BTC-PERP"), basis);
-            assert!(matches!(
-                plan_liquidation(&rule(), &account, &liquidity, &good),
-                Err(MarginError::InvalidInput { field: "basis", .. })
-            ));
-        }
+        let mut account = long_btc(dec!(90));
+        account.basis.insert(iid("BTC-PERP"), dec!(-1000));
+        assert!(matches!(
+            plan_liquidation(&rule(), &account, &liquidity, &good),
+            Err(MarginError::InvalidInput { field: "basis", .. })
+        ));
+        let mut zero = long_btc(dec!(90));
+        zero.basis.insert(iid("BTC-PERP"), dec!(0));
+        let plan = plan_liquidation(&rule(), &zero, &liquidity, &good).expect("plan");
+        // upnl = 950 - 0: the account is healthy.
+        assert_eq!(plan.before.collateral, dec!(1040));
+        assert_eq!(plan.outcome, CloseoutOutcome::AlreadyMet);
         let mut short = long_btc(dec!(90));
         short.view.positions[0].contracts = dec!(-10);
         assert!(matches!(
