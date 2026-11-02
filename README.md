@@ -3,7 +3,7 @@
 [![Stars](https://img.shields.io/github/stars/joaquinbejar/margin-rs.svg)](https://github.com/joaquinbejar/margin-rs/stargazers)
 [![Issues](https://img.shields.io/github/issues/joaquinbejar/margin-rs.svg)](https://github.com/joaquinbejar/margin-rs/issues)
 [![PRs](https://img.shields.io/github/issues-pr/joaquinbejar/margin-rs.svg)](https://github.com/joaquinbejar/margin-rs/pulls)
-[![MSRV](https://img.shields.io/badge/MSRV-1.85-orange)](./rust-toolchain.toml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-orange)](./rust-toolchain.toml)
 [![Documentation](https://img.shields.io/badge/docs-latest-blue.svg)](https://docs.rs/margin-rs)
 
 # margin-rs
@@ -126,7 +126,7 @@ margin-rs = { git = "https://github.com/joaquinbejar/margin-rs" }
 ### Ledger
 
 ```rust
-use margin_rs::ledger::{Execution, Ledger, Side};
+use margin_rs::ledger::{Execution, Ledger, Action};
 use margin_rs::{Asset, Decimal, ExecutionId, InstrumentId, SpotInstrument, TransferId};
 
 fn main() -> margin_rs::Result<()> {
@@ -140,7 +140,7 @@ fn main() -> margin_rs::Result<()> {
     ledger.register_instrument(SpotInstrument::new(pair.clone(), btc, usdc.clone(), 2, 8)?)?;
     ledger.deposit(TransferId::new("d1")?, usdc.clone(), Decimal::from(1000))?;
 
-    let buy = Execution::new(ExecutionId::new("e1")?, pair, Side::Buy, Decimal::from(100), Decimal::from(2))
+    let buy = Execution::new(ExecutionId::new("e1")?, pair, Action::Buy, Decimal::from(100), Decimal::from(2))
         .with_fee(usdc.clone(), Decimal::new(2, 1)); // 0.2 USDC
     ledger.book_execution(&buy)?;
     ledger.book_execution(&buy)?; // duplicate: ignored
@@ -154,7 +154,7 @@ fn main() -> margin_rs::Result<()> {
 ### Pretrade risk gate
 
 ```rust
-use margin_rs::ledger::{Execution, Ledger, Side};
+use margin_rs::ledger::{Execution, Ledger, Action};
 use margin_rs::risk::{FillReport, InstrumentLimits, OrderRequest, RiskGate};
 use margin_rs::{Asset, Decimal, ExecutionId, InstrumentId, OrderId, SpotInstrument, TransferId};
 
@@ -172,13 +172,13 @@ fn main() -> margin_rs::Result<()> {
     gate.set_limits(&pair, InstrumentLimits::default())?;
 
     // 1000 USDC: a buy of 6 at 100 reserves 600; a second one does not fit.
-    let first = OrderRequest::new(OrderId::new("o1")?, pair.clone(), Side::Buy, Decimal::from(100), Decimal::from(6));
-    let second = OrderRequest::new(OrderId::new("o2")?, pair.clone(), Side::Buy, Decimal::from(100), Decimal::from(6));
+    let first = OrderRequest::new(OrderId::new("o1")?, pair.clone(), Action::Buy, Decimal::from(100), Decimal::from(6));
+    let second = OrderRequest::new(OrderId::new("o2")?, pair.clone(), Action::Buy, Decimal::from(100), Decimal::from(6));
     assert!(!gate.submit(&first, 0).is_rejected());
     assert!(gate.submit(&second, 0).is_rejected());
 
     // The fill consumes the reservation exactly once.
-    let fill = Execution::new(ExecutionId::new("e1")?, pair, Side::Buy, Decimal::from(100), Decimal::from(6));
+    let fill = Execution::new(ExecutionId::new("e1")?, pair, Action::Buy, Decimal::from(100), Decimal::from(6));
     assert!(gate.on_fill(&OrderId::new("o1")?, &FillReport::new(fill, Decimal::from(6)))?.is_clean());
     assert_eq!(gate.ledger().balance(&usdc).map(|b| b.available), Some(Decimal::from(400)));
     Ok(())
@@ -274,7 +274,7 @@ See [docs/exact-arithmetic.md](docs/exact-arithmetic.md).
 
 - Version 0.1, not yet published; the API may change before the first
   release.
-- Rust edition 2024, MSRV 1.85. CI runs the latest stable and the MSRV.
+- Rust edition 2024, MSRV 1.88. CI runs the latest stable and the MSRV.
 - Small dependency set: `thiserror` and `rust_decimal` (without default
   features). margin-rs never depends on market-maker-rs. Planned
   integration: market-maker-rs does not depend on margin-rs yet.
@@ -290,7 +290,7 @@ make fmt         # Format the code
 make fmt-check   # Check formatting
 make lint        # Clippy with warnings as errors
 make doc         # Documentation with warnings as errors
-make msrv        # Build and test on the MSRV (1.85)
+make msrv        # Build and test on the MSRV (1.88)
 make pre-push    # fmt-check, lint, test, doc and msrv
 ```
 

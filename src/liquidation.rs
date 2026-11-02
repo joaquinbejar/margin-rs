@@ -103,12 +103,13 @@ use crate::decimal::grid::{ContractGrid, GridIndex};
 use crate::decimal::{
     MAX_SCALE, Rounding, add, check_scale, mul_div_round, neg, sub, sum, sum_products,
 };
+use crate::direction::Dir;
 use crate::error::{MarginError, Result};
 use crate::ids::{AccountId, Asset, ExecutionId, InstrumentId, OrderId, VenueId};
 use crate::initial_margin::{
     ExposurePosition, ExposureView, MarginRequirement, PiecewiseLinearMargin, RuleId,
 };
-use crate::ledger::{DerivativeSettlement, Side};
+use crate::ledger::{Action, DerivativeSettlement};
 
 /// When the closeout stops.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -164,7 +165,7 @@ pub struct ForcedReduction {
     /// Instrument.
     pub instrument: InstrumentId,
     /// `Sell` to reduce a long, `Buy` to reduce a short.
-    pub side: Side,
+    pub side: Action,
     /// Index of the liquidity level used.
     pub level: usize,
     /// Execution price.
@@ -251,8 +252,8 @@ pub enum CloseoutIntent {
     Reduce {
         /// Instrument.
         instrument: InstrumentId,
-        /// Side.
-        side: Side,
+        /// Action.
+        side: Action,
         /// Contracts, positive.
         contracts: Decimal,
         /// Worst acceptable price: the last level the plan uses.
@@ -300,9 +301,16 @@ impl LiquidationPlan {
     ///
     /// # Errors
     ///
-    /// [`MarginError::Arithmetic`] if a sum cannot be represented (it is
-    /// at most the position the plan started from).
+    /// - [`MarginError::UnsupportedAction`] if a reduction's side is not
+    ///   `Buy` or `Sell`. Plans built by [`plan_liquidation`] never have one,
+    ///   but the fields are public; every reduction is checked before any
+    ///   intent is built.
+    /// - [`MarginError::Arithmetic`] if a sum cannot be represented (it is
+    ///   at most the position the plan started from).
     pub fn intents(&self) -> Result<Vec<CloseoutIntent>> {
+        for reduction in &self.reductions {
+            Dir::from_action(reduction.side, "reduction side")?;
+        }
         let mut intents: Vec<CloseoutIntent> = self
             .cancels
             .iter()
@@ -313,7 +321,7 @@ impl LiquidationPlan {
         // Per instrument, in first reduction order: side, contracts of every
         // fill and the last (worst) price.
         let mut order: Vec<&InstrumentId> = Vec::new();
-        let mut fills: BTreeMap<&InstrumentId, (Side, Vec<Decimal>, Decimal)> = BTreeMap::new();
+        let mut fills: BTreeMap<&InstrumentId, (Action, Vec<Decimal>, Decimal)> = BTreeMap::new();
         for reduction in &self.reductions {
             let entry = fills.entry(&reduction.instrument).or_insert_with(|| {
                 order.push(&reduction.instrument);
@@ -574,9 +582,9 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
             "p * n * M",
         )?;
         let (side, fill_cash, contracts_after) = if held > Decimal::ZERO {
-            (Side::Sell, notional, sub(held, contracts, "Qc - n")?)
+            (Action::Sell, notional, sub(held, contracts, "Qc - n")?)
         } else {
-            (Side::Buy, neg(notional), add(held, contracts, "Qc + n")?)
+            (Action::Buy, neg(notional), add(held, contracts, "Qc + n")?)
         };
         let released_basis = if contracts == held_abs {
             open.basis

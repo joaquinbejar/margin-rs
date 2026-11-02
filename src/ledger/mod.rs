@@ -34,7 +34,7 @@
 //! # Example
 //!
 //! ```
-//! use margin_rs::ledger::{Execution, Ledger, Side};
+//! use margin_rs::ledger::{Execution, Ledger, Action};
 //! use margin_rs::{Asset, ExecutionId, InstrumentId, SpotInstrument, TransferId};
 //! use rust_decimal_macros::dec;
 //!
@@ -49,7 +49,7 @@
 //! ledger.register_instrument(SpotInstrument::new(pair.clone(), btc.clone(), usdc.clone(), 2, 8)?)?;
 //! ledger.deposit(TransferId::new("d1")?, usdc.clone(), dec!(1000))?;
 //!
-//! let buy = Execution::new(ExecutionId::new("e1")?, pair.clone(), Side::Buy, dec!(100), dec!(2))
+//! let buy = Execution::new(ExecutionId::new("e1")?, pair.clone(), Action::Buy, dec!(100), dec!(2))
 //!     .with_fee(usdc.clone(), dec!(0.2));
 //! assert!(ledger.book_execution(&buy)?.is_new());
 //! assert!(!ledger.book_execution(&buy)?.is_new()); // duplicate: no effect
@@ -71,7 +71,7 @@ use std::collections::BTreeMap;
 
 use rust_decimal::Decimal;
 
-pub use execution::{Booking, Execution, ExecutionCashflow, Fee, Side};
+pub use execution::{Action, Booking, Execution, ExecutionCashflow, Fee};
 pub use settlement::{DerivativeSettlement, SettlementBooking, SettlementCashflow};
 
 pub use snapshot::{BalanceSnapshot, LedgerSnapshot, PositionSnapshot};
@@ -80,6 +80,7 @@ pub use valuation::{AssetPnl, PositionValuation, Valuation};
 use crate::decimal::{
     self, Rounding, add, check_configured_scale, check_scale, mul, mul_div_round, neg, sub,
 };
+use crate::direction::Dir;
 use crate::error::{MarginError, Result};
 use crate::ids::{Asset, ExecutionId, InstrumentId, ReservationId, TransferId};
 use crate::instrument::Instrument;
@@ -546,6 +547,8 @@ impl Ledger {
     ///
     /// The ledger is unchanged on any error.
     ///
+    /// - [`MarginError::UnsupportedAction`]: the side is not `Buy` or `Sell`
+    ///   (for example `Action::Other`), refused before anything else.
     /// - [`MarginError::ConflictingEntry`]: the id was booked with different
     ///   content.
     /// - [`MarginError::UnknownInstrument`] or [`MarginError::UnknownAsset`]
@@ -627,6 +630,8 @@ impl Ledger {
         reservation: Option<(&ReservationId, Decimal)>,
         allow_overdraft: bool,
     ) -> Result<(Booking, BTreeMap<Asset, Decimal>)> {
+        // Refused before the duplicate check and before any change.
+        let dir = Dir::from_action(execution.side, "execution side")?;
         if let Some((previous, index)) = self.executions.get(&execution.id) {
             if previous == execution {
                 return Ok((
@@ -689,9 +694,9 @@ impl Ledger {
             notional_exact.and_then(|exact| sub(notional, exact, "notional - exact").ok());
 
         // Signed quantity and signed quote value (positive when buying).
-        let (signed_quantity, signed_value) = match execution.side {
-            Side::Buy => (execution.quantity, notional),
-            Side::Sell => (neg(execution.quantity), neg(notional)),
+        let (signed_quantity, signed_value) = match dir {
+            Dir::Buy => (execution.quantity, notional),
+            Dir::Sell => (neg(execution.quantity), neg(notional)),
         };
 
         // Changes per asset, each summed in one exact step (a fee in the
@@ -743,10 +748,10 @@ impl Ledger {
         };
 
         let mut touched: Vec<&Asset> = deltas.keys().collect();
-        if let Some((_, asset, _, _)) = &reservation_change {
-            if !deltas.contains_key(asset) {
-                touched.push(asset);
-            }
+        if let Some((_, asset, _, _)) = &reservation_change
+            && !deltas.contains_key(asset)
+        {
+            touched.push(asset);
         }
         let mut new_balances = Vec::with_capacity(touched.len());
         let mut shortfalls = BTreeMap::new();
@@ -1217,9 +1222,9 @@ impl Ledger {
             if let Some(fee) = &cashflow.fee {
                 fee_terms.entry(&fee.asset).or_default().push(fee.amount);
             }
-            let (quantity, cash) = match cashflow.side {
-                Side::Buy => (cashflow.quantity, neg(cashflow.notional)),
-                Side::Sell => (neg(cashflow.quantity), cashflow.notional),
+            let (quantity, cash) = match Dir::from_action(cashflow.side, "cashflow side")? {
+                Dir::Buy => (cashflow.quantity, neg(cashflow.notional)),
+                Dir::Sell => (neg(cashflow.quantity), cashflow.notional),
             };
             quantity_terms
                 .entry(&cashflow.instrument)

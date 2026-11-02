@@ -1,6 +1,6 @@
 # Makefile for margin-rs
 
-MSRV := 1.85.0
+MSRV := 1.88.0
 
 .PHONY: all
 all: pre-push

@@ -37,10 +37,11 @@ use std::collections::BTreeMap;
 use rust_decimal::Decimal;
 
 use crate::decimal::{Rounding, add, check_scale, mul_div_round, neg, product, sub, sum};
+use crate::direction::Dir;
 use crate::error::{MarginError, Result};
 use crate::ids::{Asset, InstrumentId};
 use crate::instrument::Instrument;
-use crate::ledger::{Fee, LedgerSnapshot, Position, Side, apply_fill};
+use crate::ledger::{Action, Fee, LedgerSnapshot, Position, apply_fill};
 use crate::valuation::{AccountValuation, MarkSet, ValuationPolicy, value};
 
 /// A fill assumed to happen in a scenario.
@@ -49,7 +50,7 @@ pub struct HypotheticalFill {
     /// Instrument traded.
     pub instrument: InstrumentId,
     /// Direction.
-    pub side: Side,
+    pub side: Action,
     /// Execution price.
     pub price: Decimal,
     /// Quantity.
@@ -126,6 +127,8 @@ pub struct StressResult {
 /// # Errors
 ///
 /// - Every error of [`value`].
+/// - [`MarginError::UnsupportedAction`] for a fill side that is not `Buy`
+///   or `Sell`.
 /// - [`MarginError::UnknownInstrument`] or [`MarginError::UnknownAsset`] for
 ///   a fill on an unknown instrument or with a fee in an unknown asset.
 /// - [`MarginError::InvalidInput`] for a non positive fill price or
@@ -162,6 +165,9 @@ pub fn stress(
                 "must be greater than -1",
             ));
         }
+    }
+    for fill in &scenario.fills {
+        Dir::from_action(fill.side, "fill side")?;
     }
 
     let base = value(snapshot, marks, policy)?;
@@ -259,9 +265,9 @@ fn apply_hypothetical(
         rounding,
         "price * quantity",
     )?;
-    let (signed_quantity, signed_value) = match fill.side {
-        Side::Buy => (fill.quantity, notional),
-        Side::Sell => (neg(fill.quantity), neg(notional)),
+    let (signed_quantity, signed_value) = match Dir::from_action(fill.side, "fill side")? {
+        Dir::Buy => (fill.quantity, notional),
+        Dir::Sell => (neg(fill.quantity), neg(notional)),
     };
     // Every change to one asset is summed in one exact step, so a fee in
     // the base or quote asset cannot make an intermediate overflow.

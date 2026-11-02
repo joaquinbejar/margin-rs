@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use margin_rs::initial_margin::{
     ExposurePosition, ExposureView, InitialMarginModel, MarginRequirement, ProductKind, RuleId,
 };
-use margin_rs::ledger::{DerivativeSettlement, Execution, Ledger, Side};
+use margin_rs::ledger::{Action, DerivativeSettlement, Execution, Ledger};
 use margin_rs::liquidation::{
     CloseoutIntent, CloseoutOutcome, CloseoutTarget, LiquidationAccount, LiquidationPlan,
     LiquidationPolicy, LiquidityLevel, plan_liquidation,
@@ -350,7 +350,7 @@ mod plan {
         let fill = &plan.reductions[0];
         assert_eq!(
             (fill.side, fill.level, fill.price, fill.contracts),
-            (Side::Sell, 0, dec!(94), dec!(3))
+            (Action::Sell, 0, dec!(94), dec!(3))
         );
         assert_eq!(fill.fill_cash, dec!(282));
         assert_eq!(fill.released_basis, dec!(300));
@@ -374,7 +374,7 @@ mod plan {
                 CloseoutIntent::Cancel { order: oid("o2") },
                 CloseoutIntent::Reduce {
                     instrument: iid("BTC-PERP"),
-                    side: Side::Sell,
+                    side: Action::Sell,
                     contracts: dec!(3),
                     limit_price: dec!(94),
                 },
@@ -522,7 +522,7 @@ mod plan {
             plan.intents().expect("intents")[2],
             CloseoutIntent::Reduce {
                 instrument: iid("BTC-PERP"),
-                side: Side::Sell,
+                side: Action::Sell,
                 contracts: dec!(10),
                 limit_price: dec!(93),
             }
@@ -578,9 +578,9 @@ mod plan {
         assert_eq!(
             fills,
             vec![
-                ("ETH-PERP".to_owned(), Side::Buy, dec!(5)),
-                ("ETH-PERP".to_owned(), Side::Buy, dec!(15)),
-                ("BTC-PERP".to_owned(), Side::Sell, dec!(10)),
+                ("ETH-PERP".to_owned(), Action::Buy, dec!(5)),
+                ("ETH-PERP".to_owned(), Action::Buy, dec!(15)),
+                ("BTC-PERP".to_owned(), Action::Sell, dec!(10)),
             ]
         );
         // Buying back 5 at 56 against a basis of -1000 for 20.
@@ -969,7 +969,7 @@ mod ledger_fixtures {
                 SpotInstrument::new(pair.clone(), btc, usdc(), 2, 8).expect("spot"),
             )
             .expect("instrument");
-        let spot = Execution::new(eid("e1"), pair.clone(), Side::Buy, dec!(100), dec!(1));
+        let spot = Execution::new(eid("e1"), pair.clone(), Action::Buy, dec!(100), dec!(1));
         ledger.book_execution(&spot).expect("spot");
 
         let settlement = DerivativeSettlement {
@@ -988,7 +988,7 @@ mod ledger_fixtures {
             ..settlement
         };
         ledger.book_settlement(&settlement).expect("settlement");
-        let reused = Execution::new(eid("s1"), pair.clone(), Side::Sell, dec!(100), dec!(1));
+        let reused = Execution::new(eid("s1"), pair.clone(), Action::Sell, dec!(100), dec!(1));
         assert!(matches!(
             ledger.book_execution(&reused),
             Err(MarginError::ConflictingEntry { .. })
@@ -1045,4 +1045,29 @@ mod ledger_fixtures {
         ));
         assert_eq!(ledger.settlement_journal(), []);
     }
+}
+
+/// A caller-built `Other` reduction is refused by `intents`, wherever it is
+/// in the plan: every reduction is checked before any intent is built.
+#[test]
+fn test_intents_caller_built_other_reduction_is_unsupported() {
+    let base = plan(
+        &long_btc(dec!(200)),
+        &bids(&[(dec!(94), dec!(4)), (dec!(93), dec!(100))]),
+        &policy(CloseoutTarget::Flat),
+    );
+    assert_eq!(base.reductions.len(), 2);
+    for index in 0..base.reductions.len() {
+        let mut tampered = base.clone();
+        tampered.reductions[index].side = Action::Other;
+        assert_eq!(
+            tampered.intents(),
+            Err(MarginError::UnsupportedAction {
+                field: "reduction side",
+                action: Action::Other,
+            }),
+            "reduction {index}"
+        );
+    }
+    assert!(base.intents().is_ok());
 }

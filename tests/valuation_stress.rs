@@ -8,7 +8,7 @@
 )]
 
 use margin_rs::OrderId;
-use margin_rs::ledger::{Execution, Fee, Ledger, Side};
+use margin_rs::ledger::{Action, Execution, Fee, Ledger};
 use margin_rs::risk::{FillReport, InstrumentLimits, OrderRequest, RiskGate};
 use margin_rs::scenarios::{HypotheticalFill, Scenario, stress};
 use margin_rs::valuation::{
@@ -28,7 +28,7 @@ fn pair() -> InstrumentId {
     InstrumentId::new("BTC-USDC").expect("valid id")
 }
 
-fn exec(id: &str, side: Side, price: Decimal, quantity: Decimal) -> Execution {
+fn exec(id: &str, side: Action, price: Decimal, quantity: Decimal) -> Execution {
     Execution::new(
         ExecutionId::new(id).expect("id"),
         pair(),
@@ -60,7 +60,7 @@ fn long_two_btc() -> Ledger {
         .expect("deposit");
     ledger
         .book_execution(
-            &exec("b1", Side::Buy, dec!(100), dec!(2)).with_fee(asset("USDC"), dec!(0.2)),
+            &exec("b1", Action::Buy, dec!(100), dec!(2)).with_fee(asset("USDC"), dec!(0.2)),
         )
         .expect("book");
     ledger
@@ -104,7 +104,7 @@ fn round_trip_reconciles_without_marks() {
     let mut ledger = long_two_btc();
     ledger
         .book_execution(
-            &exec("s1", Side::Sell, dec!(100), dec!(2)).with_fee(asset("USDC"), dec!(0.2)),
+            &exec("s1", Action::Sell, dec!(100), dec!(2)).with_fee(asset("USDC"), dec!(0.2)),
         )
         .expect("book");
     let v = value(&ledger.snapshot(), &MarkSet::new(5000), &policy()).expect("value");
@@ -197,7 +197,7 @@ fn fees_in_another_asset_are_counted_once() {
         .expect("deposit");
     ledger
         .book_execution(
-            &exec("b2", Side::Buy, dec!(100), dec!(1)).with_fee(asset("BNB"), dec!(0.01)),
+            &exec("b2", Action::Buy, dec!(100), dec!(1)).with_fee(asset("BNB"), dec!(0.01)),
         )
         .expect("book");
     let marks =
@@ -229,7 +229,7 @@ fn fees_in_another_asset_are_counted_once() {
 fn off_grid_marks_round_once() {
     let mut ledger = long_two_btc();
     ledger
-        .book_execution(&exec("b2", Side::Buy, dec!(100.01), dec!(0.33333333)))
+        .book_execution(&exec("b2", Action::Buy, dec!(100.01), dec!(0.33333333)))
         .expect("book");
     let v = value(
         &ledger.snapshot(),
@@ -277,7 +277,7 @@ fn mark_set_validation() {
 fn hedge() -> HypotheticalFill {
     HypotheticalFill {
         instrument: pair(),
-        side: Side::Sell,
+        side: Action::Sell,
         price: dec!(100),
         quantity: dec!(2),
         fee: Some(Fee {
@@ -404,7 +404,7 @@ fn stress_keeps_invalid_marks_out_of_collateral() {
 fn sell_btc(quantity: Decimal) -> HypotheticalFill {
     HypotheticalFill {
         instrument: pair(),
-        side: Side::Sell,
+        side: Action::Sell,
         price: dec!(100),
         quantity,
         fee: None,
@@ -480,7 +480,7 @@ fn hedge_debt_in_a_stale_quote_asset() {
         .with(asset("USDT"), Mark::new(dec!(1), 1000, PriceSource::Index));
     let hedge = Scenario::new("hedge").fill(HypotheticalFill {
         instrument: btc_usdt,
-        side: Side::Buy,
+        side: Action::Buy,
         price: dec!(100),
         quantity: dec!(1),
         fee: None,
@@ -537,7 +537,7 @@ fn overdrawing_fees_and_debt_liquidation() {
 fn closed_position_attribution_needs_no_base_mark() {
     let mut ledger = long_two_btc();
     ledger
-        .book_execution(&exec("s1", Side::Sell, dec!(110), dec!(2)))
+        .book_execution(&exec("s1", Action::Sell, dec!(110), dec!(2)))
         .expect("book");
     let v = value(&ledger.snapshot(), &MarkSet::new(5000), &policy()).expect("value");
     assert!(v.is_clean());
@@ -616,12 +616,12 @@ fn gate_overdraft_is_valued_as_a_debt() {
     gate.set_limits(&pair(), InstrumentLimits::default())
         .expect("limits");
     let id = OrderId::new("s1").expect("id");
-    let order = OrderRequest::new(id.clone(), pair(), Side::Sell, dec!(100), dec!(1));
+    let order = OrderRequest::new(id.clone(), pair(), Action::Sell, dec!(100), dec!(1));
     assert!(!gate.submit(&order, 0).is_rejected());
     let outcome = gate
         .on_fill(
             &id,
-            &FillReport::new(exec("f1", Side::Sell, dec!(100), dec!(2)), dec!(2)),
+            &FillReport::new(exec("f1", Action::Sell, dec!(100), dec!(2)), dec!(2)),
         )
         .expect("a real fill is booked");
     assert_eq!(
@@ -711,7 +711,7 @@ fn hypothetical_fill_changes_apply_in_one_step() {
         .expect("deposit");
     let fill = HypotheticalFill {
         instrument: pair(),
-        side: Side::Buy,
+        side: Action::Buy,
         price: dec!(1),
         quantity: dec!(2),
         fee: Some(Fee {
@@ -730,5 +730,28 @@ fn hypothetical_fill_changes_apply_in_one_step() {
     assert_eq!(
         r.stressed.assets[&asset("BTC")].total,
         Decimal::MAX - dec!(1)
+    );
+}
+
+/// A scenario with an `Other` fill is refused before anything is valued.
+#[test]
+fn test_stress_other_action_fill_is_unsupported() {
+    let snapshot = long_two_btc().snapshot();
+    let marks = btc_at(dec!(100), 5000);
+    let other = HypotheticalFill {
+        side: Action::Other,
+        ..hedge()
+    };
+    assert_eq!(
+        stress(
+            &snapshot,
+            &marks,
+            &policy(),
+            &Scenario::new("x").fill(other)
+        ),
+        Err(MarginError::UnsupportedAction {
+            field: "fill side",
+            action: Action::Other,
+        })
     );
 }

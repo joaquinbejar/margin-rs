@@ -208,6 +208,18 @@ pub enum MarginError {
         to: Asset,
     },
 
+    /// An order or execution direction this crate cannot trade: anything
+    /// but [`Action::Buy`](financial_types::Action::Buy) and
+    /// [`Action::Sell`](financial_types::Action::Sell), for example
+    /// `Action::Other`.
+    #[error("unsupported action {action:?} for {field}")]
+    UnsupportedAction {
+        /// Field that carried the action.
+        field: &'static str,
+        /// The action.
+        action: financial_types::Action,
+    },
+
     /// A reconciliation check failed: stored state differs from the state
     /// recomputed from the journal.
     #[error("reconciliation failed: {check} for {key}: expected {expected}, found {actual}")]

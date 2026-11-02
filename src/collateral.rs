@@ -183,13 +183,13 @@ pub fn value_collateral(
                 "must be between 0 and 1",
             ));
         }
-        if let Some(extra) = extra {
-            if add(*haircut, extra, "haircut + extra")? > Decimal::ONE {
-                return Err(MarginError::invalid_input(
-                    "extra",
-                    "haircut + extra must not exceed 1",
-                ));
-            }
+        if let Some(extra) = extra
+            && add(*haircut, extra, "haircut + extra")? > Decimal::ONE
+        {
+            return Err(MarginError::invalid_input(
+                "extra",
+                "haircut + extra must not exceed 1",
+            ));
         }
     }
     let pricing = pricing(snapshot, marks, &valuation_policy);

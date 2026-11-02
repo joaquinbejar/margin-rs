@@ -4,7 +4,7 @@ use rust_decimal::Decimal;
 
 use crate::error::MarginError;
 use crate::ids::{Asset, InstrumentId, OrderId};
-use crate::ledger::{Execution, Side};
+use crate::ledger::{Action, Execution};
 
 /// Why an order is sent. Informational: every purpose goes through the same
 /// checks.
@@ -27,7 +27,7 @@ pub struct OrderRequest {
     /// Instrument to trade.
     pub instrument: InstrumentId,
     /// Direction.
-    pub side: Side,
+    pub side: Action,
     /// Limit price. Fills may only improve on it.
     pub price: Decimal,
     /// Requested quantity.
@@ -44,7 +44,7 @@ impl OrderRequest {
     pub fn new(
         id: OrderId,
         instrument: InstrumentId,
-        side: Side,
+        side: Action,
         price: Decimal,
         quantity: Decimal,
     ) -> Self {

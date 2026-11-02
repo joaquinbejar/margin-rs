@@ -64,12 +64,13 @@ use crate::risk::RiskGate;
 use rust_decimal::Decimal;
 
 use crate::decimal::{add, neg, sub, sum};
+use crate::direction::Dir;
 use crate::error::{MarginError, Result};
 use crate::ids::{AccountId, Asset, ExecutionId, InstrumentId, OrderId, VenueId};
 use crate::initial_margin::{
     ExposurePosition, ExposureView, InitialMarginModel, MarginRequirement, ProductKind,
 };
-use crate::ledger::Side;
+use crate::ledger::Action;
 
 /// Contract terms of a margined instrument.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,7 +91,7 @@ pub struct MarginOrder {
     /// Instrument.
     pub instrument: InstrumentId,
     /// Direction.
-    pub side: Side,
+    pub side: Action,
     /// Contracts, positive.
     pub contracts: Decimal,
 }
@@ -259,9 +260,9 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
         let mut sells: BTreeMap<&InstrumentId, Vec<Decimal>> = BTreeMap::new();
         if with_orders {
             for pending in orders.values() {
-                let side = match pending.order.side {
-                    Side::Buy => &mut buys,
-                    Side::Sell => &mut sells,
+                let side = match Dir::from_action(pending.order.side, "pending order side")? {
+                    Dir::Buy => &mut buys,
+                    Dir::Sell => &mut sells,
                 };
                 side.entry(&pending.order.instrument)
                     .or_default()
@@ -312,12 +313,16 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
     ///
     /// Errors of the margin rule (for example an unsupported product);
     /// policy outcomes are [`MarginDecision::Rejected`].
+    /// [`MarginError::UnsupportedAction`] for an order side that is not
+    /// `Buy` or `Sell`, before the order id is used.
     pub fn reserve(
         &mut self,
         order: MarginOrder,
         collateral: Option<Decimal>,
         marks: &BTreeMap<InstrumentId, Decimal>,
     ) -> Result<MarginDecision> {
+        // Refused before the order id is used and before any change.
+        Dir::from_action(order.side, "order side")?;
         let (decision, candidate) = self.decide(&order, collateral, marks)?;
         self.seen_orders.insert(order.id);
         if let Some(orders) = candidate {
@@ -337,8 +342,8 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
             .copied()
             .unwrap_or_default();
         let reducing_side = match position.cmp(&Decimal::ZERO) {
-            core::cmp::Ordering::Greater => Side::Sell,
-            core::cmp::Ordering::Less => Side::Buy,
+            core::cmp::Ordering::Greater => Action::Sell,
+            core::cmp::Ordering::Less => Action::Buy,
             core::cmp::Ordering::Equal => return Ok(false),
         };
         if order.side != reducing_side {
@@ -463,9 +468,9 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
                 });
             }
         };
-        let signed = match pending.order.side {
-            Side::Buy => contracts,
-            Side::Sell => neg(contracts),
+        let signed = match Dir::from_action(pending.order.side, "pending order side")? {
+            Dir::Buy => contracts,
+            Dir::Sell => neg(contracts),
         };
         let position = self
             .positions

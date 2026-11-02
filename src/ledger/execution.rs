@@ -7,14 +7,12 @@ use rust_decimal::Decimal;
 use crate::ids::{Asset, ExecutionId, InstrumentId};
 use crate::ledger::snapshot::PositionSnapshot;
 
-/// Direction of an execution from the ledger owner's point of view.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Side {
-    /// Receive the base asset, pay the quote asset.
-    Buy,
-    /// Deliver the base asset, receive the quote asset.
-    Sell,
-}
+/// Direction of an execution from the ledger owner's point of view:
+/// [`Action::Buy`] receives the base asset and pays the quote asset,
+/// [`Action::Sell`] delivers the base asset and receives the quote asset.
+/// Any other action is rejected with
+/// [`MarginError::UnsupportedAction`](crate::MarginError::UnsupportedAction).
+pub use financial_types::Action;
 
 /// Fee charged by one execution.
 ///
@@ -41,7 +39,7 @@ pub struct Execution {
     /// Instrument traded.
     pub instrument: InstrumentId,
     /// Direction of the fill.
-    pub side: Side,
+    pub side: Action,
     /// Execution price, in quote asset per unit of base asset. Positive.
     pub price: Decimal,
     /// Executed quantity, in base asset units. Positive.
@@ -56,7 +54,7 @@ impl Execution {
     pub fn new(
         id: ExecutionId,
         instrument: InstrumentId,
-        side: Side,
+        side: Action,
         price: Decimal,
         quantity: Decimal,
     ) -> Self {
@@ -94,7 +92,7 @@ pub struct ExecutionCashflow {
     /// Instrument traded.
     pub instrument: InstrumentId,
     /// Direction of the fill.
-    pub side: Side,
+    pub side: Action,
     /// Execution price.
     pub price: Decimal,
     /// Executed quantity.
