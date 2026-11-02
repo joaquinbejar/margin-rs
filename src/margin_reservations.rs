@@ -23,13 +23,22 @@
 //!
 //! # Available capital and double reservation
 //!
-//! `available = collateral - requirement(worst case)`. The caller passes
-//! collateral from [`crate::collateral::value_collateral`] on the
-//! [`Available`](crate::collateral::BalanceBasis::Available) basis, which
-//! already excludes cash reserved by the spot gate
-//! ([`crate::risk::RiskGate`]). Spot orders therefore hold cash in the
-//! ledger and derivative orders hold margin here, and no unit of capital is
-//! reserved by both. Unknown collateral rejects every new order.
+//! [`MarginReservationService::reserve`] is a pure decision against the
+//! `collateral` it is given; on its own it does not stop a spot order from
+//! spending the same cash. Used with a [`RiskGate`], the account must go
+//! through [`MarginReservationService::reserve_with_gate`] and
+//! [`MarginReservationService::sync_hold`], which keep the whole margin
+//! requirement as one external hold in the gate's ledger
+//! ([`RiskGate::set_hold`]):
+//!
+//! - the margin check uses the settlement asset's available cash plus the
+//!   current hold, so spot reservations already made are excluded;
+//! - the accepted requirement becomes the hold, so later spot orders see
+//!   it as reserved.
+//!
+//! Either order of admission is therefore safe: no unit of cash is held by
+//! a spot reservation and by margin at the same time. Unknown collateral
+//! rejects every new order.
 //!
 //! # Lifecycle
 //!
@@ -44,6 +53,9 @@
 //!   order's remaining quantity; repeating it changes nothing.
 
 use std::collections::{BTreeMap, BTreeSet};
+
+use crate::ids::ReservationId;
+use crate::risk::RiskGate;
 
 use rust_decimal::Decimal;
 
@@ -157,7 +169,7 @@ pub struct MarginReservationService<M> {
     orders: BTreeMap<OrderId, PendingOrder>,
     closed: BTreeMap<OrderId, MarginOrder>,
     seen_orders: BTreeSet<OrderId>,
-    seen_fills: BTreeSet<ExecutionId>,
+    fills: BTreeMap<ExecutionId, (OrderId, Decimal)>,
 }
 
 impl<M: InitialMarginModel> MarginReservationService<M> {
@@ -172,7 +184,7 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
             orders: BTreeMap::new(),
             closed: BTreeMap::new(),
             seen_orders: BTreeSet::new(),
-            seen_fills: BTreeSet::new(),
+            fills: BTreeMap::new(),
         }
     }
 
@@ -351,7 +363,9 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
     }
 
     /// Applies a fill of `contracts` to `order`, once per `execution`.
-    /// Returns `false` for a repeated execution id (nothing changes).
+    /// Returns `false` for a repeated identical fill (nothing changes); the
+    /// same execution id with another order or quantity is a
+    /// [`MarginError::ConflictingEntry`] and changes nothing.
     ///
     /// A real execution is never lost: a fill larger than the remaining
     /// quantity, or one reported after the order was filled or its cancel
@@ -368,8 +382,14 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
         execution: ExecutionId,
         contracts: Decimal,
     ) -> Result<bool> {
-        if self.seen_fills.contains(&execution) {
-            return Ok(false);
+        if let Some((seen_order, seen_contracts)) = self.fills.get(&execution) {
+            if seen_order == order && *seen_contracts == contracts {
+                return Ok(false);
+            }
+            return Err(MarginError::ConflictingEntry {
+                kind: "fill",
+                id: execution.to_string(),
+            });
         }
         if contracts <= Decimal::ZERO {
             return Err(MarginError::invalid_input("contracts", "must be positive"));
@@ -406,8 +426,80 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
         } else if let Some(entry) = self.orders.get_mut(order) {
             entry.remaining = remaining;
         }
-        self.seen_fills.insert(execution);
+        self.fills.insert(execution, (order.clone(), contracts));
         Ok(true)
+    }
+
+    /// Settlement asset of the registered instruments.
+    fn settlement(&self) -> Result<Asset> {
+        let mut assets = self.instruments.values().map(|i| &i.settlement);
+        let first = assets
+            .next()
+            .ok_or_else(|| MarginError::invalid_input("instruments", "none registered"))?;
+        if let Some(other) = assets.find(|a| *a != first) {
+            return Err(MarginError::CurrencyMismatch {
+                field: "settlement",
+                expected: first.clone(),
+                found: other.clone(),
+            });
+        }
+        Ok(first.clone())
+    }
+
+    /// [`MarginReservationService::reserve`] against a [`RiskGate`]'s
+    /// ledger, keeping the account's whole requirement as the external hold
+    /// `hold` so spot orders cannot spend the same cash. See the
+    /// [module docs](self).
+    ///
+    /// Collateral is the settlement asset's available balance plus the
+    /// current hold (cash collateral, as in Xynthex v1). On acceptance the
+    /// hold is set to the new requirement.
+    ///
+    /// # Errors
+    ///
+    /// As [`MarginReservationService::reserve`], plus
+    /// [`MarginError::CurrencyMismatch`] if instruments settle in different
+    /// assets and the errors of [`RiskGate::set_hold`].
+    pub fn reserve_with_gate(
+        &mut self,
+        order: MarginOrder,
+        gate: &mut RiskGate,
+        hold: &ReservationId,
+        marks: &BTreeMap<InstrumentId, Decimal>,
+    ) -> Result<MarginDecision> {
+        let currency = self.settlement()?;
+        let available = gate
+            .ledger()
+            .balance(&currency)
+            .map(|b| b.available)
+            .unwrap_or_default();
+        let collateral = add(available, gate.hold(hold), "available + hold")?;
+        let decision = self.reserve(order, Some(collateral), marks)?;
+        if let MarginDecision::Reserved { required, .. } = &decision {
+            gate.set_hold(hold, currency, *required)?;
+        }
+        Ok(decision)
+    }
+
+    /// Sets the gate's external hold to the current requirement, after
+    /// fills, effective cancels or new marks. Returns the new hold.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`MarginReservationService::requirement`] and of
+    /// [`RiskGate::set_hold`] (a requirement that grew beyond the available
+    /// cash, for example after a mark move, is reported and the previous
+    /// hold kept).
+    pub fn sync_hold(
+        &self,
+        gate: &mut RiskGate,
+        hold: &ReservationId,
+        marks: &BTreeMap<InstrumentId, Decimal>,
+    ) -> Result<Decimal> {
+        let currency = self.settlement()?;
+        let required = self.requirement(marks)?.total;
+        gate.set_hold(hold, currency, required)?;
+        Ok(required)
     }
 
     /// Releases what is left of `order` once its cancel is effective, and

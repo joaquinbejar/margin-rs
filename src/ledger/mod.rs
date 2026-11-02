@@ -430,6 +430,18 @@ impl Ledger {
     /// [`MarginError::UnknownReservation`] if no reservation with this id is
     /// open.
     pub fn release(&mut self, id: &ReservationId) -> Result<(Asset, Decimal)> {
+        self.release_inner(id)
+    }
+
+    /// An open reservation's asset and amount.
+    #[must_use]
+    pub fn reservation(&self, id: &ReservationId) -> Option<(&Asset, Decimal)> {
+        self.reservations
+            .get(id)
+            .map(|(asset, amount)| (asset, *amount))
+    }
+
+    fn release_inner(&mut self, id: &ReservationId) -> Result<(Asset, Decimal)> {
         let (asset, amount) = self
             .reservations
             .get(id)

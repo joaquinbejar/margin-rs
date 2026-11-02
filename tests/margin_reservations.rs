@@ -350,3 +350,182 @@ fn rejection_reasons() {
     );
     assert_eq!(total(&service), (dec!(0), dec!(0), dec!(0)));
 }
+
+/// C1: an execution id reused for another order or quantity is a typed
+/// conflict and changes nothing; the identical repeat is a no-op.
+#[test]
+fn conflicting_fill_ids_are_rejected() {
+    let mut service = service();
+    service
+        .reserve(
+            order("a", "XYZ-PERP", Side::Buy, dec!(3)),
+            Some(dec!(100000)),
+            &marks(),
+        )
+        .expect("decision");
+    service
+        .reserve(
+            order("b", "XYZ-PERP", Side::Buy, dec!(3)),
+            Some(dec!(100000)),
+            &marks(),
+        )
+        .expect("decision");
+    assert_eq!(service.apply_fill(&oid("a"), eid("e"), dec!(1)), Ok(true));
+    let conflict = Err(MarginError::ConflictingEntry {
+        kind: "fill",
+        id: "e".into(),
+    });
+    assert_eq!(service.apply_fill(&oid("a"), eid("e"), dec!(2)), conflict);
+    assert_eq!(service.apply_fill(&oid("b"), eid("e"), dec!(1)), conflict);
+    assert_eq!(service.apply_fill(&oid("a"), eid("e"), dec!(1)), Ok(false));
+    assert_eq!(service.position(&iid("XYZ-PERP")), Some(dec!(1)));
+    assert_eq!(service.remaining(&oid("a")), Some(dec!(2)));
+    assert_eq!(service.remaining(&oid("b")), Some(dec!(3)));
+}
+
+mod with_gate {
+    use super::*;
+    use margin_rs::ledger::Ledger;
+    use margin_rs::risk::{InstrumentLimits, OrderRequest, RiskDecision, RiskGate, RiskReason};
+    use margin_rs::{ReservationId, SpotInstrument, TransferId};
+
+    /// 10000 USDC; spot BTC-USDC (lot 0.01) on the gate.
+    fn gate() -> RiskGate {
+        let mut ledger = Ledger::default();
+        ledger.register_asset(usdc(), 6).expect("register");
+        ledger
+            .register_asset(Asset::new("BTC").expect("asset"), 8)
+            .expect("register");
+        ledger
+            .register_instrument(
+                SpotInstrument::new(
+                    iid("BTC-USDC"),
+                    Asset::new("BTC").expect("asset"),
+                    usdc(),
+                    2,
+                    2,
+                )
+                .expect("spot"),
+            )
+            .expect("register");
+        let mut gate = RiskGate::new(ledger);
+        gate.deposit(TransferId::new("d").expect("id"), usdc(), dec!(10000))
+            .expect("deposit");
+        gate.set_limits(&iid("BTC-USDC"), InstrumentLimits::default())
+            .expect("limits");
+        gate
+    }
+
+    fn spot_buy(id: &str, quantity: Decimal) -> OrderRequest {
+        OrderRequest::new(oid(id), iid("BTC-USDC"), Side::Buy, dec!(100), quantity)
+    }
+
+    fn hold() -> ReservationId {
+        ReservationId::new("margin:acct").expect("id")
+    }
+
+    /// C2, margin first: a margin plan of 6000 becomes a ledger hold, so a
+    /// spot buy of 5000 then finds only 4000 available.
+    #[test]
+    fn margin_first_blocks_the_same_cash_for_spot() {
+        let mut gate = gate();
+        let mut service = service();
+        assert_eq!(
+            service
+                .reserve_with_gate(
+                    order("m1", "XYZ-PERP", Side::Buy, dec!(3)),
+                    &mut gate,
+                    &hold(),
+                    &marks()
+                )
+                .expect("decision"),
+            MarginDecision::Reserved {
+                required: dec!(6000),
+                reserved: dec!(6000),
+            }
+        );
+        assert_eq!(gate.hold(&hold()), dec!(6000));
+        assert_eq!(
+            gate.submit(&spot_buy("s1", dec!(50)), 0),
+            RiskDecision::Rejected {
+                reasons: vec![RiskReason::InsufficientBalance {
+                    asset: usdc(),
+                    required: dec!(5000),
+                    available: dec!(4000),
+                }]
+            }
+        );
+        // The margin plan is cancelled: the hold goes and the cash is free.
+        service.release_on_effective_cancel(&oid("m1"));
+        assert_eq!(service.sync_hold(&mut gate, &hold(), &marks()), Ok(dec!(0)));
+        assert!(!gate.submit(&spot_buy("s2", dec!(50)), 0).is_rejected());
+        gate.ledger().reconcile().expect("reconciles");
+    }
+
+    /// C2, spot first: a spot buy reserves 5000, so a margin plan of 6000
+    /// sees 5000 of collateral and is rejected.
+    #[test]
+    fn spot_first_blocks_the_same_cash_for_margin() {
+        let mut gate = gate();
+        let mut service = service();
+        assert!(!gate.submit(&spot_buy("s1", dec!(50)), 0).is_rejected());
+        assert_eq!(
+            service
+                .reserve_with_gate(
+                    order("m1", "XYZ-PERP", Side::Buy, dec!(3)),
+                    &mut gate,
+                    &hold(),
+                    &marks()
+                )
+                .expect("decision"),
+            MarginDecision::Rejected {
+                reason: MarginRejection::InsufficientMargin {
+                    required: dec!(6000),
+                    collateral: dec!(5000),
+                    shortfall: dec!(1000),
+                },
+            }
+        );
+        assert_eq!(gate.hold(&hold()), dec!(0));
+        // A plan that fits the rest (4000) is held.
+        assert!(matches!(
+            service
+                .reserve_with_gate(
+                    order("m2", "XYZ-PERP", Side::Buy, dec!(2)),
+                    &mut gate,
+                    &hold(),
+                    &marks()
+                )
+                .expect("decision"),
+            MarginDecision::Reserved { .. }
+        ));
+        let usdc_balance = gate.ledger().balance(&usdc()).expect("balance");
+        assert_eq!(
+            (
+                usdc_balance.total,
+                usdc_balance.reserved,
+                usdc_balance.available
+            ),
+            (dec!(10000), dec!(9000), dec!(1000))
+        );
+    }
+
+    /// The hold id cannot be an order id of the gate.
+    #[test]
+    fn hold_ids_do_not_collide_with_orders() {
+        let mut gate = gate();
+        assert!(!gate.submit(&spot_buy("x", dec!(1)), 0).is_rejected());
+        assert_eq!(
+            gate.set_hold(&ReservationId::new("x").expect("id"), usdc(), dec!(1)),
+            Err(MarginError::invalid_input(
+                "hold",
+                "the id belongs to an order"
+            ))
+        );
+        // A hold larger than what is available is refused and the previous
+        // hold is kept.
+        gate.set_hold(&hold(), usdc(), dec!(100)).expect("hold");
+        assert!(gate.set_hold(&hold(), usdc(), dec!(20000)).is_err());
+        assert_eq!(gate.hold(&hold()), dec!(100));
+    }
+}

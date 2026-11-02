@@ -36,6 +36,15 @@ A real execution is never lost, so `apply_fill` handles these cases instead of r
 
 ## Relationship with cash reservations (no double reservation)
 
-Spot orders reserve **cash** in the ledger through `risk::RiskGate` (M1-05). Derivative orders reserve **margin** here.
+`reserve` on its own is a pure decision against the `collateral` it is given. It does not stop a spot order from spending the same cash. An account with both spot and derivative orders must use the gate-integrated calls:
 
-The `collateral` passed to `reserve` should come from `collateral::value_collateral` on the default `BalanceBasis::Available`, which already subtracts the cash held by spot reservations. Each unit of capital is therefore committed once: either to a spot order's cash reservation or to derivative margin, never to both. A `None` collateral, meaning a debt with no trusted mark, rejects every new order.
+| Call | Effect |
+|---|---|
+| `reserve_with_gate(order, &mut gate, &hold, marks)` | Collateral is the settlement asset's available cash in the `RiskGate` ledger plus the current hold. On acceptance, the whole requirement becomes the external hold, set with `RiskGate::set_hold` |
+| `sync_hold(&mut gate, &hold, marks)` | After fills, effective cancels or new marks, the hold is set to the current requirement |
+
+Spot reservations therefore reduce what margin can use, and the margin hold reduces what spot orders can use. **Either order of admission is safe**, and no unit of cash is reserved twice. The tests `margin_first_blocks_the_same_cash_for_spot` and `spot_first_blocks_the_same_cash_for_margin` cover both orders.
+
+`RiskGate::set_hold` is atomic: if the new amount does not fit, the previous hold stays. A hold id cannot be an order id. Collateral here is cash in the settlement asset, as in Xynthex v1, where XYZ and long options count as zero collateral.
+
+Fills are idempotent by execution id. Reusing an id with another order or quantity returns `ConflictingEntry` and changes nothing.
