@@ -255,6 +255,13 @@ impl LiquidationAccount {
                 Some(Instrument::LinearPerpetual(perpetual)) => {
                     (ProductKind::LinearPerpetual, perpetual.terms())
                 }
+                Some(Instrument::InverseFuture(_) | Instrument::InversePerpetual(_)) => {
+                    return Err(MarginError::UnsupportedInstrument {
+                        rule: model.rule().to_string(),
+                        instrument: id.clone(),
+                        reason: "inverse futures and perpetuals are not planned yet",
+                    });
+                }
                 None => {
                     return Err(MarginError::UnknownInstrument {
                         instrument: id.clone(),

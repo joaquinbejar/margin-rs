@@ -413,13 +413,16 @@ pub(crate) fn derivative_values(
         if position.quantity.is_zero() {
             continue;
         }
-        let terms = match snapshot.instruments.get(id) {
+        let contract = match snapshot.instruments.get(id) {
             Some(Instrument::Spot(_)) => continue,
-            Some(derivative @ (Instrument::LinearFuture(_) | Instrument::LinearPerpetual(_))) => {
-                derivative
-                    .linear_terms()
-                    .ok_or(MarginError::arithmetic("derivative terms"))?
-            }
+            Some(
+                derivative @ (Instrument::LinearFuture(_)
+                | Instrument::LinearPerpetual(_)
+                | Instrument::InverseFuture(_)
+                | Instrument::InversePerpetual(_)),
+            ) => derivative
+                .derivative()
+                .ok_or(MarginError::arithmetic("derivative terms"))?,
             None => {
                 return Err(MarginError::UnknownInstrument {
                     instrument: id.clone(),
@@ -439,7 +442,7 @@ pub(crate) fn derivative_values(
                 "must be positive",
             ));
         }
-        let settlement = terms.settlement();
+        let settlement = &contract.settlement;
         let scale = *snapshot
             .assets
             .get(settlement)
@@ -448,11 +451,15 @@ pub(crate) fn derivative_values(
             })?;
         let market_value = crate::ledger::derivative::market_value(
             position.quantity,
-            terms.multiplier(),
+            contract.size,
             mark.price,
             scale,
         )?;
-        let unrealized_pnl = sub(market_value, position.cost_basis, "market value - basis")?;
+        let unrealized_pnl = crate::ledger::derivative::unrealized_pnl(
+            contract.size,
+            market_value,
+            position.cost_basis,
+        )?;
         values.insert(
             id.clone(),
             DerivativeValue {
@@ -529,11 +536,16 @@ pub(crate) fn validate(
     }
     for instrument in marks.instruments.keys() {
         match snapshot.instruments.get(instrument) {
-            Some(Instrument::LinearFuture(_) | Instrument::LinearPerpetual(_)) => {}
+            Some(
+                Instrument::LinearFuture(_)
+                | Instrument::LinearPerpetual(_)
+                | Instrument::InverseFuture(_)
+                | Instrument::InversePerpetual(_),
+            ) => {}
             Some(Instrument::Spot(_)) => {
                 return Err(MarginError::invalid_input(
                     "instrument marks",
-                    "only linear futures and perpetuals take instrument marks",
+                    "only futures and perpetuals take instrument marks",
                 ));
             }
             None => {
@@ -786,7 +798,12 @@ pub fn value(
             Some(Instrument::Spot(spot)) => spot,
             // Its realized PnL was paid in the settlement asset; its
             // unrealized PnL is the instrument valuation above.
-            Some(derivative @ (Instrument::LinearFuture(_) | Instrument::LinearPerpetual(_))) => {
+            Some(
+                derivative @ (Instrument::LinearFuture(_)
+                | Instrument::LinearPerpetual(_)
+                | Instrument::InverseFuture(_)
+                | Instrument::InversePerpetual(_)),
+            ) => {
                 let settlement = derivative.quote();
                 if !position.realized_pnl.is_zero() {
                     needed.insert(settlement);

@@ -7,9 +7,7 @@ use rust_decimal::Decimal;
 use crate::decimal::{Rounding, mul_div_round};
 use crate::ids::{Asset, InstrumentId, ReservationId};
 
-/// The largest scale a `Decimal` holds.
-const DECIMAL_MAX_SCALE: u32 = 28;
-use crate::instrument::{Instrument, PositionKind};
+use crate::instrument::{ContractSize, DECIMAL_DIGITS, Instrument, PositionKind};
 
 /// Balance of one asset.
 ///
@@ -39,19 +37,22 @@ pub struct PositionSnapshot {
     /// Instrument.
     pub instrument: InstrumentId,
     /// Asset of `cost_basis` and `realized_pnl`: the quote asset of a spot
-    /// instrument, the settlement asset of a derivative.
+    /// instrument, the settlement asset of a derivative (the base asset of
+    /// an inverse one).
     pub quote: Asset,
-    /// Spot, linear future or linear perpetual.
+    /// Spot, or a linear or inverse future or perpetual.
     pub kind: PositionKind,
-    /// Units of the underlying per unit of `quantity`: 1 for spot, the
-    /// contract multiplier for a derivative.
-    pub multiplier: Decimal,
+    /// Size of one unit of `quantity`: `Multiplier(1)` for spot, the
+    /// multiplier of a linear derivative, the contract value of an inverse
+    /// one.
+    pub size: ContractSize,
     /// Net traded quantity (contracts for a derivative); positive long,
     /// negative short.
     pub quantity: Decimal,
     /// Signed amount attributed to the open quantity: the quote cost of a
-    /// spot position, the basis (cash value at entry prices) of a
-    /// derivative.
+    /// spot position, the basis (cash value at entry prices) of a linear
+    /// derivative, the value in the base at entry prices of an inverse
+    /// one.
     pub cost_basis: Decimal,
     /// Realized PnL gross of fees.
     pub realized_pnl: Decimal,
@@ -64,30 +65,48 @@ impl PositionSnapshot {
         self.quantity.is_zero()
     }
 
-    /// Average entry price, `cost_basis / (quantity * multiplier)`.
+    /// Average entry price: `cost_basis / (quantity * multiplier)` for spot
+    /// and linear derivatives, and for an inverse derivative the harmonic
+    /// mean `quantity * contract_value / cost_basis`.
     ///
-    /// `None` in two cases: the position is flat, or the quotient cannot be
-    /// represented as a `Decimal` at any scale.
+    /// `None` when the position is flat, when an inverse position has a
+    /// zero basis (its entry value rounded to zero), or when the quotient
+    /// cannot be represented as a `Decimal` at any scale.
     ///
     /// Informational: it is rounded once (half-even for a derivative) to the
     /// largest scale, up to 28, that fits a `Decimal`, and is never used for
     /// booking or risk, which work on `cost_basis` directly. For a
-    /// derivative it is the price per unit of the underlying, not per
+    /// derivative it is the price per unit of the underlying (in the quote
+    /// currency of the contract value for an inverse one), not per
     /// contract, and the quotient is computed in wide integers.
     #[must_use]
     pub fn average_price(&self) -> Option<Decimal> {
         if self.quantity.is_zero() {
             return None;
         }
-        if self.multiplier == Decimal::ONE {
-            return self.cost_basis.checked_div(self.quantity);
-        }
+        let (numerators, denominators) = match self.size {
+            ContractSize::Multiplier(multiplier) if multiplier == Decimal::ONE => {
+                return self.cost_basis.checked_div(self.quantity);
+            }
+            ContractSize::Multiplier(multiplier) => {
+                ([self.cost_basis, Decimal::ONE], [self.quantity, multiplier])
+            }
+            ContractSize::ContractValue(contract_value) => {
+                if self.cost_basis.is_zero() {
+                    return None;
+                }
+                (
+                    [self.quantity, contract_value],
+                    [self.cost_basis, Decimal::ONE],
+                )
+            }
+        };
         // The largest scale (up to a Decimal's 28) whose rounded quotient
         // still fits, as checked_div gives for spot.
-        (0..=DECIMAL_MAX_SCALE).rev().find_map(|scale| {
+        (0..=DECIMAL_DIGITS).rev().find_map(|scale| {
             mul_div_round(
-                &[self.cost_basis],
-                &[self.quantity, self.multiplier],
+                &numerators,
+                &denominators,
                 scale,
                 Rounding::HalfEven,
                 "average price",

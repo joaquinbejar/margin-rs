@@ -45,13 +45,13 @@ With `Exclude`, a stale mark above the true price cannot inflate collateral. Wit
   - `fees = sum(fees_paid * price(asset))`.
 - For spot, `equity - net_transfers = realized + unrealized - fees` exactly. Each figure is rounded once, so `rounding_difference` shows the only possible gap. It is zero on grid values.
 
-## Linear futures and perpetuals
+## Futures and perpetuals
 
-An open derivative position is valued at its **instrument mark**, `MarkSet::instruments` (`MarkSet::with_instrument`): the price per unit of the underlying, in the instrument's settlement asset, with the same freshness rules as asset marks.
+An open derivative position is valued at its **instrument mark**, `MarkSet::instruments` (`MarkSet::with_instrument`): the price per unit of the underlying, with the same freshness rules as asset marks. For a linear contract it is in the settlement asset; for an inverse contract it is in the quote currency of its contract value `CV`, per unit of the base (the settlement asset).
 
 | Figure | Rule |
 |---|---|
-| unrealized PnL | `upnl = rhe(Q * M * mark) - basis`, rounded once (half-even) to the settlement asset scale, per instrument, listed in `AccountValuation::derivatives` |
+| unrealized PnL | linear: `upnl = rhe(Q * M * mark) - basis`; inverse: `upnl = basis - rhe(Q * CV / mark)`, in the base. Rounded once (half-even) to the settlement asset scale, per instrument, listed in `AccountValuation::derivatives` |
 | missing mark | `MissingMark` for an open position (never valued at zero); flat and settled positions need none, and a mark for them is ignored |
 | `equity` | adds `upnl * price(settlement asset)`; a stale or future instrument mark is used and flagged in `AccountValuation::instrument_flags` |
 | `collateral_equity` | `cash + sum(upnl)` per settlement asset, **one net amount**, with the balance rules above applied to the net: a loss nets against the cash, a net debt counts in full |

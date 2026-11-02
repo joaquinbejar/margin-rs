@@ -106,9 +106,9 @@ use crate::direction::Dir;
 use crate::error::{MarginError, Result};
 use crate::ids::{AccountId, Asset, ExecutionId, InstrumentId, OrderId, ReservationId, VenueId};
 use crate::initial_margin::{
-    ExposurePosition, ExposureView, InitialMarginModel, MarginRequirement, ProductKind,
+    ExposurePosition, ExposureView, InitialMarginModel, MarginRequirement, ProductKind, RuleId,
 };
-use crate::instrument::{Instrument, LinearTerms};
+use crate::instrument::{ContractSize, Instrument, LinearTerms};
 use crate::ledger::{Action, LedgerSnapshot};
 use crate::risk::RiskGate;
 use crate::valuation::net_with_upnl;
@@ -348,7 +348,7 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
                     .ok_or_else(|| MarginError::UnknownInstrument {
                         instrument: id.clone(),
                     })?;
-            let Some((product, terms)) = linear(instrument) else {
+            let Some((product, terms)) = linear(instrument, id, self.model.rule())? else {
                 return Err(MarginError::invalid_input(
                     "instrument",
                     "is not a linear future or perpetual in the ledger",
@@ -387,7 +387,7 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
                     .ok_or_else(|| MarginError::UnknownInstrument {
                         instrument: id.clone(),
                     })?;
-            let Some((product, terms)) = linear(instrument) else {
+            let Some((product, terms)) = linear(instrument, id, self.model.rule())? else {
                 continue;
             };
             if terms.settlement() != &currency {
@@ -1013,7 +1013,7 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
                     .ok_or_else(|| MarginError::UnknownInstrument {
                         instrument: id.clone(),
                     })?;
-            let Some((_, contract)) = linear(instrument) else {
+            let Some((_, contract)) = linear(instrument, id, self.model.rule())? else {
                 continue;
             };
             if contract.settlement() != currency {
@@ -1031,7 +1031,7 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
             check_scale(*mark, MAX_SCALE, "instrument mark")?;
             terms.push(crate::ledger::derivative::market_value(
                 position.quantity,
-                contract.multiplier(),
+                ContractSize::Multiplier(contract.multiplier()),
                 *mark,
                 scale,
             )?);
@@ -1084,14 +1084,31 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
 /// Instruments with their terms and current positions.
 type Book = BTreeMap<InstrumentId, (MarginInstrument, Decimal)>;
 
-/// The product and terms of a linear future or perpetual; `None` for spot.
-/// Exhaustive, so a new kind of instrument must be decided here.
-fn linear(instrument: &Instrument) -> Option<(ProductKind, &LinearTerms)> {
+/// The product and terms of a linear future or perpetual `id`; `None` for
+/// spot. Exhaustive, so a new kind of instrument must be decided here.
+///
+/// # Errors
+///
+/// [`MarginError::UnsupportedInstrument`] for an inverse future or
+/// perpetual: never skipped, since its requirement and value would be
+/// missing.
+fn linear<'a>(
+    instrument: &'a Instrument,
+    id: &InstrumentId,
+    rule: &RuleId,
+) -> Result<Option<(ProductKind, &'a LinearTerms)>> {
     match instrument {
-        Instrument::Spot(_) => None,
-        Instrument::LinearFuture(future) => Some((ProductKind::LinearFuture, future.terms())),
+        Instrument::Spot(_) => Ok(None),
+        Instrument::LinearFuture(future) => Ok(Some((ProductKind::LinearFuture, future.terms()))),
         Instrument::LinearPerpetual(perpetual) => {
-            Some((ProductKind::LinearPerpetual, perpetual.terms()))
+            Ok(Some((ProductKind::LinearPerpetual, perpetual.terms())))
+        }
+        Instrument::InverseFuture(_) | Instrument::InversePerpetual(_) => {
+            Err(MarginError::UnsupportedInstrument {
+                rule: rule.to_string(),
+                instrument: id.clone(),
+                reason: "inverse futures and perpetuals are not margined yet",
+            })
         }
     }
 }

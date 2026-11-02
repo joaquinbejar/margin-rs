@@ -14,7 +14,9 @@
 
 use std::collections::BTreeMap;
 
-use margin_rs::instrument::{LinearFuture, LinearPerpetual, LinearTerms, PositionKind};
+use margin_rs::instrument::{
+    ContractSize, LinearFuture, LinearPerpetual, LinearTerms, PositionKind,
+};
 use margin_rs::ledger::{
     Action, Booking, Execution, ExpirySettlement, FundingPayment, Ledger, LedgerConfig,
 };
@@ -153,7 +155,7 @@ fn open_increase_reduce_and_close_a_perpetual() {
         (dec!(5), dec!(50.22))
     );
     assert_eq!(position.kind, PositionKind::LinearPerpetual);
-    assert_eq!(position.multiplier, dec!(0.1));
+    assert_eq!(position.size, ContractSize::Multiplier(dec!(0.1)));
 
     // Sell 2 at 102: N = 20.40, released = rhe(50.22 * 2 / 5 = 20.088) =
     // 20.09, realized = 20.40 - 20.09 = 0.31.

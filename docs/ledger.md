@@ -140,6 +140,30 @@ A crossing or a partial reduction can leave an open position with a zero basis (
 - **Ids**: executions, settlements, funding payments and expiry settlements share one id space. An identical repeat is a duplicate before any other check; the same id with other content is `ConflictingEntry`.
 - **Reconciliation**: per asset, the real cash (transfers, execution deltas, settlements, funding, expiries); per derivative instrument, the contracts and the virtual identity `sum of signed virtual notionals (-N buy, +N sell) = realized_pnl - basis`, recomputed in wide integers from every fill.
 
+### Inverse futures and perpetuals
+
+An inverse future (`InverseFuture`) or perpetual (`InversePerpetual`) settles in the **base** asset. `InverseTerms` declares the settlement asset (the base) and the contract value `CV`, in units of the quote currency in which its prices and marks are quoted; that currency is not a ledger asset and is never inferred. With base scale `c`:
+
+| Figure | Rule |
+|---|---|
+| virtual value of `n` at `p` | `V = rhe(n * CV / p)`, in the base; never exchanged |
+| basis | value in the base at entry prices, signed (a long is positive): `+= V` for a buy, `-V` for a sell |
+| reduce `n <= abs(Q)` | `released = rhe(basis * n / abs(Q))`, the whole basis on a full close; realized `= released - V` (sell, reducing a long) or `released + V` (buy, reducing a short) |
+| cross zero `n > abs(Q)` | `C = rhe(abs(Q) * CV / p)`, `O = V - C` exactly; realized `= basis - C` (sell) or `basis + C` (buy); new basis `-O` (sell) or `+O` (buy) |
+| cash | `+ realized - fee`, in the base |
+| market value at `mark` | `rhe(Q * CV / mark)`; unrealized PnL `= basis - market value` (a long gains when its value in the base falls) |
+| average price | the harmonic mean `abs(Q) * CV / abs(basis)`; `None` for a zero basis |
+
+So each closed contract realizes `CV * (1/entry - 1/exit)` (long), up to the rounding of each value. The PnL is convex in the price: equal moves up and down give unequal PnL.
+
+Every value (`V`, `C`, the value at an expiry and both values of a late fill) is a quotient rounded once, half-even at the base scale, which is this ledger's policy. Its exact rest is recorded in `DerivativeFill::residual` (`closing_residual` for `C` and the settlement leg of a late fill) as an `InverseResidual { numerator, denominator }`, with `n * CV / p = V + numerator / denominator` exactly: `numerator = n * CV - V * p`, signed, and `denominator = p`. It is never rounded again and is zero only for an exact quotient. To keep it an exact `Decimal`, `InverseTerms::new` requires `contract_scale` plus the decimals of `CV` (trailing zeros ignored) to be at most 28, and `register_instrument` requires the base scale plus `price_scale` to be at most 28. The released basis is an allocation, as for linear contracts, with no residual.
+
+Booking, funding, expiry, late fills, ids and mandatory cash follow the linear rules above. Funding is booked as an amount already computed by the caller, positive = received: a funding formula with positive = paid (such as `Qc * CV * rate / mark`) is booked as its negative. Reconciliation checks the contracts and the identity `sum of signed virtual values (-V buy, +V sell) = -realized_pnl - basis`.
+
+`PositionSnapshot::size` and `DerivativeFill::size` give the `ContractSize`: `Multiplier(M)` (1 for spot) or `ContractValue(CV)`.
+
+Until the margin rules and closeout plans cover them, every consumer other than the ledger and the valuation refuses an open inverse position with `UnsupportedInstrument`, never skipping it: margin reservations on the ledger, `LiquidationAccount::from_ledger`, the stress scenarios and the risk gate.
+
 `valuation::value` and `collateral::value_collateral` value open derivative positions at instrument marks (see `docs/valuation.md`); the stress scenarios do not shock instrument marks and refuse an open derivative with `UnsupportedInstrument`. The risk gate handles spot orders only and refuses a derivative with `UnsupportedInstrument` at every entry point.
 
 ## Derivative settlements outside the ledger (M3-04, legacy)
@@ -156,6 +180,6 @@ This path is kept for derivatives that are not registered in the ledger; registe
 
 ## Limits and non-goals
 
-- Options are not ledger positions. Account valuation, stress, liquidation and margin reservations do not read derivative positions from the ledger yet.
+- Options are not ledger positions. Stress scenarios do not read derivative positions from the ledger yet, and margin reservations and liquidation do not support inverse ones yet.
 - The journal and the set of seen execution ids grow without bound for the life of a ledger. Pruning or checkpoints are future work.
 - Reservations are plain holds that a caller creates and releases. M1-05 builds order-level reservations on top: release on fill, reject and effective cancel, and exactly-once adjustment on a partial fill.

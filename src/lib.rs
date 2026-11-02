@@ -106,7 +106,8 @@ pub use ids::{
     VenueId,
 };
 pub use instrument::{
-    Instrument, LinearFuture, LinearPerpetual, LinearTerms, PositionKind, SpotInstrument,
+    ContractSize, Instrument, InverseFuture, InversePerpetual, InverseTerms, LinearFuture,
+    LinearPerpetual, LinearTerms, PositionKind, SpotInstrument,
 };
 pub use rust_decimal::Decimal;
 
