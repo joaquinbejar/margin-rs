@@ -11,7 +11,7 @@
 //! computed separately and never combined by this crate.
 //!
 //! Rules live in [`crate::rules`]. The first one is
-//! [`TieredLinearIm::xynthex_v1`](crate::rules::TieredLinearIm::xynthex_v1).
+//! [`TieredLinearIm::linear_v1`](crate::rules::TieredLinearIm::linear_v1).
 
 use core::fmt;
 
@@ -20,7 +20,7 @@ use rust_decimal::Decimal;
 use crate::error::Result;
 use crate::ids::{AccountId, Asset, InstrumentId, VenueId};
 
-/// Name and version of a margin rule, for example `xynthex-linear-im/1`.
+/// Name and version of a margin rule, for example `linear-im/1`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RuleId {
     /// Rule name.

@@ -44,7 +44,7 @@
 //!
 //! - [`MarginReservationService::reserve`] accepts an order if the
 //!   requirement with it stays within collateral, or if it is risk
-//!   reducing in the sense of Xynthex economics 11.2 E3 (opposite side to
+//!   reducing (opposite side to
 //!   the position, size at most `|position|` minus the reducing orders
 //!   already resting, so it can neither flip nor extend the position),
 //!   which is accepted even when the account is under margined; otherwise
@@ -326,7 +326,7 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
         Ok(decision)
     }
 
-    /// Xynthex economics 11.2 E3: the order is on the side opposite to the
+    /// Risk reducing: the order is on the side opposite to the
     /// position, and its size is at most `|position|` minus the live
     /// reducing orders already resting on that instrument, so no
     /// combination of fills can flip or extend the position.
@@ -402,7 +402,7 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
             }
             Err(error) => return Err(error),
         };
-        // Risk reducing exception (Xynthex economics 11.2 E3): accepted
+        // Risk reducing exception: accepted
         // whatever the collateral, even when under margined.
         if after.total > collateral && !self.is_risk_reducing(order)? {
             return reject(MarginRejection::InsufficientMargin {
@@ -511,7 +511,7 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
     /// [module docs](self).
     ///
     /// Collateral is the settlement asset's available balance plus the
-    /// current hold (cash collateral, as in Xynthex v1). On acceptance the
+    /// current hold (cash collateral). On acceptance the
     /// hold is set to the new requirement.
     ///
     /// # Errors

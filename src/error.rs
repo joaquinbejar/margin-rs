@@ -140,7 +140,7 @@ pub enum MarginError {
     /// The margin rule does not cover this instrument.
     #[error("rule {rule} does not support {instrument}: {reason}")]
     UnsupportedInstrument {
-        /// Rule identifier and version, for example `xynthex-linear-im/1`.
+        /// Rule identifier and version, for example `linear-im/1`.
         rule: String,
         /// Instrument identifier.
         instrument: InstrumentId,

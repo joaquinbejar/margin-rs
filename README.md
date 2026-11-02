@@ -1,53 +1,129 @@
+[![License](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
+[![CI](https://github.com/joaquinbejar/margin-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/joaquinbejar/margin-rs/actions/workflows/ci.yml)
+[![Stars](https://img.shields.io/github/stars/joaquinbejar/margin-rs.svg)](https://github.com/joaquinbejar/margin-rs/stargazers)
+[![Issues](https://img.shields.io/github/issues/joaquinbejar/margin-rs.svg)](https://github.com/joaquinbejar/margin-rs/issues)
+[![PRs](https://img.shields.io/github/issues-pr/joaquinbejar/margin-rs.svg)](https://github.com/joaquinbejar/margin-rs/pulls)
+[![MSRV](https://img.shields.io/badge/MSRV-1.85-orange)](./rust-toolchain.toml)
+[![Documentation](https://img.shields.io/badge/docs-latest-blue.svg)](https://docs.rs/margin-rs)
+
 # margin-rs
 
-Risk and margin engine for the Xynthex market making lab; usable standalone.
+A risk and margin engine for market making and trading systems, written in
+Rust with exact decimal arithmetic throughout. It provides a single
+accounting ledger, a pretrade risk gate, mark to market valuation and stress,
+versioned margin rules, collateral with haircuts, margin reserved for pending
+orders, maintenance states, and staged closeout plans. It can be used on its
+own or as the accounting and risk layer of a market making stack. The
+integration with
+[market-maker-rs](https://github.com/joaquinbejar/market-maker-rs) is
+planned: market-maker-rs does not depend on margin-rs yet.
 
-## Status
+## Overview
 
-M1-04: the single accounting ledger for one account. M1-05: the pretrade
-risk gate that every order passes through. M3-03B: the first versioned
-initial margin rule.
+A trading system needs one place that knows how much cash and inventory an
+account has, what is committed to live orders, and how far the account is
+from its margin limits. margin-rs is that place:
 
-| Export | Purpose |
+- every fill is booked once, by execution id, into one ledger; nothing else
+  keeps a second balance that could drift;
+- every order passes a pretrade gate that reserves what it could spend,
+  before it reaches a venue;
+- margin requirements come from versioned rules, and every figure carries
+  the rule that produced it and a per position breakdown;
+- when an account falls below maintenance, the crate reports its state and
+  computes a staged closeout plan, leaving any deficit explicit.
+
+Every amount is an exact `Decimal`: no binary floating point, no silent
+rounding, and no partial sum that can overflow while the result does not.
+
+## Features
+
+### Accounting
+- **Single ledger** per account: balances per asset split into reserved and
+  available, positions with signed average cost and realized PnL, fees per
+  asset (rebates as negative fees).
+- **Idempotent booking** by execution and transfer id; reusing an id for
+  different content is an error. Every operation is atomic.
+- **Cashflow per execution** and a full **reconciliation** of the state from
+  the journal.
+- **Mandatory postings** that are never lost: a real execution or a
+  derivative settlement that overdraws the account is booked and the
+  shortfall is reported.
+
+### Pretrade risk
+- **Risk gate** that owns the ledger: reservations for every order, sized so
+  that no fragmentation of fills can exceed them.
+- **Hard limits** on the joint exposure of positions and live orders: order
+  size, position, notional, open orders, price band and market data age.
+- **Typed decisions** (accepted, reduced, rejected) with every reason.
+- **Circuit breaker** with quote withdrawal, also when the gate halts itself
+  on an accounting breach or an execution anomaly.
+
+### Valuation and stress
+- **Mark to market** in one reporting asset with price source and freshness
+  flags; collateral equity that invalid marks can never raise.
+- **PnL attribution** into realized, unrealized and fees, counted once.
+- **Spot inventory stress**: hypothetical fills (hedges), price gaps and a
+  liquidation spread.
+
+### Margin
+- **Versioned margin rules**: `TieredLinearIm` with progressive tiers, and
+  the rule `linear-im/1` (initial 10 %, maintenance 5 % of the notional) for
+  linear futures and perpetuals.
+- **Factor risk**: exposures with explicit units and portfolio variance
+  under a validated, exactly positive semidefinite covariance matrix.
+- **Collateral** with per asset haircuts, eligibility and a declared stale
+  price policy; debts always count.
+- **Margin reservations** for pending derivative orders, with one cash pool
+  shared with spot orders, so no unit of cash is reserved twice.
+
+### Maintenance and liquidation
+- **Account state** (healthy, reduce only, default) from the maintenance
+  threshold; equality is healthy, unknown figures never are.
+- **Staged closeout plan**: cancel resting orders, reduce positions against
+  scenario liquidity with the smallest closeout that restores the target,
+  then report what is left (unfilled size, deficit and debt).
+- **Derivative settlements** posted to the ledger, idempotent by execution
+  id.
+
+## Modules
+
+| Module | Purpose |
 |---|---|
-| `ledger::Ledger` | Accounting authority: balances per asset (available and reserved), positions per instrument with signed average cost, fees per asset, idempotent booking by execution id, cashflow per execution, snapshots, reconciliation. |
-| `ledger::Valuation` | Mark to market by asset under an explicit policy; `net_in` is the only conversion between assets. |
-| `risk::RiskGate` | Pretrade gate that owns the ledger: reservations for every order, hard limits on the joint exposure of positions and live orders, typed `RiskDecision` (accepted, reduced, rejected), circuit breaker with quote withdrawal. |
-| `risk::InstrumentLimits`, `OrderRequest`, `RiskReason`, `HaltReason` | Limits, requests and typed reasons. |
-| `valuation::value` | Account mark to market in one reporting asset over a `LedgerSnapshot`: price source and freshness flags, collateral equity that invalid marks cannot raise, PnL with fees counted once. |
-| `scenarios::stress` | Spot inventory stress: hypothetical fills (hedges), price gaps, liquidation spread. |
-| `initial_margin::InitialMarginModel`, `rules::TieredLinearIm` | Versioned margin rules; `xynthex-linear-im/1` for linear USDC futures and perpetuals, with the rule id and a per position breakdown in every requirement. |
-| `factors`, `covariance::portfolio_variance` | Factor exposures with explicit units (price return, vol point, rate point) and portfolio variance under a validated, exactly positive semidefinite covariance matrix (one and two factors). |
-| `collateral::value_collateral` | Available collateral of one account with per asset haircuts, eligibility and a declared stale price policy; debts always count. |
-| `margin_reservations::MarginReservationService` | Initial margin reserved for pending derivative orders of one account: exact worst case requirement, idempotent fills and effective cancels, typed rejection reasons. |
-| `maintenance::assess` | Account state from the maintenance threshold (healthy, reduce only, default; equality is healthy) with excess, shortfall and debt. |
-| `liquidation::plan_liquidation` | Staged closeout plan (cancel, reduce, residual) against scenario liquidity: partial closeouts, fees, explicit deficit and debt, adapter intents. |
-| `ledger::DerivativeSettlement` | Cash of a derivative fill (realized PnL and fee), booked idempotently by execution id and never rejected. |
-| `SpotInstrument`, `Instrument` | Instrument definitions (spot only). |
-| `Asset`, `AccountId`, `VenueId`, `ExecutionId`, `InstrumentId`, `OrderId`, `TransferId`, `ReservationId` | Validated identifiers. |
-| `Rounding` | Rounding mode for the notional and the released cost. |
-| `MarginError`, `Result<T>` | Typed error boundary (`#[non_exhaustive]`). |
-| `Decimal` | Re-export of `rust_decimal::Decimal`. |
+| `ledger` | `Ledger`: balances, positions, fees, idempotent booking, cashflows, snapshots, reconciliation, valuation by asset, derivative settlements. |
+| `risk` | `RiskGate`: pretrade gate, reservations, hard limits, typed decisions, circuit breaker and quote withdrawal. |
+| `valuation` | Account mark to market in one reporting asset over a `LedgerSnapshot`, PnL attribution, collateral equity. |
+| `scenarios` | Spot inventory stress. |
+| `initial_margin`, `rules` | `InitialMarginModel`, `PiecewiseLinearMargin` and `TieredLinearIm` (`linear-im/1`). |
+| `factors`, `covariance` | Factor exposures with units and portfolio variance. |
+| `collateral` | Collateral value with haircuts and a stale price policy. |
+| `margin_reservations` | Initial margin reserved for pending derivative orders. |
+| `maintenance` | Account state from the maintenance threshold. |
+| `liquidation` | Staged closeout plan and adapter intents. |
+| `decimal` | Exact wide integer arithmetic and the `Rounding` modes. |
+| `error` | `MarginError` and `Result`: the typed error boundary. |
 
-The full contract, the rounding and valuation policies and the mapping from
-market-maker-rs are in [docs/ledger.md](docs/ledger.md); the gate's rules
-and its market-maker-rs mapping are in [docs/risk-gate.md](docs/risk-gate.md);
-valuation and stress are in [docs/valuation.md](docs/valuation.md); margin
-rules are in [docs/initial-margin.md](docs/initial-margin.md); factor risk is
-in [docs/covariance.md](docs/covariance.md); collateral is in
-[docs/collateral.md](docs/collateral.md); margin reservations are in
-[docs/margin-reservations.md](docs/margin-reservations.md); maintenance and
-liquidation are in [docs/liquidation.md](docs/liquidation.md); the exact
-arithmetic rule is in [docs/exact-arithmetic.md](docs/exact-arithmetic.md).
+The detailed contracts are in [`docs/`](docs):
+[ledger](docs/ledger.md), [risk gate](docs/risk-gate.md),
+[valuation and stress](docs/valuation.md),
+[initial margin](docs/initial-margin.md), [covariance](docs/covariance.md),
+[collateral](docs/collateral.md),
+[margin reservations](docs/margin-reservations.md),
+[maintenance and liquidation](docs/liquidation.md) and the
+[exact arithmetic rule](docs/exact-arithmetic.md).
 
-## Usage
+## Installation
 
-The crate is not published. Depend on it by git:
+The crate is not yet published on crates.io. Depend on it by git:
 
 ```toml
 [dependencies]
 margin-rs = { git = "https://github.com/joaquinbejar/margin-rs" }
 ```
+
+## Examples
+
+### Ledger
 
 ```rust
 use margin_rs::ledger::{Execution, Ledger, Side};
@@ -75,24 +151,182 @@ fn main() -> margin_rs::Result<()> {
 }
 ```
 
-## Policies
+### Pretrade risk gate
 
-- Rust edition 2024, MSRV 1.85. CI runs the latest stable and the MSRV.
-- Small dependency set: `thiserror` and `rust_decimal` (without default
-  features). margin-rs never depends on market-maker-rs or tessera-rl.
-  `Cargo.lock` is committed so CI, including the MSRV job, is reproducible.
-- No binary floating point arithmetic: `clippy::float_arithmetic` is denied
-  crate wide. Money, prices and quantities are exact decimals; every
-  operation is checked, and the only rounding steps are explicit.
-- No `unsafe` code.
+```rust
+use margin_rs::ledger::{Execution, Ledger, Side};
+use margin_rs::risk::{FillReport, InstrumentLimits, OrderRequest, RiskGate};
+use margin_rs::{Asset, Decimal, ExecutionId, InstrumentId, OrderId, SpotInstrument, TransferId};
 
-## Development
+fn main() -> margin_rs::Result<()> {
+    let usdc = Asset::new("USDC")?;
+    let btc = Asset::new("BTC")?;
+    let pair = InstrumentId::new("BTC-USDC")?;
+    let mut ledger = Ledger::default();
+    ledger.register_asset(usdc.clone(), 6)?;
+    ledger.register_asset(btc.clone(), 8)?;
+    ledger.register_instrument(SpotInstrument::new(pair.clone(), btc, usdc.clone(), 2, 8)?)?;
 
-```sh
-make pre-push   # fmt-check, clippy -D warnings, tests, docs -D warnings, MSRV check
-make fmt        # format the code
+    let mut gate = RiskGate::new(ledger);
+    gate.deposit(TransferId::new("d1")?, usdc.clone(), Decimal::from(1000))?;
+    gate.set_limits(&pair, InstrumentLimits::default())?;
+
+    // 1000 USDC: a buy of 6 at 100 reserves 600; a second one does not fit.
+    let first = OrderRequest::new(OrderId::new("o1")?, pair.clone(), Side::Buy, Decimal::from(100), Decimal::from(6));
+    let second = OrderRequest::new(OrderId::new("o2")?, pair.clone(), Side::Buy, Decimal::from(100), Decimal::from(6));
+    assert!(!gate.submit(&first, 0).is_rejected());
+    assert!(gate.submit(&second, 0).is_rejected());
+
+    // The fill consumes the reservation exactly once.
+    let fill = Execution::new(ExecutionId::new("e1")?, pair, Side::Buy, Decimal::from(100), Decimal::from(6));
+    assert!(gate.on_fill(&OrderId::new("o1")?, &FillReport::new(fill, Decimal::from(6)))?.is_clean());
+    assert_eq!(gate.ledger().balance(&usdc).map(|b| b.available), Some(Decimal::from(400)));
+    Ok(())
+}
 ```
 
-## License
+### Margin, maintenance and closeout
 
-MIT
+```rust
+use std::collections::BTreeMap;
+
+use margin_rs::initial_margin::{ExposurePosition, ExposureView, InitialMarginModel, ProductKind};
+use margin_rs::liquidation::{
+    CloseoutOutcome, CloseoutTarget, LiquidationAccount, LiquidationPolicy, LiquidityLevel,
+    plan_liquidation,
+};
+use margin_rs::maintenance::{AccountState, CollateralView, assess};
+use margin_rs::rules::TieredLinearIm;
+use margin_rs::{AccountId, Asset, Decimal, InstrumentId, VenueId};
+
+fn main() -> margin_rs::Result<()> {
+    let usdc = Asset::new("USDC")?;
+    let perp = InstrumentId::new("BTC-PERP")?;
+    let rule = TieredLinearIm::linear_v1(usdc.clone(), 6)?;
+
+    // Long 10 contracts entered at 100 (basis 1000), marked at 95.
+    let view = ExposureView {
+        account: AccountId::new("acct")?,
+        venue: VenueId::new("venue")?,
+        positions: vec![ExposurePosition {
+            instrument: perp.clone(),
+            product: ProductKind::LinearPerpetual,
+            settlement: usdc.clone(),
+            contracts: Decimal::from(10),
+            multiplier: Decimal::ONE,
+            mark: Decimal::from(95),
+        }],
+    };
+    let requirement = rule.requirement(&view)?;
+    assert_eq!(requirement.maintenance, Decimal::new(475, 1)); // 5 % of 950
+
+    // Cash 90 and upnl -50: collateral 40 is below maintenance.
+    let collateral = Decimal::from(40);
+    let state = assess(
+        AccountState::Healthy,
+        &CollateralView { currency: usdc.clone(), cash: Decimal::from(90), collateral: Some(collateral), equity: Some(collateral) },
+        &requirement,
+    )?;
+    assert_eq!(state.state, AccountState::ReduceOnly);
+
+    // Close just enough at the bid to restore maintenance.
+    let account = LiquidationAccount {
+        view,
+        basis: BTreeMap::from([(perp.clone(), Decimal::from(1000))]),
+        cash: Decimal::from(90),
+        resting_orders: vec![],
+    };
+    let liquidity = BTreeMap::from([(perp, vec![LiquidityLevel { price: Decimal::from(94), contracts: Decimal::from(100) }])]);
+    let policy = LiquidationPolicy {
+        target: CloseoutTarget::Maintenance,
+        fee_rate: Decimal::new(5, 4), // 0.0005
+        contract_step: Decimal::ONE,
+    };
+    let plan = plan_liquidation(&rule, &account, &liquidity, &policy)?;
+    assert_eq!(plan.outcome, CloseoutOutcome::TargetMet);
+    assert_eq!(plan.reductions[0].contracts, Decimal::from(3));
+    Ok(())
+}
+```
+
+## Exact arithmetic
+
+- Money, prices and quantities are `rust_decimal::Decimal`. Every operation
+  is checked: it returns the exact result or a typed `Arithmetic` error,
+  never a saturated or silently rounded value.
+- Sums and products of more than two terms are computed in 768-bit wide
+  integers with one final conversion or one final rounding, so an
+  intermediate that does not fit can never change a result that does.
+- The only rounding steps are explicit and documented (notional, released
+  cost, margin per position, fees, valuation), each from the exact value
+  with a declared `Rounding` mode.
+- Binary floating point is banned crate wide (`clippy::float_arithmetic =
+  deny`), and there is no `unsafe` code.
+
+See [docs/exact-arithmetic.md](docs/exact-arithmetic.md).
+
+## Status and policies
+
+- Version 0.1, not yet published; the API may change before the first
+  release.
+- Rust edition 2024, MSRV 1.85. CI runs the latest stable and the MSRV.
+- Small dependency set: `thiserror` and `rust_decimal` (without default
+  features). margin-rs never depends on market-maker-rs. Planned
+  integration: market-maker-rs does not depend on margin-rs yet.
+  `Cargo.lock` is committed so CI, including the MSRV job, is
+  reproducible.
+
+## 🛠 Makefile Commands
+
+```sh
+make build       # Compile every target
+make test        # Unit, integration and doc tests (README examples included)
+make fmt         # Format the code
+make fmt-check   # Check formatting
+make lint        # Clippy with warnings as errors
+make doc         # Documentation with warnings as errors
+make msrv        # Build and test on the MSRV (1.85)
+make pre-push    # fmt-check, lint, test, doc and msrv
+```
+
+## Contribution and Contact
+
+We welcome contributions to this project! If you would like to contribute, please follow these steps:
+
+1. Fork the repository.
+2. Create a new branch for your feature or bug fix.
+3. Make your changes and ensure that the project still builds and all tests pass.
+4. Commit your changes and push your branch to your forked repository.
+5. Submit a pull request to the main repository.
+
+If you have any questions, issues, or would like to provide feedback, please feel free to contact the project
+maintainer:
+
+### **Contact Information**
+- **Author**: Joaquín Béjar García
+- **Email**: jb@taunais.com
+- **Telegram**: [@joaquin_bejar](https://t.me/joaquin_bejar)
+- **Repository**: <https://github.com/joaquinbejar/margin-rs>
+- **Documentation**: <https://docs.rs/margin-rs>
+
+
+We appreciate your interest and look forward to your contributions!
+
+**License**: MIT
+
+<!-- related-projects:start -->
+## Related projects
+
+Repositories by the same author that this project depends on, and repositories that depend on it.
+
+### Depends on
+
+None: margin-rs depends only on `rust_decimal` and `thiserror`.
+
+### Used by
+
+| Repository | Description |
+|------------|-------------|
+| [market-maker-rs](https://github.com/joaquinbejar/market-maker-rs) · [crates.io](https://crates.io/crates/market-maker-rs) | Quantitative market making strategies, starting with the Avellaneda-Stoikov model. Planned integration: it does not depend on margin-rs yet. |
+
+<!-- related-projects:end -->

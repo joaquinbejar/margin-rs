@@ -21,19 +21,19 @@
 //! Positions are margined gross, one per instrument: no netting between
 //! instruments, accounts or venues.
 //!
-//! # `xynthex-linear-im/1`
+//! # `linear-im/1`
 //!
-//! [`TieredLinearIm::xynthex_v1`] is the Xynthex M2 rule for linear USDC
-//! futures and perpetuals, from Xynthex `docs/design/economics.md` section
-//! 11.2 at commit `2b6a97330ef056673c97f3b1a48da4e62cdb67f3` (file last
-//! changed in `84727a8014172c3bea6c6de2a47d5b6715122ace`):
+//! [`TieredLinearIm::linear_v1`] is the crate's rule for linear USDC
+//! futures and perpetuals:
 //!
-//! > Futures and perp: `im = im_rate * |Qc| * M * mark` (default 10 %),
-//! > `mm = mm_rate * ...` (default 5 %).
+//! ```text
+//! im = 0.10 * |Qc| * M * mark
+//! mm = 0.05 * |Qc| * M * mark
+//! ```
 //!
 //! It is the table with a single tier `[0, inf)` at `im_rate = 0.10` and
-//! `mm_rate = 0.05`. Spot and options are outside this rule: Xynthex margins
-//! spot by cash and options by a different formula (same section).
+//! `mm_rate = 0.05`. Spot and options are outside this rule: spot is
+//! margined by cash and options by a different formula.
 
 use std::collections::BTreeSet;
 
@@ -69,22 +69,21 @@ pub struct TieredLinearIm {
 }
 
 impl TieredLinearIm {
-    /// The Xynthex M2 rule, `xynthex-linear-im/1`: one tier, initial 10 %,
-    /// maintenance 5 %. `usdc` is the settlement asset and `scale` its
-    /// number of decimals.
+    /// The rule `linear-im/1`: one tier, initial 10 %, maintenance 5 %.
+    /// `usdc` is the settlement asset and `scale` its number of decimals.
     ///
-    /// The identifier names exactly these rates. A Xynthex run with other
-    /// `im_rate` or `mm_rate` values (economics.md 11.2 calls 10 % and 5 %
-    /// defaults) is a different rule: build it with [`TieredLinearIm::new`]
-    /// and its own [`RuleId`] or version, never with this one.
+    /// The identifier names exactly these rates. Other `im_rate` or
+    /// `mm_rate` values are a different rule: build it with
+    /// [`TieredLinearIm::new`] and its own [`RuleId`] or version, never
+    /// with this one.
     ///
     /// # Errors
     ///
     /// [`MarginError::InvalidInput`] if `scale` exceeds
     /// [`MAX_SCALE`](crate::decimal::MAX_SCALE).
-    pub fn xynthex_v1(usdc: Asset, scale: u32) -> Result<Self> {
+    pub fn linear_v1(usdc: Asset, scale: u32) -> Result<Self> {
         Self::new(
-            RuleId::new("xynthex-linear-im", 1),
+            RuleId::new("linear-im", 1),
             usdc,
             scale,
             vec![MarginTier {

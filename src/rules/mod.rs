@@ -3,7 +3,7 @@
 //!
 //! | Rule | Products | Primary specification |
 //! |---|---|---|
-//! | [`TieredLinearIm::xynthex_v1`] (`xynthex-linear-im/1`) | Linear USDC futures and perpetuals | Xynthex `docs/design/economics.md` section 11.2 at commit `2b6a97330ef056673c97f3b1a48da4e62cdb67f3` |
+//! | [`TieredLinearIm::linear_v1`] (`linear-im/1`) | Linear USDC futures and perpetuals | [`initial_linear`] and `docs/initial-margin.md` |
 //!
 //! External venue rules (for example Binance USDⓈ-M leverage brackets) are
 //! future rules: each will cite its venue specification pinned by date and
