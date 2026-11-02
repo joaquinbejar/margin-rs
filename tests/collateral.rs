@@ -1,4 +1,4 @@
-//! Collateral fixtures (M3-03A), hand calculated.
+//! Collateral fixtures, hand calculated.
 
 #![allow(
     clippy::unwrap_used,

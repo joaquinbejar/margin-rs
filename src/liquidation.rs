@@ -18,7 +18,7 @@
 //! # From and back to the ledger
 //!
 //! When the positions live in the [`Ledger`](crate::ledger::Ledger) as
-//! linear futures and perpetuals, [`LiquidationAccount::from_ledger`] reads
+//! futures and perpetuals, linear or inverse, [`LiquidationAccount::from_ledger`] reads
 //! the account from a [`LedgerSnapshot`] and each forced fill is booked back
 //! as an [`Execution`] ([`ForcedReduction::execution`]) with
 //! [`Ledger::book_execution_allowing_overdraft`](crate::ledger::Ledger::book_execution_allowing_overdraft).
@@ -407,7 +407,7 @@ pub struct ForcedReduction {
 }
 
 impl ForcedReduction {
-    /// This fill as a ledger execution of a linear future or perpetual,
+    /// This fill as a ledger execution of a future or perpetual,
     /// under the execution id the venue gave it: side, price, contracts and
     /// a fee in the plan's `currency`, executed at `executed_at_ms`. Booked
     /// with

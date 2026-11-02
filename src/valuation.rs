@@ -53,11 +53,13 @@
 //! `net_pnl` by rounding only, reported as
 //! [`PnlAttribution::rounding_difference`].
 //!
-//! # Linear futures and perpetuals
+//! # Futures and perpetuals
 //!
 //! An open derivative position is valued at its instrument mark
-//! ([`MarkSet::instruments`], per unit of the underlying in its settlement
-//! asset): `upnl = rhe(Q * M * mark) - basis`, rounded once (half-even) to
+//! ([`MarkSet::instruments`], per unit of the underlying): for a linear
+//! contract `upnl = rhe(Q * M * mark) - basis` in its settlement asset, and
+//! for an inverse one `upnl = basis - rhe(Q * CV / mark)` in the base (the
+//! mark is then in the quote currency of `CV`), rounded once (half-even) to
 //! the settlement asset scale, listed in [`AccountValuation::derivatives`].
 //! Every open derivative needs a mark ([`MarginError::MissingMark`]
 //! otherwise); flat and settled ones need none, and a mark for them is
@@ -133,8 +135,9 @@ pub struct MarkSet {
     pub as_of_ms: u64,
     /// Price per asset, in the reporting asset.
     pub prices: BTreeMap<Asset, Mark>,
-    /// Price per linear future or perpetual: per unit of the underlying, in
-    /// the instrument's settlement asset (not in the reporting asset). Every
+    /// Price per future or perpetual: per unit of the underlying, in the
+    /// instrument's settlement asset for a linear contract and in the quote
+    /// currency of `CV` for an inverse one (never in the reporting asset). Every
     /// open derivative position needs one; a mark for a flat or settled
     /// derivative is accepted and ignored.
     pub instruments: BTreeMap<InstrumentId, Mark>,
@@ -259,7 +262,7 @@ pub struct AssetValue {
     pub collateral_value: Option<Decimal>,
 }
 
-/// Valuation of one open linear future or perpetual position, in its
+/// Valuation of one open future or perpetual position, in its
 /// settlement asset.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DerivativeValue {
@@ -274,9 +277,12 @@ pub struct DerivativeValue {
     pub contracts: Decimal,
     /// Signed basis (cash value at entry prices).
     pub basis: Decimal,
-    /// `rhe(contracts * multiplier * mark)` to the settlement asset scale.
+    /// `rhe(contracts * multiplier * mark)` for a linear contract,
+    /// `rhe(contracts * CV / mark)` for an inverse one, to the settlement
+    /// asset scale.
     pub market_value: Decimal,
-    /// `market_value - basis`.
+    /// `market_value - basis`; `basis - market_value` for an inverse
+    /// contract.
     pub unrealized_pnl: Decimal,
 }
 
@@ -320,7 +326,7 @@ pub struct AccountValuation {
     /// Equity that marks can be trusted for, rounded down; `None` when a
     /// debt cannot be valued conservatively. See the [module docs](self).
     pub collateral_equity: Option<Decimal>,
-    /// Every open linear future or perpetual position, valued at its
+    /// Every open future or perpetual position, valued at its
     /// instrument mark.
     pub derivatives: BTreeMap<InstrumentId, DerivativeValue>,
     /// Open derivatives whose instrument mark is not valid (stale or

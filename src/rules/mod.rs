@@ -3,7 +3,7 @@
 //!
 //! | Rule | Products | Primary specification |
 //! |---|---|---|
-//! | [`TieredLinearIm::linear_v1`] (`linear-im/1`) | Linear USDC futures and perpetuals | [`initial_linear`] and `docs/initial-margin.md` |
+//! | [`TieredLinearIm::linear_v1`] (`linear-im/1`) | Linear futures and perpetuals, in the settlement asset | [`initial_linear`] and `docs/initial-margin.md` |
 //! | [`TieredInverseIm::inverse_v1`] (`inverse-im/1`) | Inverse futures and perpetuals, in the base | [`initial_inverse`] and `docs/initial-margin.md` |
 //!
 //! External venue rules (for example Binance USDⓈ-M leverage brackets) are

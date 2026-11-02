@@ -1,4 +1,4 @@
-# Initial margin rules (M3-03B)
+# Initial margin rules
 
 `initial_margin::InitialMarginModel::requirement(&ExposureView) -> MarginRequirement`
 
@@ -23,18 +23,18 @@
 | | |
 |---|---|
 | Rule | `rules::TieredLinearIm::linear_v1(usdc, scale)` |
-| Products | Linear USDC futures and perpetuals (`ProductKind::LinearFuture`, `LinearPerpetual`) |
+| Products | Linear futures and perpetuals settled in the rule's asset, USDC in the examples (`ProductKind::LinearFuture`, `LinearPerpetual`) |
 | Specification | This document: the crate's own rule for linear futures and perpetuals |
 | Formula | `im = 10 % * |Qc| * M * mark`, `mm = 5 % * |Qc| * M * mark` |
-| Units | `Qc` in contracts, `M` in underlying units per contract, `mark` in USDC per underlying unit; amounts in USDC at the given scale |
-| Rounding | Each position rounded up once to the USDC scale; totals are exact sums |
+| Units | `Qc` in contracts, `M` in underlying units per contract, `mark` in the settlement asset per underlying unit; amounts in the settlement asset at the given scale |
+| Rounding | Each position rounded up once to the settlement asset scale; totals are exact sums |
 | Not covered | Spot (cash margined) and options (a different formula): `UnsupportedInstrument` |
 
 The rule is the tier table `[0, inf)` with rates 0.10 and 0.05.
 
 The identifier names exactly these rates. A venue configured with other rates is a different rule. It must be built with `TieredLinearIm::new` and given its own `RuleId` or version, never `linear-im/1`.
 
-Rounding each position up once to the USDC scale, with totals as exact sums, is part of the rule. A different rounding is a new version of the rule.
+Rounding each position up once to the settlement asset scale, with totals as exact sums, is part of the rule. A different rounding is a new version of the rule.
 
 ## Tier tables
 

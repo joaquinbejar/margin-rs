@@ -1,4 +1,4 @@
-//! Margin reservation fixtures (M3-03C), hand calculated with
+//! Margin reservation fixtures, hand calculated with
 //! `linear-im/1` (im = 10 % of |contracts| * M * mark).
 //!
 //! XYZ-PERP and ABC-PERP: M = 10, mark 2000, so one contract needs 2000.

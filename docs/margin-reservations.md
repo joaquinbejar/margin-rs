@@ -1,4 +1,4 @@
-# Margin reservations for pending orders (M3-03C)
+# Margin reservations for pending orders
 
 `margin_reservations::MarginReservationService<M: InitialMarginModel>` serves one account at one venue under one margin rule, for example `linear-im/1`.
 
@@ -60,9 +60,9 @@ Fills are idempotent by execution id. Reusing an id with another order or quanti
 | `sync_hold(&mut gate, &hold, marks)` | The hold follows the ledger's positions |
 | `requirement_with_gate(&gate, marks)` | The requirement, positions read from the ledger |
 
-**The hold covers the whole account in the settlement asset.** The requirement margins the registered instruments, with their orders, and every other open linear future and perpetual of the ledger settled in that asset, with the ledger's terms (product and multiplier). A position opened by another strategy uses margin like the service's own. Use one such service per account and settlement asset; orders can only be placed on registered instruments.
+**The hold covers the whole account in the settlement asset.** The requirement margins the registered instruments, with their orders, and every other open future and perpetual of the ledger settled in that asset, linear or inverse, with the ledger's terms (product and contract size); the rule refuses a product it does not cover with `UnsupportedInstrument`. A position opened by another strategy uses margin like the service's own. Use one such service per account and settlement asset; orders can only be placed on registered instruments.
 
-**Collateral counts every open derivative.** The unrealized PnL `rhe(Q * M * mark) - basis` covers every open linear future and perpetual in the ledger settled in the service's asset, including the ones this service does not trade. A loss on another strategy's position is never left out. Each needs a mark: a missing one rejects the order with `MissingMark`, never a zero, and a mark that is not positive is `InvalidInput`. Derivatives settled in other assets do not count.
+**Collateral counts every open derivative.** The unrealized PnL (`rhe(Q * M * mark) - basis` for a linear contract, `basis - rhe(Q * CV / mark)` for an inverse one) covers every open future and perpetual in the ledger settled in the service's asset, including the ones this service does not trade. A loss on another strategy's position is never left out. Each needs a mark: a missing one rejects the order with `MissingMark`, never a zero, and a mark that is not positive is `InvalidInput`. Derivatives settled in other assets do not count.
 
 **Own hold once, foreign holds never.** `available` already excludes every reservation. The service adds back its own hold, read by its own id and checked to be in the settlement asset (`CurrencyMismatch` otherwise), and nothing else. On acceptance the hold becomes `min(required, max(available + own hold, 0))`: a hold takes cash only, never unrealized gains.
 

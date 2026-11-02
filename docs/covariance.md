@@ -1,4 +1,4 @@
-# Portfolio covariance risk (M3-02)
+# Portfolio covariance risk
 
 `covariance::portfolio_variance(&[FactorExposure], &ValidatedCovariance, scale) -> PortfolioVariance`
 
@@ -34,7 +34,7 @@ The covariance is per horizon, in each factor's units. Cross-covariances, for ex
 
 Exposures to the same factor net, so offsetting positions offset. The net per factor is an exact sum, kept in wide integers until the final rounding. It is independent of the order of the exposures, and neither partial sums nor the nets themselves need to be representable. `PortfolioVariance::net_exposures` reports a net as `None` when it is not a `Decimal`. The function computes `e' C e` over at most `n * n` terms, exactly, and rounds it **up** once to `scale`. Time is O(exposures) and memory is bounded by the number of factors. Because `C` is positive semidefinite, the exact value is never negative, so the result is never negative either. A negative value would be reported as an error, never returned.
 
-Scenario revaluation is a separate interface (`scenarios`, M2-08).
+Scenario revaluation is a separate interface (`scenarios`).
 
 ## Reference
 

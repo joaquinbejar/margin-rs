@@ -1,8 +1,9 @@
 //! Cash settlement of derivative positions held outside the ledger.
 //!
-//! The ledger books spot instruments only. A linear future or perpetual is
-//! margined elsewhere (see [`crate::liquidation`]); when such a position is
-//! reduced, its realized PnL and fee are paid in cash. A
+//! Futures and perpetuals registered in the ledger are booked as
+//! executions. This legacy path is for a derivative that is not registered:
+//! it is margined elsewhere (see [`crate::liquidation`]); when such a
+//! position is reduced, its realized PnL and fee are paid in cash. A
 //! [`DerivativeSettlement`] is that cash movement: one signed amount in one
 //! asset, identified like a fill by its [`ExecutionId`].
 //!

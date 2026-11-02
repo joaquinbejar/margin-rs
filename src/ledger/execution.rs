@@ -50,7 +50,7 @@ pub struct Execution {
     /// When the venue executed the fill, in milliseconds since the epoch
     /// (the unit and epoch of a future's expiry). Part of the execution: a
     /// repeat must carry the same time. Optional for spot; required for a
-    /// linear future or perpetual, and a future's fills must be executed
+    /// future or perpetual (linear or inverse), and a future's fills must be executed
     /// strictly before its expiry.
     pub executed_at_ms: Option<u64>,
 }
@@ -135,7 +135,8 @@ pub struct ExecutionCashflow {
     pub realized_pnl: Decimal,
     /// Position after the execution.
     pub position_after: PositionSnapshot,
-    /// Details of a linear future or perpetual fill; `None` for spot.
+    /// Details of a future or perpetual fill (linear or inverse); `None` for
+    /// spot.
     pub derivative: Option<DerivativeFill>,
 }
 

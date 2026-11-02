@@ -1,4 +1,4 @@
-//! Account valuation and stress fixtures (M2-08), hand calculated.
+//! Account valuation and stress fixtures, hand calculated.
 
 #![allow(
     clippy::unwrap_used,

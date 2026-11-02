@@ -1,4 +1,4 @@
-# Account valuation and stress (M2-08)
+# Account valuation and stress
 
 Cash posting and valuation are separate.
 
@@ -92,8 +92,8 @@ A shock on an asset without a mark has no effect and is listed in `StressResult:
 
 ## Out of scope
 
-- Margin requirements (M3-03).
-- Portfolio risk (M3-02).
+- Margin requirements (`initial_margin`, `rules`, see `docs/initial-margin.md`).
+- Portfolio risk (`covariance`, see `docs/covariance.md`).
 - Negative balances only arise in hypothetical scenarios or from mandatory debits; see `docs/ledger.md`.
 - Shocks per underlying: the instrument terms do not name one.
 - Mark sourcing itself: the caller supplies marks.

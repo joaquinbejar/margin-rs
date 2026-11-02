@@ -11,13 +11,15 @@ repository = "https://github.com/joaquinbejar/margin-rs"
 homepage = "https://github.com/joaquinbejar/margin-rs"
 keywords = ["finance", "margin", "risk", "trading"]
 categories = ["finance"]
-# Not published: releases need their own scope (MAR-00 release_policy).
+# Not published yet: the owner decides the first release.
 publish = false
 include = [
     "src/**/*",
     "tests/**/*.rs",
     "Cargo.toml",
     "README.md",
+    "CHANGELOG.md",
+    "docs/*.md",
     "LICENSE",
     "Makefile",
     "rust-toolchain.toml",

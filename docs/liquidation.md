@@ -1,4 +1,4 @@
-# Maintenance and liquidation (M3-04)
+# Maintenance and liquidation
 
 This document covers two modules and one ledger posting:
 
@@ -222,4 +222,5 @@ The account holds 10 BTC-PERP long, `M = 1`, entry 100 (basis 1000), mark 95, wi
 ## Out of scope
 
 - Insurance fund, loss allocation and auto-deleveraging. The debt and the deficit are left for them, explicitly.
-- Options. `TieredLinearIm` covers only linear futures and perpetuals.
+- Options. The rules cover linear (`TieredLinearIm`) and inverse (`TieredInverseIm`) futures and perpetuals only.
+- Stress of inverse positions (see `docs/valuation.md`).
