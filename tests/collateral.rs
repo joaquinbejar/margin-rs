@@ -303,3 +303,92 @@ fn policy_validation() {
         })
     );
 }
+
+/// M303A-C1: the total is the exact sum of the rounded lines, whatever the
+/// asset names and their order.
+///
+/// Balances MAX, 0.1 and MIN (a debt), all at a fresh mark of 1 with no
+/// haircut: each line is representable and the total is exactly 0.1. A
+/// total that is not representable is an error; an unknown line makes the
+/// total unknown in any order.
+#[test]
+fn total_is_exact_whatever_the_order() {
+    use margin_rs::ledger::{BalanceSnapshot, LedgerSnapshot};
+    use std::collections::BTreeMap;
+
+    let snapshot = |balances: &[(&str, Decimal)]| {
+        let mut assets = BTreeMap::from([(asset("USDC"), 6)]);
+        let mut map = BTreeMap::new();
+        for (code, amount) in balances {
+            assets.insert(asset(code), 6);
+            map.insert(
+                asset(code),
+                BalanceSnapshot {
+                    total: *amount,
+                    reserved: Decimal::ZERO,
+                    available: *amount,
+                },
+            );
+        }
+        LedgerSnapshot {
+            assets,
+            instruments: BTreeMap::new(),
+            net_transfers: BTreeMap::new(),
+            balances: map,
+            positions: BTreeMap::new(),
+            fees_paid: BTreeMap::new(),
+            reservations: BTreeMap::new(),
+            executions_booked: 0,
+        }
+    };
+    let names = ["AAA", "BBB", "CCC"];
+    let amounts = [Decimal::MAX, dec!(0.1), Decimal::MIN];
+    // Every assignment of the three amounts to the three names (the
+    // snapshot iterates by name, so this permutes the summation order).
+    let perms = [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ];
+    for perm in perms {
+        let balances: Vec<(&str, Decimal)> = names
+            .iter()
+            .zip(perm)
+            .map(|(n, i)| (*n, amounts[i]))
+            .collect();
+        let mut marks = MarkSet::new(0);
+        let mut policy = CollateralPolicy::new(asset("USDC"), 1000);
+        for name in names {
+            marks = marks.with(asset(name), mark(dec!(1), 0));
+            policy = policy.with_haircut(asset(name), dec!(0));
+        }
+        let v = value_collateral(&snapshot(&balances), &marks, &policy).expect("value");
+        assert_eq!(v.total, Some(dec!(0.1)), "{perm:?}");
+
+        // The same with the debt's mark missing: unknown in every order.
+        let debt = balances
+            .iter()
+            .find(|(_, a)| *a < Decimal::ZERO)
+            .expect("debt")
+            .0;
+        marks.prices.remove(&asset(debt));
+        let v = value_collateral(&snapshot(&balances), &marks, &policy).expect("value");
+        assert_eq!(v.total, None, "{perm:?}");
+    }
+
+    // MAX + MAX is not representable: an error, not a saturation.
+    let both = [("AAA", Decimal::MAX), ("BBB", Decimal::MAX)];
+    let marks = MarkSet::new(0)
+        .with(asset("AAA"), mark(dec!(1), 0))
+        .with(asset("BBB"), mark(dec!(1), 0));
+    let policy = CollateralPolicy::new(asset("USDC"), 1000)
+        .with_haircut(asset("AAA"), dec!(0))
+        .with_haircut(asset("BBB"), dec!(0));
+    assert_eq!(
+        value_collateral(&snapshot(&both), &marks, &policy),
+        Err(MarginError::arithmetic("collateral total"))
+    );
+}
