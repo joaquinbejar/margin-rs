@@ -266,14 +266,18 @@ impl AccountValuation {
     }
 }
 
-struct Pricing {
+pub(crate) struct Pricing {
     /// Positive price per asset (stale and future included), reporting = 1.
-    prices: BTreeMap<Asset, Decimal>,
+    pub(crate) prices: BTreeMap<Asset, Decimal>,
     /// Status per registered asset.
-    status: BTreeMap<Asset, MarkStatus>,
+    pub(crate) status: BTreeMap<Asset, MarkStatus>,
 }
 
-fn pricing(snapshot: &LedgerSnapshot, marks: &MarkSet, policy: &ValuationPolicy) -> Pricing {
+pub(crate) fn pricing(
+    snapshot: &LedgerSnapshot,
+    marks: &MarkSet,
+    policy: &ValuationPolicy,
+) -> Pricing {
     let mut prices = BTreeMap::new();
     let mut status = BTreeMap::new();
     for asset in snapshot.assets.keys() {
@@ -306,7 +310,11 @@ fn pricing(snapshot: &LedgerSnapshot, marks: &MarkSet, policy: &ValuationPolicy)
     Pricing { prices, status }
 }
 
-fn validate(snapshot: &LedgerSnapshot, marks: &MarkSet, policy: &ValuationPolicy) -> Result<u32> {
+pub(crate) fn validate(
+    snapshot: &LedgerSnapshot,
+    marks: &MarkSet,
+    policy: &ValuationPolicy,
+) -> Result<u32> {
     let scale =
         *snapshot
             .assets

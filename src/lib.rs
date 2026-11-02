@@ -29,6 +29,8 @@
 //! - [`factors`] and [`covariance`]: factor exposures with explicit units
 //!   and portfolio variance under a validated (symmetric, positive
 //!   semidefinite) covariance matrix.
+//! - [`collateral`]: available collateral of one account with explicit
+//!   per asset haircuts and a declared stale price policy.
 //! - [`MarginError`] and [`Result`]: the typed error boundary.
 //!
 //! ## Policies
@@ -65,6 +67,7 @@
 //! );
 //! ```
 
+pub mod collateral;
 pub mod covariance;
 pub mod decimal;
 pub mod error;

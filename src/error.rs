@@ -185,6 +185,13 @@ pub enum MarginError {
         reason: &'static str,
     },
 
+    /// A collateral asset's mark is not valid and the policy rejects it.
+    #[error("collateral {asset} has an invalid mark and the policy rejects it")]
+    InvalidCollateralMark {
+        /// Asset.
+        asset: Asset,
+    },
+
     /// An open position has no mark price.
     #[error("missing mark price for {instrument}")]
     MissingMark {
