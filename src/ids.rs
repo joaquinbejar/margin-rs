@@ -101,6 +101,20 @@ string_id!(
 );
 
 string_id!(
+    /// Identifier of an account. Margin is computed per account and never
+    /// netted across accounts.
+    AccountId,
+    "account_id"
+);
+
+string_id!(
+    /// Identifier of a venue. Margin is computed per venue and never netted
+    /// across venues.
+    VenueId,
+    "venue_id"
+);
+
+string_id!(
     /// Identifier of a tradable instrument, for example `BTC-USDC`.
     InstrumentId,
     "instrument_id"
