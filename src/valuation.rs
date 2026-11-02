@@ -52,6 +52,30 @@
 //! unrealized - fees` exactly; each figure is rounded once, so the attribution can differ from
 //! `net_pnl` by rounding only, reported as
 //! [`PnlAttribution::rounding_difference`].
+//!
+//! # Linear futures and perpetuals
+//!
+//! An open derivative position is valued at its instrument mark
+//! ([`MarkSet::instruments`], per unit of the underlying in its settlement
+//! asset): `upnl = rhe(Q * M * mark) - basis`, rounded once (half-even) to
+//! the settlement asset scale, listed in [`AccountValuation::derivatives`].
+//! Every open derivative needs a mark ([`MarginError::MissingMark`]
+//! otherwise); flat and settled ones need none, and a mark for them is
+//! ignored.
+//!
+//! - Reporting equity adds `upnl * price(settlement asset)`; a stale or
+//!   future instrument mark is used and flagged in
+//!   [`AccountValuation::instrument_flags`].
+//! - Collateral counts `cash + sum(upnl)` per settlement asset as **one net
+//!   amount**, with the asset rules above applied to the net (a loss nets
+//!   against the cash; a net debt counts in full). An invalid instrument
+//!   mark never adds collateral: a gain at a stale or future mark is
+//!   excluded before netting, and a loss at one makes collateral equity
+//!   `None` (it cannot be bounded and is never offset by cash). Unlike
+//!   asset marks, instrument marks are never haircut under
+//!   [`InvalidMarkPolicy::HaircutStale`]: they are excluded.
+//! - Attribution: `unrealized` adds `upnl * price(settlement asset)`;
+//!   realized PnL and funding were paid in cash and are counted once.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -59,7 +83,7 @@ use rust_decimal::Decimal;
 
 use crate::decimal::{Rounding, add, neg, sub, sum, sum_terms_round};
 use crate::error::{MarginError, Result};
-use crate::ids::Asset;
+use crate::ids::{Asset, InstrumentId};
 use crate::instrument::Instrument;
 use crate::ledger::LedgerSnapshot;
 
@@ -109,6 +133,11 @@ pub struct MarkSet {
     pub as_of_ms: u64,
     /// Price per asset, in the reporting asset.
     pub prices: BTreeMap<Asset, Mark>,
+    /// Price per linear future or perpetual: per unit of the underlying, in
+    /// the instrument's settlement asset (not in the reporting asset). Every
+    /// open derivative position needs one; a mark for a flat or settled
+    /// derivative is accepted and ignored.
+    pub instruments: BTreeMap<InstrumentId, Mark>,
 }
 
 impl MarkSet {
@@ -118,6 +147,7 @@ impl MarkSet {
         Self {
             as_of_ms,
             prices: BTreeMap::new(),
+            instruments: BTreeMap::new(),
         }
     }
 
@@ -125,6 +155,14 @@ impl MarkSet {
     #[must_use]
     pub fn with(mut self, asset: Asset, mark: Mark) -> Self {
         self.prices.insert(asset, mark);
+        self
+    }
+
+    /// Adds or replaces the mark of the derivative `instrument`, in its
+    /// settlement asset per unit of the underlying.
+    #[must_use]
+    pub fn with_instrument(mut self, instrument: InstrumentId, mark: Mark) -> Self {
+        self.instruments.insert(instrument, mark);
         self
     }
 }
@@ -214,9 +252,32 @@ pub struct AssetValue {
     /// `total * price` rounded, or `None` without a positive price.
     pub value: Option<Decimal>,
     /// Contribution to collateral equity, rounded down (toward negative
-    /// infinity); `None` when it cannot be bounded (a debt without a usable
-    /// mark).
+    /// infinity): the total balance plus the unrealized PnL counted for the
+    /// derivatives settled in this asset, as one net amount. `None` when it
+    /// cannot be bounded (a debt without a usable mark, or a derivative
+    /// loss at an invalid instrument mark).
     pub collateral_value: Option<Decimal>,
+}
+
+/// Valuation of one open linear future or perpetual position, in its
+/// settlement asset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivativeValue {
+    /// Settlement asset of the amounts below.
+    pub settlement: Asset,
+    /// Instrument mark used.
+    pub mark: Mark,
+    /// Status of the mark. A stale or future mark is used for reporting
+    /// equity but never for collateral.
+    pub status: MarkStatus,
+    /// Signed contracts.
+    pub contracts: Decimal,
+    /// Signed basis (cash value at entry prices).
+    pub basis: Decimal,
+    /// `rhe(contracts * multiplier * mark)` to the settlement asset scale.
+    pub market_value: Decimal,
+    /// `market_value - basis`.
+    pub unrealized_pnl: Decimal,
 }
 
 /// Split of the PnL into realized, unrealized and fees, in the reporting
@@ -257,6 +318,12 @@ pub struct AccountValuation {
     /// Equity that marks can be trusted for, rounded down; `None` when a
     /// debt cannot be valued conservatively. See the [module docs](self).
     pub collateral_equity: Option<Decimal>,
+    /// Every open linear future or perpetual position, valued at its
+    /// instrument mark.
+    pub derivatives: BTreeMap<InstrumentId, DerivativeValue>,
+    /// Open derivatives whose instrument mark is not valid (stale or
+    /// future): used for reporting equity, never for collateral.
+    pub instrument_flags: BTreeMap<InstrumentId, MarkStatus>,
 }
 
 impl AccountValuation {
@@ -289,26 +356,147 @@ pub(crate) fn pricing(
         }
         let state = match marks.prices.get(asset) {
             None => MarkStatus::Missing,
-            Some(mark) if mark.price <= Decimal::ZERO => MarkStatus::NonPositive,
             Some(mark) => {
-                prices.insert(asset.clone(), mark.price);
-                if mark.timestamp_ms > marks.as_of_ms {
-                    MarkStatus::Future {
-                        ahead_ms: mark.timestamp_ms.abs_diff(marks.as_of_ms),
-                    }
-                } else {
-                    let age_ms = marks.as_of_ms.abs_diff(mark.timestamp_ms);
-                    if age_ms > policy.max_age_ms {
-                        MarkStatus::Stale { age_ms }
-                    } else {
-                        MarkStatus::Valid
-                    }
+                let state = mark_status(mark, marks.as_of_ms, policy.max_age_ms);
+                if state != MarkStatus::NonPositive {
+                    prices.insert(asset.clone(), mark.price);
                 }
+                state
             }
         };
         status.insert(asset.clone(), state);
     }
     Pricing { prices, status }
+}
+
+/// Status of a present mark at `as_of_ms`: non positive, future, stale
+/// (older than `max_age_ms`) or valid.
+fn mark_status(mark: &Mark, as_of_ms: u64, max_age_ms: u64) -> MarkStatus {
+    if mark.price <= Decimal::ZERO {
+        MarkStatus::NonPositive
+    } else if mark.timestamp_ms > as_of_ms {
+        MarkStatus::Future {
+            ahead_ms: mark.timestamp_ms.abs_diff(as_of_ms),
+        }
+    } else {
+        let age_ms = as_of_ms.abs_diff(mark.timestamp_ms);
+        if age_ms > max_age_ms {
+            MarkStatus::Stale { age_ms }
+        } else {
+            MarkStatus::Valid
+        }
+    }
+}
+
+/// Values every open linear future or perpetual position at its instrument
+/// mark: `upnl = rhe(Q * M * mark) - basis`, rounded once to its settlement
+/// asset scale. Flat (and settled) positions need no mark.
+///
+/// # Errors
+///
+/// - [`MarginError::MissingMark`] if an open derivative has no instrument
+///   mark (never valued at zero).
+/// - [`MarginError::InvalidInput`] if its mark is not positive.
+/// - [`MarginError::UnknownAsset`] if its settlement asset is not
+///   registered in the snapshot.
+/// - [`MarginError::Arithmetic`] if the market value or the unrealized PnL
+///   does not fit a `Decimal`.
+pub(crate) fn derivative_values(
+    snapshot: &LedgerSnapshot,
+    marks: &MarkSet,
+    max_age_ms: u64,
+) -> Result<BTreeMap<InstrumentId, DerivativeValue>> {
+    let mut values = BTreeMap::new();
+    for (id, position) in &snapshot.positions {
+        if position.quantity.is_zero() {
+            continue;
+        }
+        let terms = match snapshot.instruments.get(id) {
+            Some(Instrument::Spot(_)) => continue,
+            Some(derivative @ (Instrument::LinearFuture(_) | Instrument::LinearPerpetual(_))) => {
+                derivative
+                    .linear_terms()
+                    .ok_or(MarginError::arithmetic("derivative terms"))?
+            }
+            None => {
+                return Err(MarginError::UnknownInstrument {
+                    instrument: id.clone(),
+                });
+            }
+        };
+        let mark = *marks
+            .instruments
+            .get(id)
+            .ok_or_else(|| MarginError::MissingMark {
+                instrument: id.clone(),
+            })?;
+        let status = mark_status(&mark, marks.as_of_ms, max_age_ms);
+        if status == MarkStatus::NonPositive {
+            return Err(MarginError::invalid_input(
+                "instrument mark",
+                "must be positive",
+            ));
+        }
+        let settlement = terms.settlement();
+        let scale = *snapshot
+            .assets
+            .get(settlement)
+            .ok_or_else(|| MarginError::UnknownAsset {
+                asset: settlement.clone(),
+            })?;
+        let market_value = crate::ledger::derivative::market_value(
+            position.quantity,
+            terms.multiplier(),
+            mark.price,
+            scale,
+        )?;
+        let unrealized_pnl = sub(market_value, position.cost_basis, "market value - basis")?;
+        values.insert(
+            id.clone(),
+            DerivativeValue {
+                settlement: settlement.clone(),
+                mark,
+                status,
+                contracts: position.quantity,
+                basis: position.cost_basis,
+                market_value,
+                unrealized_pnl,
+            },
+        );
+    }
+    Ok(values)
+}
+
+/// The unrealized PnL a collateral figure may count per settlement asset:
+/// `Some(sum)` of the gains and losses at valid instrument marks, where a
+/// gain at an invalid (stale or future) mark is excluded, and `None` when a
+/// loss is at an invalid mark (it cannot be bounded). Summed exactly.
+pub(crate) fn collateral_upnl(
+    derivatives: &BTreeMap<InstrumentId, DerivativeValue>,
+) -> Result<BTreeMap<Asset, Option<Decimal>>> {
+    let mut terms: BTreeMap<Asset, Option<Vec<Decimal>>> = BTreeMap::new();
+    for value in derivatives.values() {
+        let entry = terms
+            .entry(value.settlement.clone())
+            .or_insert_with(|| Some(Vec::new()));
+        if value.status.is_valid() {
+            if let Some(values) = entry {
+                values.push(value.unrealized_pnl);
+            }
+        } else if value.unrealized_pnl < Decimal::ZERO {
+            *entry = None;
+        }
+    }
+    terms
+        .into_iter()
+        .map(|(asset, values)| {
+            let total = match values {
+                Some(values) => Some(sum(&values, "unrealized pnl")?),
+                None => None,
+            };
+            Ok((asset, total))
+        })
+        .collect()
 }
 
 pub(crate) fn validate(
@@ -334,6 +522,22 @@ pub(crate) fn validate(
             return Err(MarginError::UnknownAsset {
                 asset: asset.clone(),
             });
+        }
+    }
+    for instrument in marks.instruments.keys() {
+        match snapshot.instruments.get(instrument) {
+            Some(Instrument::LinearFuture(_) | Instrument::LinearPerpetual(_)) => {}
+            Some(Instrument::Spot(_)) => {
+                return Err(MarginError::invalid_input(
+                    "instrument marks",
+                    "only linear futures and perpetuals take instrument marks",
+                ));
+            }
+            None => {
+                return Err(MarginError::UnknownInstrument {
+                    instrument: instrument.clone(),
+                });
+            }
         }
     }
     if let InvalidMarkPolicy::HaircutStale { haircut } = policy.invalid_marks
@@ -413,10 +617,13 @@ fn floor_terms(terms: &[&[Decimal]], scale: u32, operation: &'static str) -> Res
 ///   is not registered in the snapshot.
 /// - [`MarginError::InvalidInput`] if the mark set prices the reporting
 ///   asset or the haircut is outside `[0, 1]`.
-/// - [`MarginError::UnsupportedInstrument`] if a linear future or perpetual
-///   position is open: its unrealized PnL needs instrument marks, which
-///   this function does not take yet. Flat derivative positions, their
-///   realized PnL and funding are valued.
+/// - [`MarginError::MissingMark`] if an open linear future or perpetual has
+///   no instrument mark ([`MarkSet::instruments`]); it is never valued at
+///   zero.
+/// - [`MarginError::InvalidInput`] if an instrument mark is not positive,
+///   or names a spot instrument.
+/// - [`MarginError::UnknownInstrument`] if an instrument mark names an
+///   unregistered instrument.
 /// - [`MarginError::Arithmetic`] if a result cannot be represented.
 #[expect(
     clippy::too_many_lines,
@@ -428,22 +635,15 @@ pub fn value(
     policy: &ValuationPolicy,
 ) -> Result<AccountValuation> {
     let scale = validate(snapshot, marks, policy)?;
-    // An open derivative position is worth cash plus its unrealized PnL,
-    // which needs instrument marks this function does not take yet: refuse
-    // rather than value the account without it.
-    for (id, position) in &snapshot.positions {
-        let derivative = match snapshot.instruments.get(id) {
-            Some(Instrument::Spot(_)) | None => false,
-            Some(Instrument::LinearFuture(_) | Instrument::LinearPerpetual(_)) => true,
-        };
-        if derivative && !position.quantity.is_zero() {
-            return Err(MarginError::UnsupportedInstrument {
-                rule: "account-valuation".to_string(),
-                instrument: id.clone(),
-                reason: "an open derivative position needs instrument marks, not supported yet",
-            });
-        }
-    }
+    // Every open derivative at its instrument mark (an error without one),
+    // and what collateral may count of it per settlement asset.
+    let derivatives = derivative_values(snapshot, marks, policy.max_age_ms)?;
+    let counted_upnl = collateral_upnl(&derivatives)?;
+    let instrument_flags: BTreeMap<InstrumentId, MarkStatus> = derivatives
+        .iter()
+        .filter(|(_, value)| !value.status.is_valid())
+        .map(|(id, value)| (id.clone(), value.status))
+        .collect();
     let Pricing { prices, status } = pricing(snapshot, marks, policy);
     let rounding = policy.rounding;
     let price = |asset: &Asset| prices.get(asset).copied();
@@ -480,7 +680,16 @@ pub fn value(
                 None => equity_known = false,
             }
         }
-        let collateral = collateral_factors(balance.total, state, asset_price, policy)?;
+        // Collateral counts the cash and the unrealized PnL of the
+        // derivatives settled in this asset as one net amount.
+        let collateral = match counted_upnl.get(asset) {
+            None => collateral_factors(balance.total, state, asset_price, policy)?,
+            Some(None) => Collateral::Unknown,
+            Some(Some(upnl)) => {
+                let net = add(balance.total, *upnl, "cash + unrealized pnl")?;
+                collateral_factors(net, state, asset_price, policy)?
+            }
+        };
         let collateral_value = match &collateral {
             Collateral::Counted(factors) => {
                 Some(floor_terms(&[factors.as_slice()], scale, "collateral")?)
@@ -504,6 +713,17 @@ pub fn value(
                 collateral_value,
             },
         );
+    }
+    // The unrealized PnL of open derivatives, in their settlement assets.
+    for value in derivatives.values() {
+        if value.unrealized_pnl.is_zero() {
+            continue;
+        }
+        flag(&value.settlement);
+        match price(&value.settlement) {
+            Some(p) => equity_terms.push(vec![value.unrealized_pnl, p]),
+            None => equity_known = false,
+        }
     }
     let round_terms = |terms: &[Vec<Decimal>], mode: Rounding, op| {
         let slices: Vec<&[Decimal]> = terms.iter().map(Vec::as_slice).collect();
@@ -551,13 +771,22 @@ pub fn value(
     for (id, position) in &snapshot.positions {
         let spot = match snapshot.instruments.get(id) {
             Some(Instrument::Spot(spot)) => spot,
-            // Flat here (refused above when open): its realized PnL was paid
-            // in the settlement asset and its basis is zero.
+            // Its realized PnL was paid in the settlement asset; its
+            // unrealized PnL is the instrument valuation above.
             Some(derivative @ (Instrument::LinearFuture(_) | Instrument::LinearPerpetual(_))) => {
+                let settlement = derivative.quote();
                 if !position.realized_pnl.is_zero() {
-                    needed.insert(derivative.quote());
-                    if let Some(p) = price(derivative.quote()) {
+                    needed.insert(settlement);
+                    if let Some(p) = price(settlement) {
                         realized_terms.push(vec![position.realized_pnl, p]);
+                    }
+                }
+                if let Some(value) = derivatives.get(id)
+                    && !value.unrealized_pnl.is_zero()
+                {
+                    needed.insert(settlement);
+                    if let Some(p) = price(settlement) {
+                        unrealized_terms.push(vec![value.unrealized_pnl, p]);
                     }
                 }
                 continue;
@@ -638,5 +867,7 @@ pub fn value(
         net_pnl,
         attribution,
         collateral_equity,
+        derivatives,
+        instrument_flags,
     })
 }

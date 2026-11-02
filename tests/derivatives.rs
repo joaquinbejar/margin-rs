@@ -593,7 +593,7 @@ fn the_risk_gate_refuses_derivatives() {
 }
 
 #[test]
-fn account_valuation_refuses_an_open_derivative() {
+fn account_valuation_needs_an_instrument_mark_for_an_open_derivative() {
     let mut ledger = ledger_with_cash(dec!(100));
     let policy = ValuationPolicy::new(asset("USD"), 1000);
     let marks = MarkSet::new(10);
@@ -609,20 +609,22 @@ fn account_valuation_refuses_an_open_derivative() {
     let flat = value(&ledger.snapshot(), &marks, &policy).unwrap();
     assert_eq!(flat.equity, Some(dec!(102)));
     assert_eq!(flat.attribution.unwrap().realized, dec!(2));
-    // Open: refused, never valued without its unrealized PnL.
+    // Open: never valued without its unrealized PnL.
     book(
         &mut ledger,
         &exec("e1", "BTC-PERP", Action::Buy, dec!(100), dec!(1)),
     );
-    assert!(matches!(
+    assert_eq!(
         value(&ledger.snapshot(), &marks, &policy),
-        Err(MarginError::UnsupportedInstrument { .. })
-    ));
+        Err(MarginError::MissingMark {
+            instrument: iid("BTC-PERP")
+        })
+    );
     // Asset marks do not help: the instrument mark is what is missing.
     let usd_marks = MarkSet::new(10).with(asset("BIG"), Mark::new(dec!(1), 5, PriceSource::Mid));
     assert!(matches!(
         value(&ledger.snapshot(), &usd_marks, &policy),
-        Err(MarginError::UnsupportedInstrument { .. })
+        Err(MarginError::MissingMark { .. })
     ));
 }
 

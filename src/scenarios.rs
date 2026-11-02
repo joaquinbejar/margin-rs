@@ -133,6 +133,9 @@ pub struct StressResult {
 ///   a fill on an unknown instrument or with a fee in an unknown asset.
 /// - [`MarginError::InvalidInput`] for a non positive fill price or
 ///   quantity, a shock not greater than -1 or a spread outside `[0, 1)`.
+/// - [`MarginError::UnsupportedInstrument`] if a linear future or perpetual
+///   position is open: scenarios shock asset marks, not instrument marks,
+///   so they would leave its unrealized PnL unstressed.
 /// - [`MarginError::Arithmetic`] if a result cannot be represented.
 pub fn stress(
     snapshot: &LedgerSnapshot,
@@ -140,6 +143,21 @@ pub fn stress(
     policy: &ValuationPolicy,
     scenario: &Scenario,
 ) -> Result<StressResult> {
+    // An open derivative would keep its instrument mark under every asset
+    // shock: refuse rather than report it unstressed.
+    for (id, position) in &snapshot.positions {
+        let derivative = match snapshot.instruments.get(id) {
+            Some(Instrument::Spot(_)) | None => false,
+            Some(Instrument::LinearFuture(_) | Instrument::LinearPerpetual(_)) => true,
+        };
+        if derivative && !position.quantity.is_zero() {
+            return Err(MarginError::UnsupportedInstrument {
+                rule: "stress".to_string(),
+                instrument: id.clone(),
+                reason: "scenarios do not shock instrument marks yet",
+            });
+        }
+    }
     // Validate every parameter before doing anything.
     if scenario.liquidation_spread < Decimal::ZERO || scenario.liquidation_spread >= Decimal::ONE {
         return Err(MarginError::invalid_input(

@@ -41,13 +41,17 @@ pub struct DerivativeFill {
     /// range; it is then still exact in the booking, and can be rebuilt in
     /// wide integers from the execution and the instrument.
     pub virtual_notional: Option<Decimal>,
-    /// The closing part `rhe(p * abs(Q) * M)` of a fill that crosses zero.
-    /// `None` when the fill does not cross zero, or (as above) only when it
-    /// is out of a `Decimal`'s range.
+    /// The closing part `rhe(p * abs(Q) * M)` of a fill that crosses zero,
+    /// or, for a late fill on a settled future
+    /// ([`DerivativeFill::closed_at_settlement`]), its close at the
+    /// settlement price `rhe(P * n * M)`. `None` when the fill does not
+    /// cross zero and is not late, or (as above) only when it is out of a
+    /// `Decimal`'s range.
     pub closing_notional: Option<Decimal>,
     /// Basis released by the fill, signed like the basis before the fill
     /// (positive for a long): the whole basis on a full close or a crossing,
-    /// zero when the fill opens or increases.
+    /// zero when the fill opens or increases, and zero for a late fill on a
+    /// settled future, which never stores a basis.
     pub released_basis: Decimal,
     /// Set for a late fill on a future already settled at expiry: the
     /// settlement price at which the fill was closed at once. The position

@@ -140,7 +140,7 @@ A crossing or a partial reduction can leave an open position with a zero basis (
 - **Ids**: executions, settlements, funding payments and expiry settlements share one id space. An identical repeat is a duplicate before any other check; the same id with other content is `ConflictingEntry`.
 - **Reconciliation**: per asset, the real cash (transfers, execution deltas, settlements, funding, expiries); per derivative instrument, the contracts and the virtual identity `sum of signed virtual notionals (-N buy, +N sell) = realized_pnl - basis`, recomputed in wide integers from every fill.
 
-`valuation::value` and the stress scenarios do not value open derivative positions yet: they return `UnsupportedInstrument` rather than ignore them. The risk gate handles spot orders only and refuses a derivative with `UnsupportedInstrument` at every entry point.
+`valuation::value` and `collateral::value_collateral` value open derivative positions at instrument marks (see `docs/valuation.md`); the stress scenarios do not shock instrument marks and refuse an open derivative with `UnsupportedInstrument`. The risk gate handles spot orders only and refuses a derivative with `UnsupportedInstrument` at every entry point.
 
 ## Derivative settlements outside the ledger (M3-04, legacy)
 

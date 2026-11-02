@@ -62,7 +62,7 @@
 //! # }
 //! ```
 
-mod derivative;
+pub(crate) mod derivative;
 mod execution;
 mod settlement;
 mod snapshot;
