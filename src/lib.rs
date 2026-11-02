@@ -26,6 +26,9 @@
 //!   margin rules. The first is `xynthex-linear-im/1` for linear USDC
 //!   futures and perpetuals; every requirement carries its rule id and a per
 //!   position breakdown.
+//! - [`factors`] and [`covariance`]: factor exposures with explicit units
+//!   and portfolio variance under a validated (symmetric, positive
+//!   semidefinite) covariance matrix.
 //! - [`MarginError`] and [`Result`]: the typed error boundary.
 //!
 //! ## Policies
@@ -62,8 +65,10 @@
 //! );
 //! ```
 
+pub mod covariance;
 pub mod decimal;
 pub mod error;
+pub mod factors;
 pub mod ids;
 pub mod initial_margin;
 pub mod instrument;
@@ -76,7 +81,8 @@ pub mod valuation;
 pub use decimal::Rounding;
 pub use error::{MarginError, Result};
 pub use ids::{
-    AccountId, Asset, ExecutionId, InstrumentId, OrderId, ReservationId, TransferId, VenueId,
+    AccountId, Asset, ExecutionId, FactorId, InstrumentId, OrderId, ReservationId, TransferId,
+    VenueId,
 };
 pub use instrument::{Instrument, SpotInstrument};
 pub use rust_decimal::Decimal;

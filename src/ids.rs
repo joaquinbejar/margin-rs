@@ -115,6 +115,12 @@ string_id!(
 );
 
 string_id!(
+    /// Identifier of a risk factor, for example `BTC-USD-RETURN`.
+    FactorId,
+    "factor_id"
+);
+
+string_id!(
     /// Identifier of a tradable instrument, for example `BTC-USDC`.
     InstrumentId,
     "instrument_id"
