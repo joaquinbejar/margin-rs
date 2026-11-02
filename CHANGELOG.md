@@ -67,6 +67,21 @@ was unpublished are not listed one by one.
   `max_fee_rate`; a fee in the asset it receives is netted from that credit
   in the same booking. A real fee above the bound, or in another asset, is
   booked from the free balance.
+- Declared fee rounding for fees in base (`InstrumentLimits::fee_rounding`,
+  `FeeRounding::PerFill { mode, min_fill }`, the default rounding every
+  fill up, or `FeeRounding::Cumulative { mode, rate }` at an exact rate):
+  a sell with fees in base reserves its quantity plus the declared fee
+  bound instead of the worst case (for 2 BTC at a 1e-8 lot and 0.001: 4
+  by default, 3.002 with a half mode, 2.002 toward zero or cumulative).
+  A fill outside the declaration is booked and reported in
+  `FillOutcome::fee_breaches`; the first breach of each declaration
+  (`RiskGate::fee_declaration_breaches`) rejects new orders under it with
+  `RiskReason::FeeDeclarationBreached` until
+  `RiskGate::reset_fee_declaration`.
+- Every reservation is the hold, the smallest Decimal at least the exact
+  requirement on the asset grid (equal to it whenever it is a Decimal),
+  with counts and bounds in wide integers; affordability is exact, by an
+  integer bisection over lot counts.
 - Exactly once reservation updates on fills, venue rejects and confirmed
   cancels. A real fill that does not match its order (overfill, fill after
   filled, worse price) is booked and halts the gate as an
@@ -173,6 +188,10 @@ was unpublished are not listed one by one.
   shock on one or a hypothetical fill on one with `UnsupportedInstrument`.
 - The risk gate handles spot orders only; derivative orders reserve margin
   through `margin_reservations`.
+- A booking whose resulting ledger balance or position has no Decimal form
+  (more significant digits than a Decimal holds) fails with an arithmetic
+  error and changes nothing; reservations then cover every state the
+  ledger can book.
 - Options are not covered by the ledger, the margin rules or the closeout.
 - The journal and the set of seen ids grow for the life of a ledger;
   pruning and checkpoints are future work.

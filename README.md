@@ -64,6 +64,11 @@ rounding, and no partial sum that can overflow while the result does not.
 - **Fees in the quote or the base asset** (`InstrumentLimits::fee_asset`):
   a fee in the asset an order pays is reserved with it; a fee in the asset
   it receives is netted from that credit in the same booking.
+- **Declared fee rounding** for fees in base (`InstrumentLimits::fee_rounding`):
+  per fill (a mode and a minimum fill) or cumulative at an exact rate, so a
+  sell reserves the declared fee bound instead of the worst case. A fill
+  outside the declaration is booked, reported, and stops new orders under
+  that declaration until it is reset.
 - **Hard limits** on the joint exposure of positions and live orders: order
   size, position, notional, open orders, price band and market data age.
 - **Typed decisions** (accepted, reduced, rejected) with every reason.

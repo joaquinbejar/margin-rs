@@ -151,10 +151,42 @@ pub(crate) fn sum_terms_round(
     rounding: Rounding,
     operation: &'static str,
 ) -> Result<Decimal> {
+    wide_to_decimal(
+        sum_terms_round_wide(terms, scale, rounding, operation)?,
+        scale,
+        operation,
+    )
+}
+
+/// [`sum_terms_round`] as a wide integer count of `10^-scale` units, so the
+/// rounded value need not fit a `Decimal` (to be compared or combined
+/// before only a chosen result is converted).
+pub(crate) fn sum_terms_round_wide(
+    terms: &[&[Decimal]],
+    scale: u32,
+    rounding: Rounding,
+    operation: &'static str,
+) -> Result<Wide> {
+    sum_terms_with_wide_round_wide(terms, &[], scale, rounding, operation)
+}
+
+/// [`sum_terms_round_wide`] with extra terms that each multiply a wide
+/// integer (a count that need not fit a `Decimal`) by decimals.
+pub(crate) fn sum_terms_with_wide_round_wide(
+    terms: &[&[Decimal]],
+    wide_terms: &[(Wide, &[Decimal])],
+    scale: u32,
+    rounding: Rounding,
+    operation: &'static str,
+) -> Result<Wide> {
     let error = || MarginError::arithmetic(operation);
-    let mut products = Vec::with_capacity(terms.len());
+    let mut products = Vec::with_capacity(terms.len().saturating_add(wide_terms.len()));
     for term in terms {
         products.push(wide_product(term).ok_or_else(error)?);
+    }
+    for (count, term) in wide_terms {
+        let (value, value_scale) = wide_product(term).ok_or_else(error)?;
+        products.push((value.checked_mul(*count).ok_or_else(error)?, value_scale));
     }
     let common = products.iter().map(|(_, s)| *s).max().unwrap_or(0);
     let mut sum = Wide::ZERO;
@@ -163,7 +195,7 @@ pub(crate) fn sum_terms_round(
         sum = sum.checked_add(aligned).ok_or_else(error)?;
     }
     let denominator = Wide::new(false, U768::pow10(common).ok_or_else(error)?);
-    round_ratio(sum, denominator, scale, rounding).ok_or_else(error)
+    round_ratio_wide(sum, denominator, scale, rounding).ok_or_else(error)
 }
 
 /// `sum(product(term_i)) / product(denominators)`, computed exactly and
@@ -377,6 +409,32 @@ pub(crate) fn mul_div_round_wide(
     let numerator = numerator.scale_up(denominator_scale).ok_or_else(error)?;
     let denominator = denominator.scale_up(numerator_scale).ok_or_else(error)?;
     round_ratio_wide(numerator, denominator, scale, rounding).ok_or_else(error)
+}
+
+/// `count * product(numerators) / product(denominators)`, with `count` a
+/// wide integer, rounded once to `scale` digits and kept wide.
+pub(crate) fn mul_wide_div_round_wide(
+    count: Wide,
+    numerators: &[Decimal],
+    denominators: &[Decimal],
+    scale: u32,
+    rounding: Rounding,
+    operation: &'static str,
+) -> Result<Wide> {
+    let error = || MarginError::arithmetic(operation);
+    let (numerator, numerator_scale) = wide_product(numerators).ok_or_else(error)?;
+    let (denominator, denominator_scale) = wide_product(denominators).ok_or_else(error)?;
+    let numerator = numerator
+        .checked_mul(count)
+        .and_then(|n| n.scale_up(denominator_scale))
+        .ok_or_else(error)?;
+    let denominator = denominator.scale_up(numerator_scale).ok_or_else(error)?;
+    round_ratio_wide(numerator, denominator, scale, rounding).ok_or_else(error)
+}
+
+/// A wide integer from a non negative whole `value`.
+pub(crate) fn wide_from_u128(value: u128) -> Wide {
+    Wide::new(false, U768::from_u128(value))
 }
 
 /// `value` as a wide integer count of `10^-scale` units. Fails if `value`

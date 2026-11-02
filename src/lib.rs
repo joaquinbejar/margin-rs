@@ -17,7 +17,8 @@
 //! - [`risk`]: the pretrade risk gate for spot orders. Every order passes
 //!   through [`risk::RiskGate::submit`], which reserves balance or
 //!   inventory in the ledger, fees included whether the venue charges them
-//!   in the quote or the base asset, and enforces hard limits on the joint
+//!   in the quote or the base asset (with the rounding the venue declares
+//!   for fees in base), and enforces hard limits on the joint
 //!   exposure of positions and live orders, with typed accepted, reduced
 //!   and rejected decisions, quote withdrawal on a circuit breaker, and
 //!   exactly once reservation updates on fills, rejects and confirmed
