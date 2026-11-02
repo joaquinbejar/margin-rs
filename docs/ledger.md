@@ -116,20 +116,46 @@ The adapter maps types as follows:
 
 The currency, unit and cashflow contracts of market-maker-rs#78 (M0-05) are still open. Execution reports carry no currency yet, so the adapter supplies the instrument and fee asset from its configuration until #78 lands.
 
-## Derivative settlements (M3-04)
+## Derivative positions
 
-Futures and perpetual positions are not ledger positions: they are margined by `initial_margin`, `margin_reservations` and `liquidation`. When such a position is reduced, the cash it moves is booked with `book_settlement(&DerivativeSettlement { id, instrument, asset, realized_pnl, fee })`:
+A linear future (`LinearFuture`) or perpetual (`LinearPerpetual`) registered in the ledger is held as signed contracts `Q` with a signed **basis**: the cash value of the open contracts at their entry prices, in the settlement asset (a long has a positive basis). With multiplier `M`, settlement asset scale `c` and `rhe` the half-even rounding to `c` digits:
+
+| Figure | Rule |
+|---|---|
+| rounding | always half-even; `LedgerConfig::rounding` applies to spot only, so the ledger and `plan_liquidation` agree to the unit |
+| virtual notional of `n` at `p` | `N = rhe(p * n * M)`; never exchanged in cash |
+| open or increase | `basis += N` for a buy, `-N` for a sell; only the fee moves cash |
+| reduce `n <= abs(Q)` | `released = rhe(basis * n / abs(Q))`, the whole basis on a full close; realized `= +N - released` (sell) or `-N - released` (buy) |
+| cross zero `n > abs(Q)` | `C = rhe(p * abs(Q) * M)`, `O = N - C` exactly (no second rounding); realized `= +C - basis` (sell) or `-C - basis` (buy); new basis `-O` (sell) or `+O` (buy) |
+| cash | `+ realized - fee`, in the settlement asset |
+| market value at `mark` | `rhe(Q * M * mark)`; unrealized PnL `= market value - basis` |
+
+A crossing or a partial reduction can leave an open position with a zero basis (for example a crossing whose opening part rounds to zero); that is a valid state.
+
+`N`, `C` and `O` stay in wide integers: only the stored results (realized PnL, basis, cash, contracts) must fit a `Decimal`, so a fill whose virtual notional is out of range still books when they fit. `ExecutionCashflow::notional` is zero for a derivative (no principal is exchanged): the real cash is in `deltas`, and the virtual notional is in `ExecutionCashflow::derivative` (`None` there only when it is out of a `Decimal`'s range).
+
+- **Every execution is mandatory**: it is booked with `book_execution_allowing_overdraft`, never rejected for balance, and a shortfall is returned. `book_execution` and `book_execution_with_reservation` refuse a derivative with `InvalidInput` and no effect; a derivative fill consumes no reservation.
+- **Funding** of a perpetual: `book_funding(&FundingPayment { id, instrument, amount, as_of_ms })`. A positive amount is received, a negative one paid; the balance changes by `amount`, which joins `Ledger::funding` and counts once as realized PnL in valuation. A payment with a flat position is valid. Mandatory, with its shortfall.
+- **Expiry** of a future: `settle_expiry(&ExpirySettlement { id, instrument, price, as_of_ms })`, with `as_of_ms` at or after the expiry, closes the position at `price` with the closing rules and no fee. It is terminal: afterwards an execution on the instrument is `Expired`. The ledger has no clock, so a real fill executed before the expiry but delivered after the settlement is also `Expired` and needs manual resolution: book every fill before settling. A flat future settles with no cash.
+- **Ids**: executions, settlements, funding payments and expiry settlements share one id space. An identical repeat is a duplicate before any other check (including `Expired`); the same id with other content is `ConflictingEntry`.
+- **Reconciliation**: per asset, the real cash (transfers, execution deltas, settlements, funding, expiries); per derivative instrument, the contracts and the virtual identity `sum of signed virtual notionals (-N buy, +N sell) = realized_pnl - basis`, recomputed in wide integers from every fill.
+
+`valuation::value` and the stress scenarios do not value open derivative positions yet: they return `UnsupportedInstrument` rather than ignore them. The risk gate handles spot orders only and refuses a derivative with `UnsupportedInstrument` at every entry point.
+
+## Derivative settlements outside the ledger (M3-04, legacy)
+
+This path is kept for derivatives that are not registered in the ledger; registered futures and perpetuals use the rules above. It may be removed later. Futures and perpetual positions held outside the ledger are margined by `initial_margin`, `margin_reservations` and `liquidation`. When such a position is reduced, the cash it moves is booked with `book_settlement(&DerivativeSettlement { id, instrument, asset, realized_pnl, fee })`:
 
 - the asset's total balance changes by `realized_pnl - fee`, one exact difference;
 - the fee joins `fees_paid` and the realized PnL joins `settled_pnl`, so `Ledger::valuation`, `valuation::value` and its PnL attribution count it as realized PnL;
-- it is **idempotent by execution id**, and the id space is shared with spot executions: the same id booked again identically is a duplicate (`is_new == false`, nothing changes); the same id with other content, or already used by a spot execution, is `ConflictingEntry`;
-- the instrument must not be a registered spot instrument, and an id that has been settled cannot be registered later as one;
+- it is **idempotent by execution id**, and the id space is shared with executions, funding payments and expiry settlements: the same id booked again identically is a duplicate (`is_new == false`, nothing changes); the same id with other content, or already used elsewhere, is `ConflictingEntry`;
+- the instrument must not be registered in the ledger, and an id that has been settled cannot be registered later as one;
 - it is a **mandatory debit**: never rejected for lack of balance, deferred or reduced. A settlement that leaves the balance below its reservations, or negative, is booked in full and returns the `shortfall`; the debt stays visible in `overdrafts()` and in `reconcile()`.
 
 `reconcile()` adds every settlement delta to its asset's total, its fee to `fees_paid` and its realized PnL to `settled_pnl`, and checks `delta = realized_pnl - fee` for each one.
 
 ## Limits and non-goals
 
-- Only spot instruments are ledger positions. Derivatives post their cash as settlements (above); keeping perpetual and futures positions in the ledger (mark to market, basis) is follow up work for M3-INT.
+- Options are not ledger positions. Account valuation, stress, liquidation and margin reservations do not read derivative positions from the ledger yet.
 - The journal and the set of seen execution ids grow without bound for the life of a ledger. Pruning or checkpoints are future work.
 - Reservations are plain holds that a caller creates and releases. M1-05 builds order-level reservations on top: release on fill, reject and effective cancel, and exactly-once adjustment on a partial fill.

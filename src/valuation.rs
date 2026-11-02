@@ -413,6 +413,10 @@ fn floor_terms(terms: &[&[Decimal]], scale: u32, operation: &'static str) -> Res
 ///   is not registered in the snapshot.
 /// - [`MarginError::InvalidInput`] if the mark set prices the reporting
 ///   asset or the haircut is outside `[0, 1]`.
+/// - [`MarginError::UnsupportedInstrument`] if a linear future or perpetual
+///   position is open: its unrealized PnL needs instrument marks, which
+///   this function does not take yet. Flat derivative positions, their
+///   realized PnL and funding are valued.
 /// - [`MarginError::Arithmetic`] if a result cannot be represented.
 #[expect(
     clippy::too_many_lines,
@@ -424,6 +428,22 @@ pub fn value(
     policy: &ValuationPolicy,
 ) -> Result<AccountValuation> {
     let scale = validate(snapshot, marks, policy)?;
+    // An open derivative position is worth cash plus its unrealized PnL,
+    // which needs instrument marks this function does not take yet: refuse
+    // rather than value the account without it.
+    for (id, position) in &snapshot.positions {
+        let derivative = match snapshot.instruments.get(id) {
+            Some(Instrument::Spot(_)) | None => false,
+            Some(Instrument::LinearFuture(_) | Instrument::LinearPerpetual(_)) => true,
+        };
+        if derivative && !position.quantity.is_zero() {
+            return Err(MarginError::UnsupportedInstrument {
+                rule: "account-valuation".to_string(),
+                instrument: id.clone(),
+                reason: "an open derivative position needs instrument marks, not supported yet",
+            });
+        }
+    }
     let Pricing { prices, status } = pricing(snapshot, marks, policy);
     let rounding = policy.rounding;
     let price = |asset: &Asset| prices.get(asset).copied();
@@ -529,10 +549,24 @@ pub fn value(
     let mut realized_terms = Vec::new();
     let mut unrealized_terms = Vec::new();
     for (id, position) in &snapshot.positions {
-        let Some(Instrument::Spot(spot)) = snapshot.instruments.get(id) else {
-            return Err(MarginError::UnknownInstrument {
-                instrument: id.clone(),
-            });
+        let spot = match snapshot.instruments.get(id) {
+            Some(Instrument::Spot(spot)) => spot,
+            // Flat here (refused above when open): its realized PnL was paid
+            // in the settlement asset and its basis is zero.
+            Some(derivative @ (Instrument::LinearFuture(_) | Instrument::LinearPerpetual(_))) => {
+                if !position.realized_pnl.is_zero() {
+                    needed.insert(derivative.quote());
+                    if let Some(p) = price(derivative.quote()) {
+                        realized_terms.push(vec![position.realized_pnl, p]);
+                    }
+                }
+                continue;
+            }
+            None => {
+                return Err(MarginError::UnknownInstrument {
+                    instrument: id.clone(),
+                });
+            }
         };
         // Each term needs only the price it multiplies, and zero terms need
         // none: a closed position with realized PnL needs the quote only.
@@ -550,8 +584,9 @@ pub fn value(
             }
         }
     }
-    // Realized PnL of derivative settlements, paid in cash.
-    for (asset, settled) in &snapshot.settled_pnl {
+    // Realized PnL of derivative settlements and perpetual funding, paid in
+    // cash.
+    for (asset, settled) in snapshot.settled_pnl.iter().chain(&snapshot.funding) {
         if settled.is_zero() {
             continue;
         }

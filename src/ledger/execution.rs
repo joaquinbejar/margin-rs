@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use rust_decimal::Decimal;
 
 use crate::ids::{Asset, ExecutionId, InstrumentId};
+use crate::ledger::derivative::DerivativeFill;
 use crate::ledger::snapshot::PositionSnapshot;
 
 /// Direction of an execution from the ledger owner's point of view:
@@ -101,10 +102,12 @@ pub struct ExecutionCashflow {
     ///
     /// `None` when the exact product needs more than 28 fractional digits
     /// (for example price and quantity scales of 18 each); `notional` is
-    /// still the exact product rounded once.
+    /// still the exact product rounded once. `None` for a derivative.
     pub notional_exact: Option<Decimal>,
     /// Notional rounded to the quote asset scale; the amount of quote asset
-    /// actually exchanged.
+    /// actually exchanged. Zero for a derivative, which exchanges no
+    /// notional: its cash is in `deltas` and its virtual notional in
+    /// [`ExecutionCashflow::derivative`].
     pub notional: Decimal,
     /// `notional - notional_exact`, when `notional_exact` is known.
     pub rounding_residual: Option<Decimal>,
@@ -117,6 +120,8 @@ pub struct ExecutionCashflow {
     pub realized_pnl: Decimal,
     /// Position after the execution.
     pub position_after: PositionSnapshot,
+    /// Details of a linear future or perpetual fill; `None` for spot.
+    pub derivative: Option<DerivativeFill>,
 }
 
 /// Result of [`Ledger::book_execution`](crate::ledger::Ledger::book_execution).

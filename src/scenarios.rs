@@ -234,10 +234,20 @@ fn apply_hypothetical(
     fill: &HypotheticalFill,
     rounding: Rounding,
 ) -> Result<()> {
-    let Some(Instrument::Spot(spot)) = snapshot.instruments.get(&fill.instrument).cloned() else {
-        return Err(MarginError::UnknownInstrument {
-            instrument: fill.instrument.clone(),
-        });
+    let spot = match snapshot.instruments.get(&fill.instrument).cloned() {
+        Some(Instrument::Spot(spot)) => spot,
+        Some(Instrument::LinearFuture(_) | Instrument::LinearPerpetual(_)) => {
+            return Err(MarginError::UnsupportedInstrument {
+                rule: "stress".to_string(),
+                instrument: fill.instrument.clone(),
+                reason: "hypothetical derivative fills are not supported yet",
+            });
+        }
+        None => {
+            return Err(MarginError::UnknownInstrument {
+                instrument: fill.instrument.clone(),
+            });
+        }
     };
     // The same input rules as Ledger::book_execution.
     if fill.price <= Decimal::ZERO {

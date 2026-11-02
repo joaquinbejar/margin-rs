@@ -581,9 +581,17 @@ impl RiskGate {
         if let Some(reason) = self.halted() {
             reasons.push(RiskReason::Halted { reason });
         }
-        let Ok(spot) = self.spot(&request.instrument) else {
-            reasons.push(RiskReason::UnknownInstrument);
-            return RiskDecision::Rejected { reasons };
+        let spot = match self.spot(&request.instrument) {
+            Ok(spot) => spot,
+            // A registered derivative: named as such, not as unknown.
+            Err(error @ MarginError::UnsupportedInstrument { .. }) => {
+                reasons.push(RiskReason::InvalidOrder { error });
+                return RiskDecision::Rejected { reasons };
+            }
+            Err(_) => {
+                reasons.push(RiskReason::UnknownInstrument);
+                return RiskDecision::Rejected { reasons };
+            }
         };
         if let Err(error) = validate_order(request, &spot) {
             reasons.push(RiskReason::InvalidOrder { error });
@@ -893,6 +901,13 @@ impl RiskGate {
     fn spot(&self, instrument: &InstrumentId) -> Result<SpotInstrument> {
         match self.ledger.instrument(instrument) {
             Some(Instrument::Spot(spot)) => Ok(spot.clone()),
+            Some(Instrument::LinearFuture(_) | Instrument::LinearPerpetual(_)) => {
+                Err(MarginError::UnsupportedInstrument {
+                    rule: "risk-gate".to_string(),
+                    instrument: instrument.clone(),
+                    reason: "the risk gate handles spot orders; derivatives reserve margin with MarginReservationService",
+                })
+            }
             None => Err(MarginError::UnknownInstrument {
                 instrument: instrument.clone(),
             }),

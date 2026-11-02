@@ -105,7 +105,9 @@ pub use ids::{
     AccountId, Asset, ExecutionId, FactorId, InstrumentId, OrderId, ReservationId, TransferId,
     VenueId,
 };
-pub use instrument::{Instrument, SpotInstrument};
+pub use instrument::{
+    Instrument, LinearFuture, LinearPerpetual, LinearTerms, PositionKind, SpotInstrument,
+};
 pub use rust_decimal::Decimal;
 
 // Compiles and runs the Rust examples in README.md as doctests, so the README

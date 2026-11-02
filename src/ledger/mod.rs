@@ -62,6 +62,7 @@
 //! # }
 //! ```
 
+mod derivative;
 mod execution;
 mod settlement;
 mod snapshot;
@@ -71,6 +72,10 @@ use std::collections::BTreeMap;
 
 use rust_decimal::Decimal;
 
+pub use derivative::{
+    DerivativeFill, ExpiryCashflow, ExpirySettlement, FundingCashflow, FundingPayment,
+    PostingBooking,
+};
 pub use execution::{Action, Booking, Execution, ExecutionCashflow, Fee};
 pub use settlement::{DerivativeSettlement, SettlementBooking, SettlementCashflow};
 
@@ -78,12 +83,13 @@ pub use snapshot::{BalanceSnapshot, LedgerSnapshot, PositionSnapshot};
 pub use valuation::{AssetPnl, PositionValuation, Valuation};
 
 use crate::decimal::{
-    self, Rounding, add, check_configured_scale, check_scale, mul, mul_div_round, neg, sub,
+    self, Rounding, Wide, add, check_configured_scale, check_scale, decimal_to_wide, mul,
+    mul_div_round, neg, sub,
 };
 use crate::direction::Dir;
 use crate::error::{MarginError, Result};
 use crate::ids::{Asset, ExecutionId, InstrumentId, ReservationId, TransferId};
-use crate::instrument::Instrument;
+use crate::instrument::{Instrument, LinearTerms, PositionKind};
 
 /// Result of [`Ledger::book_execution_allowing_overdraft`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +198,12 @@ pub struct Ledger {
     settlements: BTreeMap<ExecutionId, (DerivativeSettlement, usize)>,
     settlement_journal: Vec<SettlementCashflow>,
     settled_pnl: BTreeMap<Asset, Decimal>,
+    fundings: BTreeMap<ExecutionId, (FundingPayment, usize)>,
+    funding_journal: Vec<FundingCashflow>,
+    funding: BTreeMap<Asset, Decimal>,
+    expiries: BTreeMap<ExecutionId, (ExpirySettlement, usize)>,
+    expiry_journal: Vec<ExpiryCashflow>,
+    settled_instruments: BTreeMap<InstrumentId, ExecutionId>,
 }
 
 impl Ledger {
@@ -235,7 +247,8 @@ impl Ledger {
                 self.balances.insert(asset.clone(), Balance::default());
                 self.net_transfers.insert(asset.clone(), Decimal::ZERO);
                 self.fees_paid.insert(asset.clone(), Decimal::ZERO);
-                self.settled_pnl.insert(asset, Decimal::ZERO);
+                self.settled_pnl.insert(asset.clone(), Decimal::ZERO);
+                self.funding.insert(asset, Decimal::ZERO);
                 Ok(())
             }
         }
@@ -243,12 +256,18 @@ impl Ledger {
 
     /// Registers an instrument. Its assets must be registered first.
     ///
-    /// Registering an identical instrument again is a no-op.
+    /// Registering an identical instrument again is a no-op. A linear future
+    /// or perpetual is held as signed contracts with a basis in its
+    /// settlement asset; every figure it books is rounded half-even to that
+    /// asset's scale, whatever [`LedgerConfig::rounding`] says (which
+    /// applies to spot only), so the ledger and
+    /// [`plan_liquidation`](crate::liquidation::plan_liquidation) agree to
+    /// the unit.
     ///
     /// # Errors
     ///
-    /// - [`MarginError::UnknownAsset`] if the base or quote asset is not
-    ///   registered.
+    /// - [`MarginError::UnknownAsset`] if the base, quote or settlement asset
+    ///   is not registered.
     /// - [`MarginError::InvalidInput`] if the quantity scale exceeds the base
     ///   asset scale.
     /// - [`MarginError::AlreadyRegistered`] if a different instrument uses the
@@ -265,6 +284,12 @@ impl Ledger {
                         "must not exceed the base asset scale",
                     ));
                 }
+            }
+            Instrument::LinearFuture(future) => {
+                self.asset_scale_or_err(future.terms().settlement())?;
+            }
+            Instrument::LinearPerpetual(perpetual) => {
+                self.asset_scale_or_err(perpetual.terms().settlement())?;
             }
         }
         let id = instrument.id().clone();
@@ -558,6 +583,9 @@ impl Ledger {
     ///   fractional digits than the instrument or asset allows.
     /// - [`MarginError::InsufficientBalance`]: an asset debited by the
     ///   execution would end with a negative available balance.
+    /// - [`MarginError::InvalidInput`]: the instrument is a linear future or
+    ///   perpetual. Their executions are mandatory and are booked with
+    ///   [`Ledger::book_execution_allowing_overdraft`].
     /// - [`MarginError::Arithmetic`]: overflow or a non exact intermediate.
     pub fn book_execution(&mut self, execution: &Execution) -> Result<Booking> {
         self.book(execution, None, false)
@@ -593,7 +621,9 @@ impl Ledger {
     }
 
     /// Books an execution that **already happened** at a venue, even if it
-    /// overdraws the account.
+    /// overdraws the account. It is the authoritative path for executions of
+    /// linear futures and perpetuals, which are always mandatory (see
+    /// "Derivative positions" in `docs/ledger.md`).
     ///
     /// Same rules as [`Ledger::book_execution_with_reservation`] (or
     /// [`Ledger::book_execution`] when `reservation` is `None`), except that
@@ -607,7 +637,18 @@ impl Ledger {
     /// # Errors
     ///
     /// Every error of [`Ledger::book_execution_with_reservation`] except
-    /// [`MarginError::InsufficientBalance`].
+    /// [`MarginError::InsufficientBalance`]. For a linear future or
+    /// perpetual, after the duplicate and conflict checks:
+    ///
+    /// - [`MarginError::InvalidInput`]: a reservation is given (a derivative
+    ///   fill consumes none).
+    /// - [`MarginError::Expired`]: the future was settled at expiry; a real
+    ///   fill delivered after the settlement needs manual resolution.
+    /// - [`MarginError::InvalidInput`] or [`MarginError::PrecisionExceeded`]:
+    ///   price, contracts or fee off their grids.
+    /// - [`MarginError::Arithmetic`]: a stored result (realized PnL, basis,
+    ///   cash or contracts) does not fit a `Decimal`. Intermediates such as
+    ///   the virtual notional never fail on their own.
     pub fn book_execution_allowing_overdraft(
         &mut self,
         execution: &Execution,
@@ -649,7 +690,7 @@ impl Ledger {
                 id: execution.id.to_string(),
             });
         }
-        if self.settlements.contains_key(&execution.id) {
+        if self.id_used_by_posting(&execution.id) {
             return Err(MarginError::ConflictingEntry {
                 kind: "execution",
                 id: execution.id.to_string(),
@@ -663,6 +704,14 @@ impl Ledger {
         })?;
         let spot = match instrument {
             Instrument::Spot(spot) => spot.clone(),
+            Instrument::LinearFuture(future) => {
+                let terms = future.terms().clone();
+                return self.book_derivative(execution, dir, &terms, reservation, allow_overdraft);
+            }
+            Instrument::LinearPerpetual(perpetual) => {
+                let terms = perpetual.terms().clone();
+                return self.book_derivative(execution, dir, &terms, reservation, allow_overdraft);
+            }
         };
 
         if execution.price <= Decimal::ZERO {
@@ -832,7 +881,163 @@ impl Ledger {
             fee: execution.fee.clone(),
             deltas,
             realized_pnl,
-            position_after: position_snapshot(&execution.instrument, spot.quote(), new_position),
+            position_after: position_snapshot(
+                &execution.instrument,
+                spot.quote(),
+                PositionKind::Spot,
+                Decimal::ONE,
+                new_position,
+            ),
+            derivative: None,
+        };
+        self.journal.push(cashflow.clone());
+        self.executions
+            .insert(execution.id.clone(), (execution.clone(), index));
+        Ok((Booking::Booked(cashflow), shortfalls))
+    }
+
+    /// True if `id` is already used by a settlement, a funding payment or an
+    /// expiry settlement (the namespace shared with executions).
+    fn id_used_by_posting(&self, id: &ExecutionId) -> bool {
+        self.settlements.contains_key(id)
+            || self.fundings.contains_key(id)
+            || self.expiries.contains_key(id)
+    }
+
+    /// Books an execution of a linear future or perpetual (see the
+    /// `derivative` module): mandatory, so a debit beyond the available
+    /// balance is booked and reported as a shortfall.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one validate-then-commit sequence, as for spot: every check runs before any balance changes"
+    )]
+    fn book_derivative(
+        &mut self,
+        execution: &Execution,
+        dir: Dir,
+        terms: &LinearTerms,
+        reservation: Option<(&ReservationId, Decimal)>,
+        allow_overdraft: bool,
+    ) -> Result<(Booking, BTreeMap<Asset, Decimal>)> {
+        if !allow_overdraft {
+            return Err(MarginError::invalid_input(
+                "execution",
+                "a derivative execution is mandatory: book it with book_execution_allowing_overdraft",
+            ));
+        }
+        if reservation.is_some() {
+            return Err(MarginError::invalid_input(
+                "reservation",
+                "a derivative execution does not consume a reservation",
+            ));
+        }
+        if self.settled_instruments.contains_key(&execution.instrument) {
+            return Err(MarginError::Expired {
+                instrument: execution.instrument.clone(),
+            });
+        }
+        if execution.price <= Decimal::ZERO {
+            return Err(MarginError::invalid_input("price", "must be positive"));
+        }
+        if execution.quantity <= Decimal::ZERO {
+            return Err(MarginError::invalid_input("quantity", "must be positive"));
+        }
+        check_scale(execution.price, terms.price_scale(), "price")?;
+        check_scale(execution.quantity, terms.contract_scale(), "quantity")?;
+        if let Some(fee) = &execution.fee {
+            let fee_scale = self.asset_scale_or_err(&fee.asset)?;
+            check_scale(fee.amount, fee_scale, "fee")?;
+        }
+        let settlement = terms.settlement();
+        let scale = self.asset_scale_or_err(settlement)?;
+        let position = self
+            .positions
+            .get(&execution.instrument)
+            .copied()
+            .unwrap_or_default();
+        let effect = derivative::apply_derivative_fill(
+            position,
+            dir,
+            execution.price,
+            execution.quantity,
+            terms.multiplier(),
+            scale,
+        )?;
+
+        // Only the realized PnL and the fee move cash.
+        let mut changes: BTreeMap<Asset, Vec<Decimal>> = BTreeMap::new();
+        changes
+            .entry(settlement.clone())
+            .or_default()
+            .push(effect.realized);
+        if let Some(fee) = &execution.fee {
+            changes
+                .entry(fee.asset.clone())
+                .or_default()
+                .push(neg(fee.amount));
+        }
+        let mut deltas: BTreeMap<Asset, Decimal> = BTreeMap::new();
+        for (asset, values) in changes {
+            deltas.insert(asset, decimal::sum(&values, "delta accumulation")?);
+        }
+        let mut new_balances = Vec::with_capacity(deltas.len());
+        let mut shortfalls = BTreeMap::new();
+        for (asset, delta) in &deltas {
+            let balance = self.balance_of(asset)?;
+            let total = add(balance.total, *delta, "balance + delta")?;
+            let available_after = sub(total, balance.reserved, "total - reserved")?;
+            if *delta < Decimal::ZERO && available_after < Decimal::ZERO {
+                shortfalls.insert(asset.clone(), neg(available_after));
+            }
+            new_balances.push((asset.clone(), Balance::new(total, balance.reserved)?));
+        }
+        let new_fee_total = match &execution.fee {
+            Some(fee) => {
+                let paid = self.fees_paid.get(&fee.asset).copied().unwrap_or_default();
+                Some((fee.asset.clone(), add(paid, fee.amount, "fees_paid + fee")?))
+            }
+            None => None,
+        };
+        let instrument = self
+            .instruments
+            .get(&execution.instrument)
+            .cloned()
+            .ok_or_else(|| MarginError::UnknownInstrument {
+                instrument: execution.instrument.clone(),
+            })?;
+
+        // Commit: nothing below can fail.
+        for (asset, balance) in new_balances {
+            self.balances.insert(asset, balance);
+        }
+        self.positions
+            .insert(execution.instrument.clone(), effect.position);
+        if let Some((asset, total)) = new_fee_total {
+            self.fees_paid.insert(asset, total);
+        }
+        let index = self.journal.len();
+        let cashflow = ExecutionCashflow {
+            execution_id: execution.id.clone(),
+            sequence: index as u64,
+            instrument: execution.instrument.clone(),
+            side: execution.side,
+            price: execution.price,
+            quantity: execution.quantity,
+            // A derivative exchanges no notional: its cash is in `deltas`.
+            notional_exact: None,
+            notional: Decimal::ZERO,
+            rounding_residual: None,
+            fee: execution.fee.clone(),
+            deltas,
+            realized_pnl: effect.realized,
+            position_after: position_snapshot(
+                &execution.instrument,
+                instrument.quote(),
+                instrument.kind(),
+                instrument.multiplier(),
+                effect.position,
+            ),
+            derivative: Some(effect.fill),
         };
         self.journal.push(cashflow.clone());
         self.executions
@@ -885,7 +1090,10 @@ impl Ledger {
                 id: settlement.id.to_string(),
             });
         }
-        if self.executions.contains_key(&settlement.id) {
+        if self.executions.contains_key(&settlement.id)
+            || self.fundings.contains_key(&settlement.id)
+            || self.expiries.contains_key(&settlement.id)
+        {
             return Err(MarginError::ConflictingEntry {
                 kind: "settlement",
                 id: settlement.id.to_string(),
@@ -959,6 +1167,296 @@ impl Ledger {
         self.settled_pnl.get(asset).copied().unwrap_or_default()
     }
 
+    // ----- derivative postings ------------------------------------------
+
+    /// Books a funding payment of a linear perpetual.
+    ///
+    /// The settlement asset's total balance changes by `amount` (positive is
+    /// received, negative is paid), and the amount joins
+    /// [`Ledger::funding`], which valuation counts once as realized PnL. A
+    /// payment with a flat position is valid (funding of a period already
+    /// accrued) and creates no position. It is mandatory: it is booked even
+    /// when it leaves the balance below its reservations or negative, and
+    /// the result reports that shortfall. Booking the identical payment
+    /// again changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// The ledger is unchanged on any error. Checked in this order:
+    ///
+    /// - [`MarginError::ConflictingEntry`]: the id was booked with different
+    ///   content, or as an execution, settlement or expiry (an identical
+    ///   payment is a duplicate before any other check).
+    /// - [`MarginError::UnknownInstrument`]: the instrument is not
+    ///   registered.
+    /// - [`MarginError::InvalidInput`]: the instrument is not a perpetual, or
+    ///   the amount is zero.
+    /// - [`MarginError::PrecisionExceeded`]: the amount is finer than the
+    ///   settlement asset scale.
+    /// - [`MarginError::Arithmetic`]: an amount overflows.
+    pub fn book_funding(
+        &mut self,
+        payment: &FundingPayment,
+    ) -> Result<PostingBooking<FundingCashflow>> {
+        if let Some((previous, index)) = self.fundings.get(&payment.id) {
+            if previous == payment {
+                return Ok(PostingBooking {
+                    cashflow: self
+                        .funding_journal
+                        .get(*index)
+                        .cloned()
+                        .ok_or(MarginError::arithmetic("funding journal index"))?,
+                    is_new: false,
+                    shortfall: None,
+                });
+            }
+            return Err(MarginError::ConflictingEntry {
+                kind: "funding",
+                id: payment.id.to_string(),
+            });
+        }
+        if self.executions.contains_key(&payment.id)
+            || self.settlements.contains_key(&payment.id)
+            || self.expiries.contains_key(&payment.id)
+        {
+            return Err(MarginError::ConflictingEntry {
+                kind: "funding",
+                id: payment.id.to_string(),
+            });
+        }
+        let asset = match self.instruments.get(&payment.instrument) {
+            Some(Instrument::LinearPerpetual(perpetual)) => perpetual.terms().settlement().clone(),
+            Some(Instrument::Spot(_) | Instrument::LinearFuture(_)) => {
+                return Err(MarginError::invalid_input(
+                    "instrument",
+                    "funding is paid on a linear perpetual",
+                ));
+            }
+            None => {
+                return Err(MarginError::UnknownInstrument {
+                    instrument: payment.instrument.clone(),
+                });
+            }
+        };
+        if payment.amount.is_zero() {
+            return Err(MarginError::invalid_input("amount", "must not be zero"));
+        }
+        let scale = self.asset_scale_or_err(&asset)?;
+        check_scale(payment.amount, scale, "amount")?;
+        let balance = self.balance_of(&asset)?;
+        let total = add(balance.total, payment.amount, "balance + funding")?;
+        let available_after = sub(total, balance.reserved, "total - reserved")?;
+        let shortfall = (payment.amount < Decimal::ZERO && available_after < Decimal::ZERO)
+            .then_some(neg(available_after));
+        let funding = add(self.funding(&asset), payment.amount, "funding + amount")?;
+
+        // Commit: nothing below can fail.
+        self.balances
+            .insert(asset.clone(), Balance::new(total, balance.reserved)?);
+        self.funding.insert(asset.clone(), funding);
+        let index = self.funding_journal.len();
+        let cashflow = FundingCashflow {
+            id: payment.id.clone(),
+            sequence: index as u64,
+            instrument: payment.instrument.clone(),
+            asset,
+            amount: payment.amount,
+            balance_after: total,
+        };
+        self.funding_journal.push(cashflow.clone());
+        self.fundings
+            .insert(payment.id.clone(), (payment.clone(), index));
+        Ok(PostingBooking {
+            cashflow,
+            is_new: true,
+            shortfall,
+        })
+    }
+
+    /// Settles a linear future at expiry: closes its whole position at
+    /// `price`, with the closing rules of an execution and no fee, and marks
+    /// the instrument as settled.
+    ///
+    /// Settlement is terminal. Afterwards no execution or funding can be
+    /// booked on the instrument ([`MarginError::Expired`]), except that an
+    /// identical historical execution is still a duplicate. The ledger has
+    /// no clock: a real fill executed before the expiry but delivered after
+    /// this settlement is rejected with `Expired` and needs manual
+    /// resolution, so book every fill before settling. A flat position is
+    /// settled with no cash. The cash is mandatory, as for an execution.
+    ///
+    /// # Errors
+    ///
+    /// The ledger is unchanged on any error. Checked in this order:
+    ///
+    /// - [`MarginError::ConflictingEntry`]: the id was booked with different
+    ///   content, or as an execution, settlement or funding payment, or the
+    ///   instrument was already settled under another id (an identical
+    ///   settlement is a duplicate before any other check).
+    /// - [`MarginError::UnknownInstrument`]: the instrument is not
+    ///   registered.
+    /// - [`MarginError::InvalidInput`]: the instrument is not a future,
+    ///   `as_of_ms` is before its expiry, or the price is not positive.
+    /// - [`MarginError::PrecisionExceeded`]: the price is finer than the
+    ///   instrument's price scale.
+    /// - [`MarginError::Arithmetic`]: an amount overflows.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one validate-then-commit sequence: the idempotency and terminal checks, then the close, then the commit"
+    )]
+    pub fn settle_expiry(
+        &mut self,
+        settlement: &ExpirySettlement,
+    ) -> Result<PostingBooking<ExpiryCashflow>> {
+        if let Some((previous, index)) = self.expiries.get(&settlement.id) {
+            if previous == settlement {
+                return Ok(PostingBooking {
+                    cashflow: self
+                        .expiry_journal
+                        .get(*index)
+                        .cloned()
+                        .ok_or(MarginError::arithmetic("expiry journal index"))?,
+                    is_new: false,
+                    shortfall: None,
+                });
+            }
+            return Err(MarginError::ConflictingEntry {
+                kind: "expiry",
+                id: settlement.id.to_string(),
+            });
+        }
+        if self.executions.contains_key(&settlement.id)
+            || self.settlements.contains_key(&settlement.id)
+            || self.fundings.contains_key(&settlement.id)
+            || self
+                .settled_instruments
+                .contains_key(&settlement.instrument)
+        {
+            return Err(MarginError::ConflictingEntry {
+                kind: "expiry",
+                id: settlement.id.to_string(),
+            });
+        }
+        let future = match self.instruments.get(&settlement.instrument) {
+            Some(Instrument::LinearFuture(future)) => future.clone(),
+            Some(Instrument::Spot(_) | Instrument::LinearPerpetual(_)) => {
+                return Err(MarginError::invalid_input(
+                    "instrument",
+                    "only a linear future expires",
+                ));
+            }
+            None => {
+                return Err(MarginError::UnknownInstrument {
+                    instrument: settlement.instrument.clone(),
+                });
+            }
+        };
+        if settlement.as_of_ms < future.expiry_ms() {
+            return Err(MarginError::invalid_input(
+                "as_of_ms",
+                "a future is settled at or after its expiry",
+            ));
+        }
+        if settlement.price <= Decimal::ZERO {
+            return Err(MarginError::invalid_input("price", "must be positive"));
+        }
+        let terms = future.terms();
+        check_scale(settlement.price, terms.price_scale(), "price")?;
+        let asset = terms.settlement().clone();
+        let scale = self.asset_scale_or_err(&asset)?;
+        let position = self
+            .positions
+            .get(&settlement.instrument)
+            .copied()
+            .unwrap_or_default();
+        let contracts = position.quantity;
+        let (new_position, realized, fill) = if contracts.is_zero() {
+            (
+                position,
+                Decimal::ZERO,
+                DerivativeFill {
+                    multiplier: terms.multiplier(),
+                    virtual_notional: Some(Decimal::ZERO),
+                    closing_notional: None,
+                    released_basis: Decimal::ZERO,
+                },
+            )
+        } else {
+            let dir = if contracts > Decimal::ZERO {
+                Dir::Sell
+            } else {
+                Dir::Buy
+            };
+            let effect = derivative::apply_derivative_fill(
+                position,
+                dir,
+                settlement.price,
+                contracts.abs(),
+                terms.multiplier(),
+                scale,
+            )?;
+            (effect.position, effect.realized, effect.fill)
+        };
+        let balance = self.balance_of(&asset)?;
+        let total = add(balance.total, realized, "balance + realized")?;
+        let available_after = sub(total, balance.reserved, "total - reserved")?;
+        let shortfall = (realized < Decimal::ZERO && available_after < Decimal::ZERO)
+            .then_some(neg(available_after));
+
+        // Commit: nothing below can fail.
+        self.balances
+            .insert(asset.clone(), Balance::new(total, balance.reserved)?);
+        self.positions
+            .insert(settlement.instrument.clone(), new_position);
+        self.settled_instruments
+            .insert(settlement.instrument.clone(), settlement.id.clone());
+        let index = self.expiry_journal.len();
+        let cashflow = ExpiryCashflow {
+            id: settlement.id.clone(),
+            sequence: index as u64,
+            instrument: settlement.instrument.clone(),
+            asset,
+            price: settlement.price,
+            contracts,
+            realized_pnl: realized,
+            derivative: fill,
+            balance_after: total,
+        };
+        self.expiry_journal.push(cashflow.clone());
+        self.expiries
+            .insert(settlement.id.clone(), (settlement.clone(), index));
+        Ok(PostingBooking {
+            cashflow,
+            is_new: true,
+            shortfall,
+        })
+    }
+
+    /// Booked funding payments in booking order.
+    #[must_use]
+    pub fn funding_journal(&self) -> &[FundingCashflow] {
+        &self.funding_journal
+    }
+
+    /// Booked expiry settlements in booking order.
+    #[must_use]
+    pub fn expiry_journal(&self) -> &[ExpiryCashflow] {
+        &self.expiry_journal
+    }
+
+    /// Net funding received in `asset` (negative when paid; zero if none or
+    /// unregistered). Valuation counts it once as realized PnL.
+    #[must_use]
+    pub fn funding(&self, asset: &Asset) -> Decimal {
+        self.funding.get(asset).copied().unwrap_or_default()
+    }
+
+    /// True once a future was settled at expiry.
+    #[must_use]
+    pub fn is_settled(&self, instrument: &InstrumentId) -> bool {
+        self.settled_instruments.contains_key(instrument)
+    }
+
     // ----- reads --------------------------------------------------------
 
     /// Balance of a registered asset.
@@ -977,8 +1475,14 @@ impl Ledger {
     #[must_use]
     pub fn position(&self, instrument: &InstrumentId) -> Option<PositionSnapshot> {
         let position = self.positions.get(instrument)?;
-        let quote = self.instruments.get(instrument)?.quote();
-        Some(position_snapshot(instrument, quote, *position))
+        let registered = self.instruments.get(instrument)?;
+        Some(position_snapshot(
+            instrument,
+            registered.quote(),
+            registered.kind(),
+            registered.multiplier(),
+            *position,
+        ))
     }
 
     /// Cumulative fees paid in `asset` (zero if none or unregistered).
@@ -1025,9 +1529,11 @@ impl Ledger {
                 .collect(),
             fees_paid: self.fees_paid.clone(),
             settled_pnl: self.settled_pnl.clone(),
+            funding: self.funding.clone(),
             reservations: self.reservations.clone(),
             executions_booked: self.journal.len() as u64,
             settlements_booked: self.settlement_journal.len() as u64,
+            settled_instruments: self.settled_instruments.keys().cloned().collect(),
         }
     }
 
@@ -1062,13 +1568,13 @@ impl Ledger {
         let mut positions = BTreeMap::new();
         let mut asset_terms: BTreeMap<Asset, (Vec<Decimal>, Vec<Decimal>)> = BTreeMap::new();
         for (id, position) in &self.positions {
-            let quote = self
-                .instruments
-                .get(id)
-                .map(Instrument::quote)
-                .ok_or_else(|| MarginError::UnknownInstrument {
-                    instrument: id.clone(),
-                })?;
+            let registered =
+                self.instruments
+                    .get(id)
+                    .ok_or_else(|| MarginError::UnknownInstrument {
+                        instrument: id.clone(),
+                    })?;
+            let quote = registered.quote();
             let quote_scale = self.asset_scale_or_err(quote)?;
             let (mark, market_value) = if position.quantity.is_zero() {
                 (None, Decimal::ZERO)
@@ -1080,13 +1586,24 @@ impl Ledger {
                     return Err(MarginError::invalid_input("mark", "must be positive"));
                 }
                 check_scale(mark, decimal::MAX_SCALE, "mark")?;
-                let value = mul_div_round(
-                    &[position.quantity, mark],
-                    &[],
-                    quote_scale,
-                    rounding,
-                    "quantity * mark",
-                )?;
+                let value = match registered {
+                    Instrument::Spot(_) => mul_div_round(
+                        &[position.quantity, mark],
+                        &[],
+                        quote_scale,
+                        rounding,
+                        "quantity * mark",
+                    )?,
+                    // Always half-even for derivatives: rhe(Q * M * mark).
+                    Instrument::LinearFuture(_) | Instrument::LinearPerpetual(_) => {
+                        derivative::market_value(
+                            position.quantity,
+                            registered.multiplier(),
+                            mark,
+                            quote_scale,
+                        )?
+                    }
+                };
                 (Some(mark), value)
             };
             let unrealized_pnl = sub(market_value, position.cost_basis, "market_value - cost")?;
@@ -1106,14 +1623,15 @@ impl Ledger {
                 },
             );
         }
-        // Per asset sums and net PnL, each one exact wide sum.
-        for (asset, settled) in &self.settled_pnl {
-            if !settled.is_zero() {
+        // Per asset sums and net PnL, each one exact wide sum. Settlements
+        // and funding are realized PnL already in cash, counted once.
+        for (asset, realized) in self.settled_pnl.iter().chain(&self.funding) {
+            if !realized.is_zero() {
                 asset_terms
                     .entry(asset.clone())
                     .or_default()
                     .0
-                    .push(*settled);
+                    .push(*realized);
             }
         }
         for (asset, line) in &mut by_asset {
@@ -1154,10 +1672,15 @@ impl Ledger {
     /// Checks, per asset, that the total balance equals deposits minus
     /// withdrawals plus the sum of execution deltas, that the reserved
     /// balance equals the open reservations and is covered by the total, and
-    /// that the fees paid equal the sum of execution fees. Per instrument, it
-    /// checks that the position quantity equals the net traded quantity and
-    /// that the quote cash exchanged by trades equals
-    /// `realized_pnl - cost_basis` (cost is conserved exactly).
+    /// that the fees paid equal the sum of execution fees. Settlements,
+    /// funding payments and expiry settlements join the asset totals, and
+    /// the net funding is checked per asset. Per instrument, it checks that
+    /// the position quantity equals the net traded quantity and that the
+    /// quote cash exchanged by trades equals `realized_pnl - cost_basis`
+    /// (cost is conserved exactly). For a linear future or perpetual the
+    /// same identity holds with the signed virtual notionals (`-N` for a
+    /// buy, `+N` for a sell, the expiry close included), recomputed from
+    /// every fill and compared in wide integers.
     ///
     /// An overdraft (a balance below its reservations, after booking a real
     /// execution with [`Ledger::book_execution_allowing_overdraft`]) is not
@@ -1215,6 +1738,21 @@ impl Ledger {
         for (asset, amount) in self.reservations.values() {
             reserved_terms.entry(asset).or_default().push(*amount);
         }
+        let mut funding_terms: BTreeMap<&Asset, Vec<Decimal>> = BTreeMap::new();
+        for payment in &self.funding_journal {
+            totals
+                .entry(&payment.asset)
+                .or_default()
+                .push(payment.amount);
+            funding_terms
+                .entry(&payment.asset)
+                .or_default()
+                .push(payment.amount);
+        }
+        // Derivatives: the virtual notionals are recomputed in wide integers
+        // from each fill, since their sum may not fit a Decimal even when the
+        // stored realized PnL and basis do.
+        let mut virtual_cash: BTreeMap<&InstrumentId, Wide> = BTreeMap::new();
         for cashflow in &self.journal {
             for (asset, delta) in &cashflow.deltas {
                 totals.entry(asset).or_default().push(*delta);
@@ -1222,18 +1760,63 @@ impl Ledger {
             if let Some(fee) = &cashflow.fee {
                 fee_terms.entry(&fee.asset).or_default().push(fee.amount);
             }
-            let (quantity, cash) = match Dir::from_action(cashflow.side, "cashflow side")? {
-                Dir::Buy => (cashflow.quantity, neg(cashflow.notional)),
-                Dir::Sell => (neg(cashflow.quantity), cashflow.notional),
+            let dir = Dir::from_action(cashflow.side, "cashflow side")?;
+            let quantity = match dir {
+                Dir::Buy => cashflow.quantity,
+                Dir::Sell => neg(cashflow.quantity),
             };
             quantity_terms
                 .entry(&cashflow.instrument)
                 .or_default()
                 .push(quantity);
-            cash_terms
-                .entry(&cashflow.instrument)
+            if let Some(fill) = &cashflow.derivative {
+                let scale = self.asset_scale_or_err(&cashflow.position_after.quote)?;
+                let term = derivative::signed_virtual_cash(
+                    dir,
+                    cashflow.price,
+                    cashflow.quantity,
+                    fill.multiplier,
+                    scale,
+                )?;
+                add_virtual(&mut virtual_cash, &cashflow.instrument, term)?;
+            } else {
+                let cash = match dir {
+                    Dir::Buy => neg(cashflow.notional),
+                    Dir::Sell => cashflow.notional,
+                };
+                cash_terms
+                    .entry(&cashflow.instrument)
+                    .or_default()
+                    .push(cash);
+            }
+        }
+        for expiry in &self.expiry_journal {
+            totals
+                .entry(&expiry.asset)
                 .or_default()
-                .push(cash);
+                .push(expiry.realized_pnl);
+            if !expiry.contracts.is_zero() {
+                // The settlement closes the contracts: a sell of a long, a
+                // buy of a short.
+                let dir = if expiry.contracts > Decimal::ZERO {
+                    Dir::Sell
+                } else {
+                    Dir::Buy
+                };
+                quantity_terms
+                    .entry(&expiry.instrument)
+                    .or_default()
+                    .push(neg(expiry.contracts));
+                let scale = self.asset_scale_or_err(&expiry.asset)?;
+                let term = derivative::signed_virtual_cash(
+                    dir,
+                    expiry.price,
+                    expiry.contracts.abs(),
+                    expiry.derivative.multiplier,
+                    scale,
+                )?;
+                add_virtual(&mut virtual_cash, &expiry.instrument, term)?;
+            }
         }
         let total_of = |terms: Option<&Vec<Decimal>>, op| match terms {
             Some(values) => decimal::sum(values, op),
@@ -1271,6 +1854,8 @@ impl Ledger {
                 expected,
                 self.settled_pnl(asset),
             )?;
+            let expected = total_of(funding_terms.get(asset), "reconcile funding")?;
+            mismatch("funding", asset.as_str(), expected, self.funding(asset))?;
         }
         for (id, position) in &self.positions {
             let expected = total_of(quantity_terms.get(id), "reconcile quantity")?;
@@ -1280,6 +1865,31 @@ impl Ledger {
                 expected,
                 position.quantity,
             )?;
+            let derivative_scale = match self.instruments.get(id) {
+                Some(Instrument::Spot(_)) | None => None,
+                Some(
+                    registered @ (Instrument::LinearFuture(_) | Instrument::LinearPerpetual(_)),
+                ) => Some(self.asset_scale_or_err(registered.quote())?),
+            };
+            if let Some(scale) = derivative_scale {
+                // Virtual identity, in wide integers: sum of the signed
+                // virtual notionals == realized - basis.
+                let expected = virtual_cash.get(id).copied().unwrap_or(Wide::ZERO);
+                let actual = derivative::add_wide(
+                    decimal_to_wide(position.realized_pnl, scale, "realized pnl")?,
+                    decimal_to_wide(position.cost_basis, scale, "basis")?.negated(),
+                    "realized - basis",
+                )?;
+                if expected != actual {
+                    return Err(MarginError::ReconciliationMismatch {
+                        check: "virtual notional = realized - basis",
+                        key: id.to_string(),
+                        expected: expected.to_decimal(scale).unwrap_or(Decimal::MAX),
+                        actual: actual.to_decimal(scale).unwrap_or(Decimal::MAX),
+                    });
+                }
+                continue;
+            }
             let expected = total_of(cash_terms.get(id), "reconcile trade cash")?;
             let actual = sub(
                 position.realized_pnl,
@@ -1299,6 +1909,16 @@ impl Ledger {
     }
 }
 
+fn add_virtual<'a>(
+    sums: &mut BTreeMap<&'a InstrumentId, Wide>,
+    instrument: &'a InstrumentId,
+    term: Wide,
+) -> Result<()> {
+    let sum = sums.entry(instrument).or_insert(Wide::ZERO);
+    *sum = derivative::add_wide(*sum, term, "virtual notional sum")?;
+    Ok(())
+}
+
 fn mismatch(check: &'static str, key: &str, expected: Decimal, actual: Decimal) -> Result<()> {
     if expected == actual {
         Ok(())
@@ -1315,11 +1935,15 @@ fn mismatch(check: &'static str, key: &str, expected: Decimal, actual: Decimal) 
 fn position_snapshot(
     instrument: &InstrumentId,
     quote: &Asset,
+    kind: PositionKind,
+    multiplier: Decimal,
     position: Position,
 ) -> PositionSnapshot {
     PositionSnapshot {
         instrument: instrument.clone(),
         quote: quote.clone(),
+        kind,
+        multiplier,
         quantity: position.quantity,
         cost_basis: position.cost_basis,
         realized_pnl: position.realized_pnl,

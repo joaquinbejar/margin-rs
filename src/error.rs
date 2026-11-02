@@ -137,6 +137,17 @@ pub enum MarginError {
         reason: &'static str,
     },
 
+    /// The instrument has expired and was settled
+    /// ([`Ledger::settle_expiry`](crate::ledger::Ledger::settle_expiry)): no
+    /// further execution or funding can be booked on it. A real fill
+    /// delivered after the settlement needs manual resolution; it is never
+    /// ignored.
+    #[error("instrument {instrument} has expired and was settled")]
+    Expired {
+        /// Instrument identifier.
+        instrument: InstrumentId,
+    },
+
     /// The margin rule does not cover this instrument.
     #[error("rule {rule} does not support {instrument}: {reason}")]
     UnsupportedInstrument {

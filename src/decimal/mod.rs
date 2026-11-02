@@ -25,7 +25,8 @@ mod wide;
 use rust_decimal::Decimal;
 
 use crate::error::{MarginError, Result};
-use wide::{U768, Wide};
+use wide::U768;
+pub(crate) use wide::Wide;
 
 /// Largest scale (digits after the decimal point) accepted for an asset,
 /// a price or a quantity.
@@ -287,6 +288,41 @@ fn wide_product(values: &[Decimal]) -> Option<(Wide, u32)> {
     Some((product, scale))
 }
 
+/// `product(numerators) / product(denominators)` rounded once to `scale`
+/// digits, kept as a wide integer count of `10^-scale` units: unlike
+/// [`mul_div_round`], the rounded value need not fit a [`Decimal`], so it
+/// can be combined with others before only the stored results are
+/// converted ([`wide_to_decimal`]).
+pub(crate) fn mul_div_round_wide(
+    numerators: &[Decimal],
+    denominators: &[Decimal],
+    scale: u32,
+    rounding: Rounding,
+    operation: &'static str,
+) -> Result<Wide> {
+    let error = || MarginError::arithmetic(operation);
+    let (numerator, numerator_scale) = wide_product(numerators).ok_or_else(error)?;
+    let (denominator, denominator_scale) = wide_product(denominators).ok_or_else(error)?;
+    let numerator = numerator.scale_up(denominator_scale).ok_or_else(error)?;
+    let denominator = denominator.scale_up(numerator_scale).ok_or_else(error)?;
+    round_ratio_wide(numerator, denominator, scale, rounding).ok_or_else(error)
+}
+
+/// `value` as a wide integer count of `10^-scale` units. Fails if `value`
+/// has more than `scale` fractional digits.
+pub(crate) fn decimal_to_wide(value: Decimal, scale: u32, operation: &'static str) -> Result<Wide> {
+    let (wide, value_scale) = Wide::from_decimal(value);
+    wide.align(value_scale, scale)
+        .ok_or(MarginError::arithmetic(operation))
+}
+
+/// The decimal `value * 10^-scale`. Fails if it cannot be represented.
+pub(crate) fn wide_to_decimal(value: Wide, scale: u32, operation: &'static str) -> Result<Decimal> {
+    value
+        .to_decimal(scale)
+        .ok_or(MarginError::arithmetic(operation))
+}
+
 /// The decimal nearest to `numerator / denominator` at `scale` digits under
 /// `rounding`, from the exact quotient and remainder.
 fn round_ratio(
@@ -295,6 +331,16 @@ fn round_ratio(
     scale: u32,
     rounding: Rounding,
 ) -> Option<Decimal> {
+    round_ratio_wide(numerator, denominator, scale, rounding)?.to_decimal(scale)
+}
+
+/// [`round_ratio`] as a wide integer count of `10^-scale` units.
+fn round_ratio_wide(
+    numerator: Wide,
+    denominator: Wide,
+    scale: u32,
+    rounding: Rounding,
+) -> Option<Wide> {
     let scaled = numerator.magnitude.checked_mul(U768::pow10(scale)?)?;
     let (quotient, remainder) = scaled.div_rem(denominator.magnitude)?;
     let quotient = if remainder.is_zero() {
@@ -317,7 +363,10 @@ fn round_ratio(
             quotient
         }
     };
-    Wide::new(numerator.negative != denominator.negative, quotient).to_decimal(scale)
+    Some(Wide::new(
+        numerator.negative != denominator.negative,
+        quotient,
+    ))
 }
 
 /// Number of significant fractional digits of `value` (trailing zeros do
