@@ -1,6 +1,6 @@
-# Pretrade risk gate (M1-05)
+# Pretrade risk gate
 
-`margin_rs::risk::RiskGate` stands between every order source (quotes, hedges, policy proposals) and the venue. It owns the `Ledger` from M1-04, so reservations live in the same accounting authority as cash and positions.
+`margin_rs::risk::RiskGate` stands between every order source (quotes, hedges, policy proposals) and the venue. It owns the `Ledger`, so reservations live in the same accounting authority as cash and positions.
 
 ## Mandatory path
 
@@ -12,7 +12,7 @@
   - `on_fill`;
   - `trip`, `resume`;
   - `deposit`, `withdraw`;
-  - `book_derivative_execution`, `book_funding`, `settle_expiry`: postings of linear futures and perpetuals, which are mandatory and do not go through orders (a spot execution is refused by `book_derivative_execution`).
+  - `book_derivative_execution`, `book_funding`, `settle_expiry`: postings of futures and perpetuals (linear or inverse), which are mandatory and do not go through orders (a spot execution is refused by `book_derivative_execution`).
 - Every order is decided again on every submission. A policy that keeps proposing an invalid order gets it rejected every time.
 - An order id is recorded together with its decision, including when the decision is a rejection. A repeated id is rejected with `DuplicateOrderId` and never reserves twice.
 
@@ -129,7 +129,7 @@ A repeated report (same execution id and content) returns a `Duplicate` booking 
 
 ## Mapping from market-maker-rs (contract for the adapter)
 
-The market-maker-rs integration is a separate PR in market-maker-rs (M1-05-INT). The table below is the contract that PR implements.
+The market-maker-rs integration belongs to market-maker-rs, which uses margin-rs optionally through its `margin` feature. The table below is the contract it implements.
 
 | market-maker-rs (`origin/main` a869711) | margin-rs |
 |---|---|

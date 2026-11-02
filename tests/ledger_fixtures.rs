@@ -1,4 +1,4 @@
-//! Hand checked ledger fixtures (M1-04).
+//! Hand checked ledger fixtures.
 //!
 //! Every expected value below is written out by hand from the rules in
 //! `docs/ledger.md`; none is computed by the code under test.

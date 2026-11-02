@@ -1,4 +1,4 @@
-//! Initial margin fixtures (M3-03B), hand calculated.
+//! Initial margin fixtures, hand calculated.
 
 #![allow(
     clippy::unwrap_used,

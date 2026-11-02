@@ -6,255 +6,176 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+First release. It describes the crate as it is; the changes made while it
+was unpublished are not listed one by one.
+
 ### Added
 
-- **Fees charged in the base asset in the risk gate** (#37):
-  `InstrumentLimits::fee_asset` (`FeeAsset::Quote` by default, or
-  `FeeAsset::Base`) declares where a venue charges fees, fixed per order
-  at admission. A sell with fees in base reserves its quantity plus
-  `round_up(max_fee_rate * lot)` per lot in base (twice the quantity when
-  the lot is the base grid). A buy with fees in base reserves the notional
-  only: the fill pays its fee from the base it credits, in the same
-  booking, so it never draws on base held for other orders.
-  `set_limits` refuses fees in base with `max_fee_rate >= 1`. A real fee
-  above the bound or in another asset is still booked from the free
-  balance, and an overdraft halts the gate.
+#### Accounting (`ledger`)
 
-- **Closeout of inverse futures and perpetuals** (#26, part C):
-  `plan_liquidation` closes inverse positions under `TieredInverseIm`
-  (which now implements `PiecewiseLinearMargin`): fill value
-  `rhe(n * CV / p)` in the base, realized `released - fill value`, fee
-  `trunc(fee_rate * n * CV / p)`. `LiquidationAccount::from_ledger` reads
-  inverse positions and the booked plan leaves exactly `plan.after`.
-- **Certified closeout search**: the smallest count of each level is
-  found as booked, even where rounding with a coarse cash quantum opens
+- `Ledger`: the single accounting authority for one account. Balances per
+  asset split into total, reserved and available; spot positions with
+  signed average cost and realized PnL; fees per asset (rebates as
+  negative fees); per execution cashflows; snapshots (`LedgerSnapshot`,
+  self contained with assets, instruments and net transfers); valuation by
+  asset; and a full `reconcile()` of the state from the journal.
+- Idempotent booking by execution and transfer id: the same id with the
+  same content is a duplicate that changes nothing, and with other content
+  it is `ConflictingEntry`. Every operation is atomic.
+- Linear futures and perpetuals (`LinearTerms`, `LinearFuture`,
+  `LinearPerpetual`) and inverse futures and perpetuals (`InverseTerms`,
+  `InverseFuture`, `InversePerpetual`), with `ContractSize` (a multiplier
+  for a linear contract, a contract value `CV` in quote units for an
+  inverse one). A position is signed contracts with a signed basis in the
+  settlement asset; only realized PnL and fees move cash. Every figure is
+  rounded half-even once to the settlement asset scale, and intermediate
+  notionals stay in wide integers.
+- Inverse contracts settle in the base asset: a fill of `n` contracts at
+  `p` is worth `V = rhe(n * CV / p)`, the basis is the signed entry value,
+  and the realized PnL is `Q * CV * (1/entry - 1/exit)`. The exact rest of
+  each value is recorded as an `InverseResidual`.
+- `Ledger::book_funding` (`FundingPayment`) and `Ledger::settle_expiry`
+  (`ExpirySettlement`), in the id space shared with executions.
+- Mandatory postings: a derivative execution, a funding payment, an expiry
+  and a derivative settlement are booked even when they overdraw the
+  account (`book_execution_allowing_overdraft`), and the shortfall is
+  reported and stays visible in `overdrafts()` and `reconcile()`. A real
+  fill executed before a future's expiry but delivered after its
+  settlement is booked, closed at the settlement price and flagged
+  (`DerivativeFill::closed_at_settlement`); a fill executed at or after the
+  expiry is `ExecutedAfterExpiry`.
+- `book_settlement` (`DerivativeSettlement`) posts the cash of derivatives
+  that are not registered in the ledger (legacy path).
+- `reconcile()` checks balances, fees, transfers and funding per asset,
+  and per derivative the contracts and, in wide integers, the identity
+  `sum of signed virtual notionals (-N buy, +N sell) = realized_pnl -
+  basis` for a linear contract and `sum of signed virtual values (-V buy,
+  +V sell) = -realized_pnl - basis` for an inverse one.
+
+#### Pretrade risk (`risk`)
+
+- `RiskGate`, which owns the ledger: every spot order passes through
+  `submit` and reserves what it could spend, sized so that no
+  fragmentation of fills can exceed it. Reservation terms are fixed per
+  order at admission.
+- Hard limits on the joint exposure of positions and live orders
+  (`InstrumentLimits`): order size, position, notional, open orders, price
+  band and market data age. Typed decisions (accepted, reduced, rejected)
+  with every reason.
+- Fees in the quote or the base asset (`InstrumentLimits::fee_asset`,
+  `FeeAsset`): a fee in the asset an order pays is reserved with it, up to
+  `max_fee_rate`; a fee in the asset it receives is netted from that credit
+  in the same booking. A real fee above the bound, or in another asset, is
+  booked from the free balance.
+- Exactly once reservation updates on fills, venue rejects and confirmed
+  cancels. A real fill that does not match its order (overfill, fill after
+  filled, worse price) is booked and halts the gate as an
+  `ExecutionAnomaly`; one that overdraws the account halts it as an
+  `AccountingBreach`.
+- Circuit breaker (`trip`, `resume`) with quote withdrawal, also when the
+  gate halts itself.
+- `book_derivative_execution`, `book_funding` and `settle_expiry` post
+  derivative postings through the gate.
+
+#### Valuation and stress (`valuation`, `scenarios`)
+
+- `valuation::value`: mark to market of a `LedgerSnapshot` in one
+  reporting asset, with price source and freshness flags, and a PnL
+  attribution into realized, unrealized and fees, each counted once.
+- Collateral equity that an invalid mark can only lower or make unknown,
+  never raise; debts always count.
+- Open futures and perpetuals are valued at instrument marks
+  (`MarkSet::instruments`): `upnl = rhe(Q * M * mark) - basis` for a linear
+  contract and `basis - rhe(Q * CV / mark)` in the base for an inverse one.
+  Collateral counts `cash + sum(upnl)` per settlement asset as one net
+  amount.
+- `scenarios::stress`: stress of spot inventory and open linear futures and
+  perpetuals with hypothetical fills (hedges, spot or derivative), asset
+  and instrument shocks and a liquidation spread, from the baseline marks,
+  which are never changed. Each stressed price is one exact value.
+  `StressResult` reports ignored shocks, unshocked instruments and assets
+  where the spread side is not conservative for reporting equity.
+
+#### Margin (`initial_margin`, `rules`, `factors`, `covariance`, `collateral`, `margin_reservations`)
+
+- `InitialMarginModel` and versioned rules with progressive tier tables,
+  every requirement carrying its `RuleId` and a per position breakdown:
+  `TieredLinearIm` (`linear-im/1`: initial 10 %, maintenance 5 % of
+  `|Q| * M * mark`) and `TieredInverseIm` (`inverse-im/1`: the same rates
+  on `|Q| * CV / mark`, in the base). Each margin is one exact sum rounded
+  up once; notionals are informational and never block a representable
+  margin. `PiecewiseLinearMargin::margin_tiers` exposes the tiers that give
+  the unrounded margin exactly.
+- Factor exposures with explicit units (`factors`) and portfolio variance
+  under a validated, exactly positive semidefinite covariance matrix
+  (`covariance`).
+- `collateral::value_collateral`: collateral with per asset haircuts,
+  eligibility, a choice of balance basis and a declared stale price policy,
+  including the unrealized PnL of open derivatives per settlement asset.
+- `MarginReservationService`: initial margin reserved for pending
+  derivative orders, linear or inverse, with its own positions (`new`) or
+  reading them from the gate's ledger (`on_ledger`, where the hold covers
+  every open derivative of the account in the settlement asset). Spot and
+  margin reservations share one cash pool, so no unit of cash is reserved
+  twice. Risk reducing orders are accepted when the account is under
+  margined, and a hold never goes negative.
+
+#### Maintenance and liquidation (`maintenance`, `liquidation`)
+
+- `maintenance::assess`: account state (healthy, reduce only, default)
+  from the maintenance threshold; equality is healthy, unknown figures
+  never are. `CollateralView::from_valuation` builds its input.
+- `plan_liquidation`: a staged closeout plan that cancels resting orders,
+  reduces positions (linear or inverse) against scenario liquidity with
+  the smallest closeout that restores the target, and reports what is left
+  (unfilled size, deficit and debt). `LiquidationPlan::intents` gives the
+  adapter intents.
+- Certified search: the smallest count of each level is found as the
+  ledger would book it, even where rounding to a coarse cash quantum opens
   windows the unrounded figures do not have. Exact bounds in wide integers
-  (`J` contains every valid count, `J'` only valid ones) limit an exact
-  walk; the walk shares a budget of `SEARCH_BUDGET` (4096) evaluations per
-  plan. Beyond it the plan takes the first certified count and reports
-  `LiquidationPlan::minimal == false`, or fails with
-  `MarginError::CloseoutSearchLimit` when no count is certified.
-  Counts that would leave a position no `Decimal` can hold are jumped
-  over arithmetically. Breakpoint numerators stay in wide integers.
-  Checked against an exhaustive oracle on 19 200 cases
-  (`tests/closeout_oracle.rs`).
+  limit an exact walk, which shares a budget of `SEARCH_BUDGET` (4096)
+  evaluations per plan. Beyond it the plan takes the first count certified
+  to meet the target, and `LiquidationPlan::minimal` is `false` when that
+  count is not proven the smallest; with no certified count the plan
+  fails with `MarginError::CloseoutSearchLimit`. Counts that would leave a position
+  no `Decimal` can hold are skipped arithmetically.
+- A `contract_step` whose multiples below a level's size (or the
+  position's) are not exact at the step's scale is refused with
+  `InvalidInput`.
+- `LiquidationAccount::from_ledger` reads the account from a ledger
+  snapshot, and `ForcedReduction::execution` books each forced fill back as
+  a mandatory execution, so the booked plan leaves exactly
+  `LiquidationPlan::after`. `ForcedReduction::settlement` serves positions
+  kept outside the ledger.
 
-- **Margin for inverse futures and perpetuals** (#26, part B):
-  `ProductKind::InverseFuture` / `ProductKind::InversePerpetual` and the
-  rule `TieredInverseIm` (`inverse-im/1`: 10 % / 5 % of the notional
-  `|Qc| * CV / mark` in the base; tier tables with floors in the base).
-  Tiers are compared exactly by cross products and each margin is one
-  exact sum over the denominator `mark`, rounded up once; the linear rule
-  computes its margins the same way, so a notional out of range no longer
-  blocks a representable margin. Margin reservations margin and value
-  inverse positions (own or on the ledger).
+#### Exact arithmetic and error boundary
 
-- **Inverse futures and perpetuals in the ledger** (#26, part A):
-  `InverseTerms` (settlement in the base asset, contract value `CV` in
-  quote units), `InverseFuture`, `InversePerpetual`, the
-  `Instrument::InverseFuture` / `Instrument::InversePerpetual` and
-  `PositionKind` variants, `ContractSize` and
-  `Instrument::{contract_size, inverse_terms, expiry_ms}`. A fill is worth
-  `V = rhe(n * CV / p)` in the base; the basis is the signed entry value
-  and the realized PnL `Q * CV * (1/entry - 1/exit)`. Funding, expiry and
-  late fills follow the linear rules. Each value's exact rest is recorded
-  as an `InverseResidual` (`DerivativeFill::residual`,
-  `DerivativeFill::closing_residual`). `valuation::value`,
-  `collateral::value_collateral` and `Ledger::valuation` value inverse
-  positions (`upnl = basis - rhe(Q * CV / mark)`). Margin reservations on
-  the ledger, `LiquidationAccount::from_ledger`, the stress scenarios and
-  the risk gate refuse an open inverse position with
-  `UnsupportedInstrument` until parts B and C. See `docs/ledger.md`.
+- Money, prices and quantities are `rust_decimal::Decimal`. Every
+  operation is checked and exact or a typed `MarginError::Arithmetic`;
+  sums and products of more than two terms are computed in 768 bit wide
+  integers with one final conversion or rounding. The only roundings are
+  explicit, with a declared `Rounding` mode.
+- `MarginError` and `Result`: the typed error boundary.
+- The order and execution direction is `financial_types::Action` (0.3),
+  re-exported as `margin_rs::Action`; a direction other than `Buy` or
+  `Sell` is `MarginError::UnsupportedAction`, before any change.
+- Lints: clippy pedantic, with `unwrap_used`, `expect_used`, `panic`,
+  `unreachable`, `todo`, `unimplemented`, `indexing_slicing` and
+  `float_arithmetic` denied, `arithmetic_side_effects` as an error under
+  `make lint`, and `unsafe_code` forbidden. The few exceptions are
+  `#[expect]`s with a reason.
+- Edition 2024, MSRV 1.88; CI runs the latest stable and the MSRV.
 
-- **Stress of open futures and perpetuals** (#31): `scenarios::stress`
-  values open linear futures and perpetuals at stressed instrument marks
-  instead of refusing them. `Scenario::instrument_shock` moves an
-  instrument mark by `1 + shock`; the liquidation spread closes a long at
-  `mark * (1 - spread)` and a short at `mark * (1 + spread)`, and takes the
-  side of a settlement asset from the net collateral counts for it (cash
-  plus the unrealized PnL at valid marks). Each stressed price is one exact
-  product. Hypothetical fills on futures and perpetuals use the ledger's
-  derivative booking at the valuation time (a future at or past expiry is
-  `ExecutedAfterExpiry`, a settled one `InvalidInput`). `StressResult`
-  reports `ignored_instrument_shocks`, `unshocked_instruments` (open
-  derivatives without a shock) and `spread_sign_conflicts` (assets where
-  the spread side chosen for collateral is not conservative for reporting
-  equity). The baseline marks, snapshot and ledger are never changed.
+### Known limitations
 
-- **Liquidation and margin reservations read the ledger** (#23, part C):
-  `LiquidationAccount::from_ledger` builds the closeout account from a
-  `LedgerSnapshot` (every open future and perpetual in the plan's currency,
-  the total cash, the ledger's basis; spot left out; derivatives in another
-  asset, missing or non positive marks and expired unsettled futures are
-  errors), and
-  `ForcedReduction::execution` books each forced fill back as a mandatory
-  `Execution`, so the booked plan leaves exactly `plan.after`.
-  `MarginReservationService::on_ledger` reads positions from the gate's
-  ledger, margins and values every open derivative in the settlement asset
-  (registered or not; its hold covers the whole account in that asset),
-  uses its own fixed hold, and takes fills
-  already booked (`apply_booked_fill`, which flags overfills and sets the
-  hold atomically, returning `BookedFill`; `requirement_with_gate`).
-  `RiskGate::book_derivative_execution`, `RiskGate::book_funding` and
-  `RiskGate::settle_expiry` post derivative executions, funding and expiries
-  through the gate. New errors: `MarginError::FillNotBooked`,
-  `MarginError::WrongReservationMode` and `MarginError::ExpiredUnsettled`.
-
-- **Valuation and collateral of open futures and perpetuals** (#23, part
-  B): instrument marks (`MarkSet::instruments`, `MarkSet::with_instrument`;
-  per unit of the underlying in the settlement asset). `valuation::value`
-  values each open derivative at `upnl = rhe(Q * M * mark) - basis`
-  (`AccountValuation::derivatives`, `DerivativeValue`), adds it to equity
-  and to the attribution's unrealized PnL, and counts `cash + sum(upnl)`
-  per settlement asset as one net amount in collateral equity; stale or
-  future instrument marks are flagged (`AccountValuation::instrument_flags`)
-  and never add collateral (a gain is excluded, a loss makes it unknown).
-  `collateral::value_collateral` applies the same net per asset
-  (`CollateralLine::unrealized_pnl`, `CollateralValue::instrument_flags`,
-  `MarginError::InvalidInstrumentMark` under `StalePolicy::Reject`).
-  `maintenance::CollateralView::from_valuation` builds the maintenance view
-  from a valuation.
-
-- **Linear futures and perpetuals in the ledger** (#23, part A):
-  `LinearTerms`, `LinearFuture`, `LinearPerpetual` and the
-  `Instrument::LinearFuture` / `Instrument::LinearPerpetual` variants. A
-  position is signed contracts with a signed basis in the settlement asset;
-  only realized PnL and fees move cash. Every figure is rounded half-even to
-  the settlement asset scale (`LedgerConfig::rounding` applies to spot only),
-  and the virtual notionals stay in wide integers, so only stored results
-  must fit a `Decimal`. See `docs/ledger.md`.
-- `Ledger::book_funding` (`FundingPayment`, `FundingCashflow`, positive is
-  received) and `Ledger::settle_expiry` (`ExpirySettlement`,
-  `ExpiryCashflow`), mandatory and idempotent in the id space shared with
-  executions and settlements; `PostingBooking`, `Ledger::funding`,
-  `Ledger::funding_journal`, `Ledger::expiry_journal` and
-  `Ledger::is_settled`. A real fill executed before a future's expiry but
-  delivered after its settlement is still booked, never rejected: it is
-  closed at once at the settlement price and flagged in
-  `DerivativeFill::closed_at_settlement`. A fill executed at or after the
-  expiry is causally impossible: `MarginError::ExecutedAfterExpiry`.
-- `ExecutionCashflow::derivative` (`DerivativeFill`: multiplier, virtual
-  and closing notionals, released basis, settlement price of a late fill),
-  `PositionKind`, and
-  `Instrument::{kind, multiplier, linear_terms}`.
-- `reconcile()` checks funding per asset and, per derivative, the contracts
-  and the virtual identity `sum of signed virtual notionals = realized_pnl -
-  basis` in wide integers.
-
-### Changed
-
-- **Breaking:** `InstrumentLimits` has a new field, `fee_asset`: struct
-  literals that name every field must add it (`..Default::default()` is
-  unaffected) (#37).
-- **Breaking:** `plan_liquidation` refuses, with `InvalidInput` for
-  `contract_step`, a step whose multiples below a level's size (or the
-  position's) are not exact at the step's scale, such as 0.5 on
-  `Decimal::MAX` contracts. Contract counts used to be rounded down there,
-  which made them stop growing with the index.
-- **Breaking:** `PiecewiseLinearMargin::notional_breakpoints` is replaced
-  by `margin_tiers`, the tiers that give the unrounded margin exactly.
-  `LiquidationPlan` has the new field `minimal`, and `plan_liquidation` can
-  fail with the new `MarginError::CloseoutSearchLimit`.
-- **Breaking:** `ExposurePosition::multiplier` and
-  `MarginInstrument::multiplier` are replaced by `size: ContractSize`,
-  validated against the product. `PositionRequirement::notional` and
-  `TierSlice::notional` are `Option<Decimal>` (informational, `None` when
-  they do not fit). An unrepresentable margin is reported as
-  `Arithmetic { operation: "initial margin" }` (or maintenance) instead of
-  failing on the notional.
-- **Breaking:** `PositionSnapshot::multiplier` and `DerivativeFill::multiplier`
-  are replaced by `size: ContractSize`, and `Instrument::multiplier` by
-  `Instrument::contract_size`; `DerivativeFill` has the new fields
-  `residual` and `closing_residual`. `Instrument` and `PositionKind` have
-  new variants (both are `non_exhaustive`). Registering an inverse
-  instrument requires the base scale plus its price scale to be at most 28.
-- **Breaking:** `Scenario` has a new field, `instrument_shocks`, and
-  `StressResult` three (`ignored_instrument_shocks`,
-  `unshocked_instruments`, `spread_sign_conflicts`): struct literals must
-  name them (#31).
-- **Breaking:** `Execution` has the new field `executed_at_ms` (and
-  `Execution::with_executed_at`); it is part of the execution, so a repeat
-  must carry the same time. It is optional for spot and required for a
-  linear future or perpetual; a future's fills must be executed strictly
-  before its expiry.
-- **Breaking:** an execution of a linear future or perpetual is mandatory:
-  `book_execution` and `book_execution_with_reservation` refuse it with
-  `InvalidInput` and no effect, and `book_execution_allowing_overdraft`
-  books it (never rejected for balance) and returns the shortfall.
-- **Breaking:** `ExecutionCashflow` has the new field `derivative`. For a
-  derivative, `notional` is zero (no principal is exchanged) and
-  `notional_exact` and `rounding_residual` are `None`: its cash is in
-  `deltas` and its virtual notional in `derivative.virtual_notional`
-  (`None` only when out of a `Decimal`'s range). A consumer that adds
-  notionals as volume must read the virtual notional for derivatives.
-- **Breaking:** `PositionSnapshot` has the new fields `kind` and
-  `multiplier` (1 for spot), and `average_price()` is `cost_basis /
-  (quantity * multiplier)`: the price per unit of the underlying for a
-  derivative. `LedgerSnapshot` has the new fields `funding` and
-  `settled_instruments`. Code that builds these structs must set them.
-- **Breaking:** `MarkSet` has the new field `instruments`,
-  `AccountValuation` the new fields `derivatives` and `instrument_flags`,
-  `CollateralLine` the new field `unrealized_pnl` and `CollateralValue` the
-  new field `instrument_flags`. `valuation::value` and
-  `collateral::value_collateral` need an instrument mark for every open
-  derivative (`MissingMark` otherwise, never zero); `AssetValue::collateral_value`
-  and `CollateralLine::balance` include the unrealized PnL counted for the
-  asset. The stress scenarios refuse an open derivative with
-  `UnsupportedInstrument` (they shock asset marks only).
-- The risk gate refuses derivatives with `UnsupportedInstrument` in
-  `set_limits`, `on_market_data` and `submit` (as `RiskReason::InvalidOrder`).
-- `book_settlement` is kept for derivatives that are not registered in the
-  ledger (legacy; documented, not deprecated in code).
-- `plan_liquidation` accepts a basis of zero (an entry notional rounded to
-  zero); a non zero basis must still have the sign of the position.
-- `MarginReservationService::reserve_with_gate` refuses an order side other
-  than `Buy` or `Sell` before reading the gate, and a hold in another asset
-  than the settlement asset is `CurrencyMismatch`.
-
-- **Breaking:** the order and execution direction is `financial_types::Action`
-  (0.3), shared with the other crates of the stack, re-exported as
-  `margin_rs::Action` and `margin_rs::ledger::Action`. It replaces
-  `ledger::Side` in `Execution`, `ExecutionCashflow`, `OrderRequest`,
-  `OrderRecord`, `MarginOrder`, `HypotheticalFill`, `ForcedReduction` and
-  `CloseoutIntent::Reduce`. `Action::Buy` and `Action::Sell` behave as
-  `Side::Buy` and `Side::Sell` did; the old `Side` had no `Display`, so no
-  text changes.
-- `Action` is `#[non_exhaustive]` and has `Other`. Every public entry turns
-  it into a private `{Buy, Sell}` direction first, with the crate's only
-  wildcard arm; anything else is the new
-  `MarginError::UnsupportedAction { field, action }`, before any change:
-  `Ledger::book_execution*` and `RiskGate::on_fill` (before the duplicate
-  check), `MarginReservationService::reserve` (before the order id is used)
-  `scenarios::stress` and `LiquidationPlan::intents` (every reduction, since
-  plan fields are public). `RiskGate::submit` checks it first and rejects it
-  as `RiskReason::InvalidOrder` without recording anything: the id is not
-  consumed and an existing record under it is untouched. Every other
-  rejection is still recorded. Matches inside the crate stay exhaustive.
-- **MSRV 1.88** (required by `financial_types` 0.3).
-- `financial_types::Side` (long or short), `OptionStyle` and
-  `UnderlyingAssetType` are not adopted: positions are signed, and margin-rs
-  has no option style or asset type enum to replace.
-
-- Lints: clippy pedantic is on, and `unwrap_used`, `expect_used`, `panic`,
-  `unreachable`, `todo`, `unimplemented` and `indexing_slicing` are denied;
-  `arithmetic_side_effects` warns, and `make lint` runs with `-D warnings`.
-  `unsafe_code` stays forbidden, and `missing_docs` and
-  `clippy::float_arithmetic` stay denied.
-  Library code has no `unwrap`, `expect`, `panic!`, unchecked indexing or
-  unchecked arithmetic left; the few exceptions are `#[expect]`s with a
-  reason. Test code opts out of the panic and indexing lints.
-- Ledger balances compute `available = total - reserved` exactly when the
-  balance changes. A balance whose available amount cannot be represented
-  is now an `Arithmetic` error at booking time, instead of a panic or a
-  rounded value when it is read. `Ledger::balance` and `Ledger::overdrafts`
-  keep their signatures and read the stored value.
-- Negations of `Decimal` amounts go through an exact sign flip, with no
-  arithmetic.
-
-- **Breaking:** `OrderRecord::remaining` returns `Result<Decimal>`. Its
-  fields are public, so a record can hold any values, and a difference
-  that cannot be represented is now `MarginError::Arithmetic` instead of a
-  panic. Records kept by the `RiskGate` never fail; an overfilled record
-  still gives zero.
-
-No other public signature changes.
+- Inverse futures and perpetuals are valued, margined and closed out, but
+  not stressed: `scenarios::stress` refuses an open inverse position, a
+  shock on one or a hypothetical fill on one with `UnsupportedInstrument`.
+- The risk gate handles spot orders only; derivative orders reserve margin
+  through `margin_reservations`.
+- Options are not covered by the ledger, the margin rules or the closeout.
+- The journal and the set of seen ids grow for the life of a ledger;
+  pruning and checkpoints are future work.
+- market-maker-rs uses margin-rs optionally through its `margin` feature,
+  pinned by git to an earlier revision; updating it to this release is
+  pending.

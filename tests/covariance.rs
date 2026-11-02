@@ -1,4 +1,4 @@
-//! Portfolio covariance fixtures (M3-02), hand calculated.
+//! Portfolio covariance fixtures, hand calculated.
 
 #![allow(
     clippy::unwrap_used,

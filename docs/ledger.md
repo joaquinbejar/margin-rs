@@ -1,4 +1,4 @@
-# Ledger contract (M1-04)
+# Ledger contract
 
 The `margin_rs::ledger::Ledger` is the single accounting authority for one account. Strategy, risk, backtest and environment code read cash, positions and fees from it and never keep a second balance that could drift.
 
@@ -14,7 +14,7 @@ The first supported product is spot with maker and taker fees. The types already
 | Reservations | reservation id | `(asset, amount)` held back from available |
 | Transfers | transfer id | deposits and withdrawals |
 | Journal | booking order | one `ExecutionCashflow` per booked execution |
-| Settlement journal | booking order | one `SettlementCashflow` per derivative settlement (M3-04) |
+| Settlement journal | booking order | one `SettlementCashflow` per derivative settlement |
 | Settled PnL | asset | cumulative realized PnL paid by derivative settlements, gross of fees |
 
 `quantity` is the net quantity traded on the instrument since the ledger was opened. It is not the base asset balance. The base balance also moves with transfers and with fees charged in the base asset.
@@ -30,7 +30,7 @@ Example: a buy of 1 BTC with a fee of 0.001 BTC gives a position of 1 and a BTC 
 2. **Atomicity.** Every operation either applies completely or returns an error and leaves the ledger unchanged.
 3. **No overspending.** A booking, withdrawal or reservation that would leave an asset's available balance negative fails with `InsufficientBalance`.
 
-   The one exception is `book_execution_allowing_overdraft`, used for executions that already happened at a venue (M1-05). It books the execution anyway and returns the shortfall. The overdraft stays visible in `overdrafts()` and in the `Reconciliation` returned by `reconcile()` until the account is funded.
+   The one exception is `book_execution_allowing_overdraft`, used for executions that already happened at a venue (see `docs/risk-gate.md`). It books the execution anyway and returns the shortfall. The overdraft stays visible in `overdrafts()` and in the `Reconciliation` returned by `reconcile()` until the account is funded.
 4. **Precision.**
    - Each asset has a scale: its number of fractional digits, at most 18.
    - Each spot instrument has a price scale and a quantity scale, and the quantity scale may not exceed the base asset scale.
@@ -97,7 +97,7 @@ Precision: the products and their sum are computed exactly and rounded once to t
 
 ## Mapping from market-maker-rs (contract for the adapter)
 
-The market-maker-rs side of this issue covers wiring `BacktestEngine` and `InventoryPosition::update_fill` to read from the ledger, and the reconciliation tests in market-maker-rs. It is tracked as the market-maker-rs integration tasks of M1-04 and is not part of this PR.
+The market-maker-rs side, wiring `BacktestEngine` and `InventoryPosition::update_fill` to read from the ledger and its reconciliation tests, belongs to market-maker-rs, which uses margin-rs optionally through its `margin` feature.
 
 The adapter maps types as follows:
 
@@ -112,9 +112,9 @@ The adapter maps types as follows:
 | `BacktestConfig::initial_capital` | `deposit(TransferId, quote, amount)` |
 | `InventoryPosition { quantity, avg_entry_price }` | `PositionSnapshot { quantity, average_price() }`, with `cost_basis` as the authoritative value |
 | `PnL { realized, unrealized }`, `total_fees` | `PositionSnapshot::realized_pnl`, `Valuation`, `fees_paid` |
-| non-fill reports (`Accepted`, `Rejected`, `Canceled`, `CancelRejected`) | not booked; M1-05 maps them to reservation changes |
+| non-fill reports (`Accepted`, `Rejected`, `Canceled`, `CancelRejected`) | not booked; the risk gate maps them to reservation changes |
 
-The currency, unit and cashflow contracts of market-maker-rs#78 (M0-05) are still open. Execution reports carry no currency yet, so the adapter supplies the instrument and fee asset from its configuration until #78 lands.
+The currency, unit and cashflow contracts of market-maker-rs#78 are still open. Execution reports carry no currency yet, so the adapter supplies the instrument and fee asset from its configuration until #78 lands.
 
 ## Derivative positions
 
@@ -166,7 +166,7 @@ Margin reservations margin and value inverse positions with an inverse rule (`Ti
 
 `valuation::value` and `collateral::value_collateral` value open derivative positions at instrument marks (see `docs/valuation.md`); the stress scenarios shock instrument marks and book hypothetical derivative fills with the rules above. The risk gate handles spot orders only and refuses a derivative with `UnsupportedInstrument` at every entry point.
 
-## Derivative settlements outside the ledger (M3-04, legacy)
+## Derivative settlements outside the ledger (legacy)
 
 This path is kept for derivatives that are not registered in the ledger; registered futures and perpetuals use the rules above. It may be removed later. Futures and perpetual positions held outside the ledger are margined by `initial_margin`, `margin_reservations` and `liquidation`. When such a position is reduced, the cash it moves is booked with `book_settlement(&DerivativeSettlement { id, instrument, asset, realized_pnl, fee })`:
 
@@ -180,6 +180,6 @@ This path is kept for derivatives that are not registered in the ledger; registe
 
 ## Limits and non-goals
 
-- Options are not ledger positions. Stress, margin reservations and liquidation do not support inverse positions yet.
+- Options are not ledger positions. The stress scenarios do not support inverse positions yet.
 - The journal and the set of seen execution ids grow without bound for the life of a ledger. Pruning or checkpoints are future work.
-- Reservations are plain holds that a caller creates and releases. M1-05 builds order-level reservations on top: release on fill, reject and effective cancel, and exactly-once adjustment on a partial fill.
+- Reservations are plain holds that a caller creates and releases. The risk gate builds order-level reservations on top: release on fill, reject and effective cancel, and exactly-once adjustment on a partial fill.

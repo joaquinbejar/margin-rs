@@ -122,7 +122,7 @@ impl CollateralPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollateralLine {
     /// Balance on the policy's basis, plus the unrealized PnL counted for
-    /// the linear futures and perpetuals settled in this asset.
+    /// the futures and perpetuals (linear or inverse) settled in this asset.
     pub balance: Decimal,
     /// Unrealized PnL of the open derivatives settled in this asset that
     /// the line counts (gains at an invalid instrument mark excluded), as a

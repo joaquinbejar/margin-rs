@@ -1,8 +1,8 @@
-# Collateral with haircuts and a stale price policy (M3-03A)
+# Collateral with haircuts and a stale price policy
 
 `collateral::value_collateral(&LedgerSnapshot, &MarkSet, &CollateralPolicy) -> CollateralValue`
 
-This computes the available collateral of one account from exact ledger balances and supplied marks. It never changes the ledger and never touches realized cash. The marks and the currency conversion are explicit: every price comes from the `MarkSet`, in the reporting asset, with its source and timestamp (`valuation::Mark`, M2-08).
+This computes the available collateral of one account from exact ledger balances and supplied marks. It never changes the ledger and never touches realized cash. The marks and the currency conversion are explicit: every price comes from the `MarkSet`, in the reporting asset, with its source and timestamp (`valuation::Mark`).
 
 ## Policy
 
@@ -30,9 +30,9 @@ Each line is rounded down once, toward negative infinity. The total is the exact
 
 **Stale marks cannot silently increase spendable collateral.** Under the default policy, a stale or otherwise invalid mark only lowers collateral or makes it unknown. Using a stale price at all requires choosing `ExtraHaircut` explicitly.
 
-## Relation to M2-08
+## Relation to the valuation
 
-`valuation::AccountValuation::collateral_equity` (M2-08) is a valuation-side view with one haircut policy for stale marks. `value_collateral` is the margin-side collateral. It adds per-asset eligibility and haircuts, a choice of balance basis, and an explicit reject option. Both treat debts the same way.
+`valuation::AccountValuation::collateral_equity` is a valuation-side view with one haircut policy for stale marks. `value_collateral` is the margin-side collateral. It adds per-asset eligibility and haircuts, a choice of balance basis, and an explicit reject option. Both treat debts the same way.
 
 ## Collateral of a derivatives account
 
@@ -42,6 +42,6 @@ This function covers the cash and the futures and perpetuals:
 
 - The cash asset (for example USDC) is the reporting asset, with a 0 % haircut.
 - An asset that must not count is left out of `haircuts`, or given a 100 % haircut.
-- The unrealized PnL of the open linear futures and perpetuals held in the ledger is added to the balance of their settlement asset, as one net amount, at their instrument marks (`MarkSet::instruments`, see `docs/valuation.md`). The asset's haircut and stale policy apply to that net; `CollateralLine::unrealized_pnl` shows what was counted. A gain at a stale or future instrument mark is excluded, a loss at one makes the line unknown, and `StalePolicy::Reject` refuses either with `InvalidInstrumentMark`.
+- The unrealized PnL of the open futures and perpetuals held in the ledger, linear or inverse, is added to the balance of their settlement asset, as one net amount, at their instrument marks (`MarkSet::instruments`, see `docs/valuation.md`). The asset's haircut and stale policy apply to that net; `CollateralLine::unrealized_pnl` shows what was counted. A gain at a stale or future instrument mark is excluded, a loss at one makes the line unknown, and `StalePolicy::Reject` refuses either with `InvalidInstrumentMark`.
 
 Short option marks are not covered: options are not ledger positions.

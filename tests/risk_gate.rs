@@ -1,4 +1,4 @@
-//! Pretrade risk gate fixtures (M1-05).
+//! Pretrade risk gate fixtures.
 //!
 //! Expected values are written out by hand from the rules in
 //! `docs/risk-gate.md`.

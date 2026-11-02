@@ -47,7 +47,7 @@
 //!
 //! A service built with [`MarginReservationService::on_ledger`] keeps no
 //! positions: every decision reads them from the ledger of the
-//! [`RiskGate`] it is given, where the linear futures and perpetuals are
+//! [`RiskGate`] it is given, where the futures and perpetuals are
 //! registered and their executions booked. In that mode:
 //!
 //! - the caller books each fill first
@@ -327,7 +327,7 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
     ///
     /// - Own positions: the registered instruments.
     /// - On the ledger: the registered instruments, each checked against
-    ///   the ledger's definition, and every other open linear future or
+    ///   the ledger's definition, and every other open future or
     ///   perpetual of the ledger settled in the service's asset, with the
     ///   ledger's terms: the hold covers the whole account in that asset.
     fn book_in(&self, snapshot: &LedgerSnapshot) -> Result<Book> {
@@ -980,7 +980,7 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
     }
 
     /// The cash collateral (`available + own hold` in `currency`) and, on
-    /// the ledger, the unrealized PnL terms of every open linear future or
+    /// the ledger, the unrealized PnL terms of every open future or
     /// perpetual settled in `currency` (market value, then minus basis, so
     /// the caller sums them with the cash once), or the instrument whose
     /// mark is missing. A service with its own positions counts no

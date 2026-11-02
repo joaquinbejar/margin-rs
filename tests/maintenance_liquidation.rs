@@ -1,4 +1,4 @@
-//! Maintenance threshold and staged closeout fixtures (M3-04), hand
+//! Maintenance threshold and staged closeout fixtures, hand
 //! calculated with a single-tier `linear-im/1` rule (im 10 %, mm 5 % of
 //! `|Qc| * M * mark`), USDC at 6 decimals, fee rate 0.0005.
 //!

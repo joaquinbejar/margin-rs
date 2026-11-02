@@ -258,8 +258,8 @@ impl Ledger {
 
     /// Registers an instrument. Its assets must be registered first.
     ///
-    /// Registering an identical instrument again is a no-op. A linear future
-    /// or perpetual is held as signed contracts with a basis in its
+    /// Registering an identical instrument again is a no-op. A future or
+    /// perpetual (linear or inverse) is held as signed contracts with a basis in its
     /// settlement asset; every figure it books is rounded half-even to that
     /// asset's scale, whatever [`LedgerConfig::rounding`] says (which
     /// applies to spot only), so the ledger and
@@ -599,8 +599,8 @@ impl Ledger {
     ///   fractional digits than the instrument or asset allows.
     /// - [`MarginError::InsufficientBalance`]: an asset debited by the
     ///   execution would end with a negative available balance.
-    /// - [`MarginError::InvalidInput`]: the instrument is a linear future or
-    ///   perpetual. Their executions are mandatory and are booked with
+    /// - [`MarginError::InvalidInput`]: the instrument is a future or
+    ///   perpetual (linear or inverse). Their executions are mandatory and are booked with
     ///   [`Ledger::book_execution_allowing_overdraft`].
     /// - [`MarginError::Arithmetic`]: overflow or a non exact intermediate.
     pub fn book_execution(&mut self, execution: &Execution) -> Result<Booking> {
@@ -638,7 +638,7 @@ impl Ledger {
 
     /// Books an execution that **already happened** at a venue, even if it
     /// overdraws the account. It is the authoritative path for executions of
-    /// linear futures and perpetuals, which are always mandatory (see
+    /// futures and perpetuals, linear or inverse, which are always mandatory (see
     /// "Derivative positions" in `docs/ledger.md`).
     ///
     /// Same rules as [`Ledger::book_execution_with_reservation`] (or
@@ -653,8 +653,8 @@ impl Ledger {
     /// # Errors
     ///
     /// Every error of [`Ledger::book_execution_with_reservation`] except
-    /// [`MarginError::InsufficientBalance`]. For a linear future or
-    /// perpetual, after the duplicate and conflict checks:
+    /// [`MarginError::InsufficientBalance`]. For a future or perpetual
+    /// (linear or inverse), after the duplicate and conflict checks:
     ///
     /// - [`MarginError::InvalidInput`]: a reservation is given (a derivative
     ///   fill consumes none), or the execution has no `executed_at_ms`.
@@ -1228,7 +1228,7 @@ impl Ledger {
 
     // ----- derivative postings ------------------------------------------
 
-    /// Books a funding payment of a linear perpetual.
+    /// Books a funding payment of a perpetual (linear or inverse).
     ///
     /// The settlement asset's total balance changes by `amount` (positive is
     /// received, negative is paid), and the amount joins
@@ -1335,7 +1335,7 @@ impl Ledger {
         })
     }
 
-    /// Settles a linear future at expiry: closes its whole position at
+    /// Settles a future (linear or inverse) at expiry: closes its whole position at
     /// `price`, with the closing rules of an execution and no fee, and marks
     /// the instrument as settled.
     ///
@@ -1740,8 +1740,10 @@ impl Ledger {
     /// quote cash exchanged by trades equals `realized_pnl - cost_basis`
     /// (cost is conserved exactly). For a linear future or perpetual the
     /// same identity holds with the signed virtual notionals (`-N` for a
-    /// buy, `+N` for a sell, the expiry close included), recomputed from
-    /// every fill and compared in wide integers.
+    /// buy, `+N` for a sell, the expiry close included): their sum equals
+    /// `realized_pnl - basis`. For an inverse one the signed virtual values
+    /// (`-V` for a buy, `+V` for a sell) sum to `-realized_pnl - basis`.
+    /// Both are recomputed from every fill and compared in wide integers.
     ///
     /// An overdraft (a balance below its reservations, after booking a real
     /// execution with [`Ledger::book_execution_allowing_overdraft`]) is not

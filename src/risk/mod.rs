@@ -448,7 +448,7 @@ impl RiskGate {
         self.ledger.withdraw(id, asset, amount)
     }
 
-    /// Books an execution of a linear future or perpetual that already
+    /// Books an execution of a future or perpetual that already
     /// happened at a venue, through
     /// [`Ledger::book_execution_allowing_overdraft`] with no reservation: it
     /// is mandatory and booked even if it overdraws the account, and a

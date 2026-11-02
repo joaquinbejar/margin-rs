@@ -7,27 +7,37 @@
 //! ## Status
 //!
 //! - [`ledger`]: the single accounting authority for one account. Spot
-//!   instruments, available and reserved balances per asset, positions with
-//!   signed average cost, fees per asset, idempotent booking by execution
+//!   instruments and linear and inverse futures and perpetuals, available
+//!   and reserved balances per asset, spot positions with signed average
+//!   cost, derivative positions as signed contracts with a basis, funding
+//!   and expiry settlement, fees per asset, idempotent booking by execution
 //!   identifier, per execution cashflow reconciliation, snapshots and an
-//!   explicit mark to market policy.
-//! - [`risk`]: the pretrade risk gate. Every order passes through
-//!   [`risk::RiskGate::submit`], which reserves balance or inventory in the
-//!   ledger and enforces hard limits on the joint exposure of positions and
-//!   live orders, with typed accepted, reduced and rejected decisions, quote
-//!   withdrawal on a circuit breaker, and exactly once reservation updates
-//!   on fills, rejects and confirmed cancels.
+//!   explicit mark to market policy. An inverse contract settles in the
+//!   base asset, and the exact rest of each of its values is recorded.
+//! - [`risk`]: the pretrade risk gate for spot orders. Every order passes
+//!   through [`risk::RiskGate::submit`], which reserves balance or
+//!   inventory in the ledger, fees included whether the venue charges them
+//!   in the quote or the base asset, and enforces hard limits on the joint
+//!   exposure of positions and live orders, with typed accepted, reduced
+//!   and rejected decisions, quote withdrawal on a circuit breaker, and
+//!   exactly once reservation updates on fills, rejects and confirmed
+//!   cancels. Derivative executions, funding and expiries are posted
+//!   through the gate as mandatory postings.
 //! - [`valuation`]: account mark to market in one reporting asset over an
 //!   immutable ledger snapshot, with price source and freshness flags,
-//!   collateral equity that invalid marks cannot raise, and PnL with fees
-//!   counted once.
+//!   collateral equity that invalid marks cannot raise, open linear and
+//!   inverse derivatives at instrument marks, and PnL with fees counted
+//!   once.
 //! - [`scenarios`]: stress of spot inventory and open linear futures and
 //!   perpetuals (hypothetical fills such as hedges, asset and instrument
-//!   shocks, liquidation spread).
+//!   shocks, liquidation spread). Inverse positions are valued but not
+//!   stressed yet.
 //! - [`initial_margin`] and [`rules`]: versioned initial and maintenance
-//!   margin rules. The first is `linear-im/1` for linear USDC
-//!   futures and perpetuals; every requirement carries its rule id and a per
-//!   position breakdown.
+//!   margin rules with progressive tiers: `linear-im/1`
+//!   ([`rules::TieredLinearIm`]) for linear futures and perpetuals and
+//!   `inverse-im/1` ([`rules::TieredInverseIm`]) for inverse ones, in the
+//!   base. Every requirement carries its rule id and a per position
+//!   breakdown.
 //! - [`factors`] and [`covariance`]: factor exposures with explicit units
 //!   and portfolio variance under a validated (symmetric, positive
 //!   semidefinite) covariance matrix.
@@ -35,20 +45,29 @@
 //!   per asset haircuts and a declared stale price policy.
 //! - [`margin_reservations`]: initial margin reserved for pending
 //!   derivative orders of one account, recomputed exactly from positions
-//!   and live orders.
+//!   and live orders, kept by the service or read from the gate's ledger.
 //! - [`maintenance`] and [`liquidation`]: the maintenance threshold and
 //!   account state (healthy, reduce only, default), and a staged closeout
 //!   plan (cancel, reduce, residual) against scenario liquidity, with the
-//!   deficit left explicit. The cash it moves is posted in the [`ledger`]
-//!   as derivative settlements.
+//!   deficit left explicit. The smallest closeout of each level is found by
+//!   a certified search within [`liquidation::SEARCH_BUDGET`] evaluations
+//!   per plan. Beyond it the plan takes the first count certified to meet
+//!   the target, and [`liquidation::LiquidationPlan::minimal`] is `false`
+//!   when that count is not proven the smallest; with no certified count
+//!   the plan fails with [`MarginError::CloseoutSearchLimit`]. The account
+//!   is read with
+//!   [`liquidation::LiquidationAccount::from_ledger`], and each forced fill
+//!   is booked back with [`liquidation::ForcedReduction::execution`], so the
+//!   booked plan leaves exactly the planned state.
 //! - [`MarginError`] and [`Result`]: the typed error boundary.
 //!
 //! ## Policies
 //!
 //! - Edition 2024, MSRV 1.88; CI checks both the latest stable and the MSRV.
 //! - Small default dependency set; the crate never depends on
-//!   market-maker-rs. Planned integration: market-maker-rs does not depend
-//!   on margin-rs yet.
+//!   market-maker-rs. market-maker-rs uses margin-rs optionally through its
+//!   `margin` feature, pinned by git to an earlier revision; updating it to
+//!   this release is pending.
 //! - No binary floating point arithmetic (`clippy::float_arithmetic`).
 //!   Money, prices and quantities are [`Decimal`]s; every operation is
 //!   checked and exact, and the few rounding steps are explicit (see
