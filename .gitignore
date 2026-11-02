@@ -1,0 +1,31 @@
+# Cargo build output
+debug/
+target/
+**/target/
+
+# Library crate: Cargo.lock is not committed
+Cargo.lock
+**/Cargo.lock
+
+# rustfmt backups
+**/*.rs.bk
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+**/.DS_Store
+
+# Local state and secrets
+.env
+.local/
+.secrets
+
+# Coverage
+/*.profraw
+/coverage/
+/cobertura.xml
+/tarpaulin-report.html
+
+# Local planning state (not GitHub state)
+.issues/
