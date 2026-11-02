@@ -8,20 +8,18 @@ This document covers two modules and one ledger posting:
 
 ## Who owns what
 
-This follows Xynthex ADR 0009 (crosswalk X6).
-
 | Concern | Owner |
 |---|---|
-| Liquidation trigger, account state, cancelling resting orders | Xynthex core |
+| Liquidation trigger, account state, cancelling resting orders | the venue, when it keeps its own account state |
 | What to close, in what order, size limits, outcome against book liquidity | margin-rs: `LiquidationPlan` |
-| Journal of record in a Xynthex run | Xynthex core ledger; margin-rs reads its `CollateralView` |
-| Backtest and participant runs outside Xynthex | margin-rs `Ledger`, with `book_settlement` |
+| Journal of record when the venue keeps its own ledger | the venue's ledger; margin-rs reads its collateral figures (`CollateralView`) |
+| Backtests and accounts without a venue ledger | margin-rs `Ledger`, with `book_settlement` |
 
 Both functions are pure. Neither books, triggers or cancels anything.
 
 ## Maintenance threshold
 
-The primary specification is Xynthex `docs/design/economics.md` section 11.1, at commit `c1b437b612b0a33610a3cbb777938c41fcdde331`. The rule is `xynthex-linear-im/1`: IM is 10 % and MM is 5 % of `|Qc| * M * mark`. Each position is rounded up once, and the totals are exact sums.
+The margins come from a `TieredLinearIm` rule, for example a single tier with IM 10 % and MM 5 % of `|Qc| * M * mark`. Each position is rounded up once, and the totals are exact sums.
 
 `assess(previous, &CollateralView { currency, cash, collateral, equity }, &requirement)` applies these rules, in order:
 
@@ -49,7 +47,7 @@ plan_liquidation(&model, &LiquidationAccount { view, basis, cash, resting_orders
                  &liquidity, &LiquidationPolicy { target, fee_rate, contract_step })
 ```
 
-`model` implements `PiecewiseLinearMargin`, which `TieredLinearIm` and therefore `xynthex-linear-im/1` do. The trait's contract has three parts:
+`model` implements `PiecewiseLinearMargin`, which every `TieredLinearIm` does. The trait's contract has three parts:
 
 - margins are additive across positions;
 - each position's IM and MM are convex, non-decreasing, piecewise linear functions of its notional, and the slope changes only at `notional_breakpoints` (the tier floors);
@@ -81,7 +79,7 @@ Each open position needs a non-zero `basis` with the sign of the position.
 | `Initial` | `collateral >= im` and `cash >= 0` |
 | `Flat` | no position is open |
 
-`cash >= 0` is the exit condition of a Xynthex `Default`. Equality meets the target, as it does in `assess`.
+`cash >= 0` is the exit condition of `Default`. Equality meets the target, as it does in `assess`.
 
 ### Outcomes
 
@@ -94,7 +92,7 @@ Each open position needs a non-zero `basis` with the sign of the position.
 
 ### Cash conventions
 
-These follow Xynthex economics 10.3 and 10.4, at the same commit. `c` is the rule's `cash_scale` (USDC: 6).
+`c` is the rule's `cash_scale` (USDC: 6).
 
 | Figure | Formula |
 |---|---|
@@ -116,10 +114,10 @@ On one level, let `n` be the number of contracts closed.
 - `cash(n)` is linear in `n`: the price, the released basis and the fee are all proportional to `n`.
 - `excess(n) = collateral(n) - margin(n)` is concave. Collateral is linear in `n`, and the margin is convex in the notional, which falls linearly in `n`.
 
-So `min(cash, excess)` is concave, and the counts that meet the target form an interval `[a, b]`. That interval need not reach the end of the level, because closing more can push cash below zero. The two review cases from round 2 are both of this kind:
+So `min(cash, excess)` is concave, and the counts that meet the target form an interval `[a, b]`. That interval need not reach the end of the level, because closing more can push cash below zero. The two cases below are both of this kind:
 
-- MM-REVIEWER: two positions under the flat rule;
-- codex: two increasing tiers.
+- two positions under a single-tier rule;
+- one position under two increasing tiers.
 
 In each, the plan must close 5 contracts. Closing all 10 would leave debt that could have been avoided.
 
@@ -167,6 +165,6 @@ The account holds 10 BTC-PERP long, `M = 1`, entry 100 (basis 1000), mark 95, wi
 
 ## Out of scope
 
-- Insurance fund, loss allocation and auto-deleveraging (Xynthex N-MG2). The debt and the deficit are left for them, explicitly.
+- Insurance fund, loss allocation and auto-deleveraging. The debt and the deficit are left for them, explicitly.
 - Perpetual and futures positions inside the margin-rs `Ledger` (option B). That is follow-up work for M3-INT.
-- Options. `xynthex-linear-im/1` covers only linear futures and perpetuals.
+- Options. `TieredLinearIm` covers only linear futures and perpetuals.

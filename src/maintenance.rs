@@ -5,15 +5,14 @@
 //! the new [`AccountState`], why, and how far the account is from the
 //! threshold. It is a pure function of its inputs and the previous state.
 //!
-//! The decision never triggers anything. In a Xynthex run the core owns the
-//! trigger, the account state and the cancellation of resting orders
-//! (Xynthex ADR 0009, crosswalk X6); margin-rs computes the state it
-//! reports and, when asked, the [liquidation plan](crate::liquidation).
+//! The decision never triggers anything. When a venue keeps its own
+//! account state, it owns the trigger, that state and the cancellation of
+//! resting orders; margin-rs computes the state it reports and, when asked,
+//! the [liquidation plan](crate::liquidation).
 //!
 //! # Rule
 //!
-//! From Xynthex `docs/design/economics.md` section 11.1, at commit
-//! `c1b437b612b0a33610a3cbb777938c41fcdde331`:
+//! The rule, in order:
 //!
 //! | Condition | State |
 //! |---|---|
@@ -56,16 +55,15 @@ impl AccountState {
     }
 }
 
-/// What [`assess`] reads, in the requirement's currency (Xynthex
-/// `CollateralView`, economics 11.1).
+/// What [`assess`] reads, in the requirement's currency.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollateralView {
     /// Currency of every amount.
     pub currency: Asset,
-    /// Cash balance in that currency (Xynthex `cash_usdc`); negative after
-    /// a mandatory debit that the balance did not cover.
+    /// Cash balance in that currency; negative after a mandatory debit
+    /// that the balance did not cover.
     pub cash: Decimal,
-    /// Collateral (Xynthex: cash plus the unrealized PnL of futures and
+    /// Collateral (for example cash plus the unrealized PnL of futures and
     /// perpetuals, minus the marks of short options); `None` when unknown.
     pub collateral: Option<Decimal>,
     /// Account equity; `None` when unknown.

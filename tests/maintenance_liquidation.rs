@@ -1,5 +1,5 @@
 //! Maintenance threshold and staged closeout fixtures (M3-04), hand
-//! calculated with `xynthex-linear-im/1` (im 10 %, mm 5 % of
+//! calculated with a single-tier `linear-im/1` rule (im 10 %, mm 5 % of
 //! `|Qc| * M * mark`), USDC at 6 decimals, fee rate 0.0005.
 //!
 //! Main fixture (`long_btc`): 10 BTC-PERP contracts long, M = 1, entry 100
@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 
 use margin_rs::initial_margin::{
-    ExposurePosition, ExposureView, InitialMarginModel, MarginRequirement, ProductKind,
+    ExposurePosition, ExposureView, InitialMarginModel, MarginRequirement, ProductKind, RuleId,
 };
 use margin_rs::ledger::{DerivativeSettlement, Execution, Ledger, Side};
 use margin_rs::liquidation::{
@@ -19,7 +19,7 @@ use margin_rs::liquidation::{
     LiquidationPolicy, LiquidityLevel, plan_liquidation,
 };
 use margin_rs::maintenance::{AccountState, CollateralView, StateReason, assess};
-use margin_rs::rules::TieredLinearIm;
+use margin_rs::rules::{MarginTier, TieredLinearIm};
 use margin_rs::valuation::{MarkSet, ValuationPolicy, value};
 use margin_rs::{
     AccountId, Asset, Decimal, ExecutionId, InstrumentId, MarginError, OrderId, SpotInstrument,
@@ -44,7 +44,17 @@ fn eid(id: &str) -> ExecutionId {
 }
 
 fn rule() -> TieredLinearIm {
-    TieredLinearIm::xynthex_v1(usdc(), 6).expect("rule")
+    TieredLinearIm::new(
+        RuleId::new("linear-im", 1),
+        usdc(),
+        6,
+        vec![MarginTier {
+            floor: Decimal::ZERO,
+            initial_rate: dec!(0.10),
+            maintenance_rate: dec!(0.05),
+        }],
+    )
+    .expect("rule")
 }
 
 fn perp(id: &str, contracts: Decimal, mark: Decimal) -> ExposurePosition {
@@ -61,7 +71,7 @@ fn perp(id: &str, contracts: Decimal, mark: Decimal) -> ExposurePosition {
 fn view(positions: Vec<ExposurePosition>) -> ExposureView {
     ExposureView {
         account: AccountId::new("acct").expect("id"),
-        venue: VenueId::new("xynthex").expect("id"),
+        venue: VenueId::new("venue").expect("id"),
         positions,
     }
 }
@@ -183,7 +193,7 @@ mod maintenance {
             assert_eq!(decision.excess, Some(excess));
             assert_eq!(decision.maintenance_shortfall, Some(shortfall));
             assert_eq!(decision.is_transition(), state != AccountState::Healthy);
-            assert_eq!(decision.rule.to_string(), "xynthex-linear-im/1");
+            assert_eq!(decision.rule.to_string(), "linear-im/1");
         }
         let below = assess(
             AccountState::Healthy,
@@ -665,13 +675,11 @@ mod plan {
     }
 }
 
-/// Review round 2 of #22: C1 (step arithmetic near the Decimal limits),
+/// Review round 2: C1 (step arithmetic near the Decimal limits),
 /// C2 (the feasible counts on a level are an interval that need not reach
 /// its end) and n1 (basis sign).
 mod review {
     use super::*;
-    use margin_rs::initial_margin::RuleId;
-    use margin_rs::rules::MarginTier;
 
     fn tiny(contracts: Decimal, basis: Decimal, cash: Decimal) -> LiquidationAccount {
         LiquidationAccount {
@@ -731,7 +739,7 @@ mod review {
         assert_eq!(short.outcome, CloseoutOutcome::LiquidityExhausted);
     }
 
-    /// C2 (MM-REVIEWER, flat xynthex-linear-im/1): A long 10 at 110 marked
+    /// C2 (single tier): A long 10 at 110 marked
     /// 100, B long 1 at 31 marked 100, cash 67: collateral 36 < mm 55.
     /// Selling n of A at 99: cash 67 - 11.0495n, collateral 36 - 1.0495n,
     /// mm 55 - 5n. The target holds for n in [5, 6]; closing all 10 would
@@ -765,7 +773,7 @@ mod review {
         assert_eq!(plan.debt, dec!(0));
     }
 
-    /// C2 (codex, two tiers): rates 10 % below a notional of 500 and 90 %
+    /// C2 (two tiers): rates 10 % below a notional of 500 and 90 %
     /// above. Long 10 at 100 marked 100, cash 140, bid 85: closing 4 gives
     /// collateral 80 < mm 140, closing 5 gives 65 >= 50.
     #[test]

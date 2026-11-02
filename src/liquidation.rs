@@ -2,16 +2,15 @@
 //!
 //! [`plan_liquidation`] simulates one closeout of an account's linear
 //! futures and perpetuals against supplied scenario liquidity, under one
-//! [`PiecewiseLinearMargin`] rule (for example `xynthex-linear-im/1` or any
+//! [`PiecewiseLinearMargin`] rule (any
 //! [`TieredLinearIm`](crate::rules::TieredLinearIm)), and returns a
 //! [`LiquidationPlan`]. It is a pure function: it books nothing and changes
 //! no state. There is no live liquidator.
 //!
 //! # Responsibilities
 //!
-//! Following Xynthex ADR 0009 (crosswalk X6), the venue core owns the
-//! trigger, the account state and the cancellation of resting orders;
-//! margin-rs owns the plan: what to close, in what order, how much, and
+//! When a venue keeps its own account state, it owns the trigger, that
+//! state and the cancellation of resting orders; margin-rs owns the plan: what to close, in what order, how much, and
 //! what is left. The [maintenance assessment](crate::maintenance) tells the
 //! core where the account stands; the plan tells it what to do. The cash a
 //! plan moves is posted, fill by fill, as
@@ -40,14 +39,14 @@
 //! # Target
 //!
 //! [`CloseoutTarget`] fixes when the closeout stops: collateral at least
-//! maintenance or initial margin, with `cash >= 0` (the exit condition of a
-//! Xynthex `Default`, economics 11.1), or every position closed. Equality
+//! maintenance or initial margin, with `cash >= 0` (the exit condition of
+//! [`AccountState::Default`](crate::maintenance::AccountState::Default)),
+//! or every position closed. Equality
 //! meets the target, as it does in [`crate::maintenance`].
 //!
 //! # Cash conventions
 //!
-//! From Xynthex `docs/design/economics.md` sections 10.3 and 10.4, at
-//! commit `c1b437b612b0a33610a3cbb777938c41fcdde331`, with `c` the rule's
+//! With `c` the rule's
 //! [`cash_scale`](PiecewiseLinearMargin::cash_scale) (so cash, PnL and
 //! margins share one quantum):
 //!

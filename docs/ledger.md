@@ -124,7 +124,7 @@ Futures and perpetual positions are not ledger positions: they are margined by `
 - the fee joins `fees_paid` and the realized PnL joins `settled_pnl`, so `Ledger::valuation`, `valuation::value` and its PnL attribution count it as realized PnL;
 - it is **idempotent by execution id**, and the id space is shared with spot executions: the same id booked again identically is a duplicate (`is_new == false`, nothing changes); the same id with other content, or already used by a spot execution, is `ConflictingEntry`;
 - the instrument must not be a registered spot instrument, and an id that has been settled cannot be registered later as one;
-- it is a **mandatory debit** (Xynthex economics 11.2, MM-codex E2): never rejected for lack of balance, deferred or reduced. A settlement that leaves the balance below its reservations, or negative, is booked in full and returns the `shortfall`; the debt stays visible in `overdrafts()` and in `reconcile()`.
+- it is a **mandatory debit**: never rejected for lack of balance, deferred or reduced. A settlement that leaves the balance below its reservations, or negative, is booked in full and returns the `shortfall`; the debt stays visible in `overdrafts()` and in `reconcile()`.
 
 `reconcile()` adds every settlement delta to its asset's total, its fee to `fees_paid` and its realized PnL to `settled_pnl`, and checks `delta = realized_pnl - fee` for each one.
 

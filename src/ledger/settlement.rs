@@ -6,9 +6,8 @@
 //! [`DerivativeSettlement`] is that cash movement: one signed amount in one
 //! asset, identified like a fill by its [`ExecutionId`].
 //!
-//! Settlements are mandatory debits in the sense of Xynthex economics 11.2
-//! (MM-codex E2): they are always booked in full, never rejected for lack of
-//! balance, deferred or reduced. A settlement that leaves an asset below its
+//! Settlements are mandatory debits: they are always booked in full, never
+//! rejected for lack of balance, deferred or reduced. A settlement that leaves an asset below its
 //! reservations (or negative) is booked and reports the shortfall, which
 //! then shows in [`Ledger::overdrafts`](crate::ledger::Ledger::overdrafts).
 
