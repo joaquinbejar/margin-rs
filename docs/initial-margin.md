@@ -31,6 +31,10 @@
 
 The rule is the tier table `[0, inf)` with rates 0.10 and 0.05.
 
+The identifier names exactly these rates. Section 11.2 calls 10 % and 5 % defaults, so a Xynthex run configured with other rates is a different rule. It must be built with `TieredLinearIm::new` and given its own `RuleId` or version, never `xynthex-linear-im/1`.
+
+Rounding up to the USDC scale is this crate's choice: section 11.2 does not state how Xynthex rounds. If Xynthex pins a different rounding, that is a new version of the rule.
+
 ## Tier tables
 
 `TieredLinearIm::new(rule_id, currency, scale, tiers)` builds the same formula over any tier table. The bands apply **progressively**: each rate covers the part of the notional inside its band, so a requirement is continuous at every boundary. Formally:

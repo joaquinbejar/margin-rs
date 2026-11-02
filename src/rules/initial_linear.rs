@@ -73,6 +73,11 @@ impl TieredLinearIm {
     /// maintenance 5 %. `usdc` is the settlement asset and `scale` its
     /// number of decimals.
     ///
+    /// The identifier names exactly these rates. A Xynthex run with other
+    /// `im_rate` or `mm_rate` values (economics.md 11.2 calls 10 % and 5 %
+    /// defaults) is a different rule: build it with [`TieredLinearIm::new`]
+    /// and its own [`RuleId`] or version, never with this one.
+    ///
     /// # Errors
     ///
     /// [`MarginError::InvalidInput`] if `scale` exceeds
