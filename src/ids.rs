@@ -94,6 +94,13 @@ string_id!(
 );
 
 string_id!(
+    /// Identifier of an order submitted through the
+    /// [`RiskGate`](crate::risk::RiskGate), unique within one gate.
+    OrderId,
+    "order_id"
+);
+
+string_id!(
     /// Identifier of a tradable instrument, for example `BTC-USDC`.
     InstrumentId,
     "instrument_id"

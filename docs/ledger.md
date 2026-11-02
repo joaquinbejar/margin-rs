@@ -27,6 +27,8 @@ Example: a buy of 1 BTC with a fee of 0.001 BTC gives a position of 1 and a BTC 
    - Transfers follow the same rule by `TransferId`.
 2. **Atomicity.** Every operation either applies completely or returns an error and leaves the ledger unchanged.
 3. **No overspending.** A booking, withdrawal or reservation that would leave an asset's available balance negative fails with `InsufficientBalance`.
+
+   The one exception is `book_execution_allowing_overdraft`, used for executions that already happened at a venue (M1-05). It books the execution anyway and returns the shortfall. The overdraft stays visible in `overdrafts()` and in the `Reconciliation` returned by `reconcile()` until the account is funded.
 4. **Precision.**
    - Each asset has a scale: its number of fractional digits, at most 18.
    - Each spot instrument has a price scale and a quantity scale, and the quantity scale may not exceed the base asset scale.

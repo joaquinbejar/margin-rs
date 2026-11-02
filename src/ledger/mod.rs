@@ -66,6 +66,7 @@ use std::collections::BTreeMap;
 use rust_decimal::Decimal;
 
 pub use execution::{Booking, Execution, ExecutionCashflow, Fee, Side};
+
 pub use snapshot::{BalanceSnapshot, LedgerSnapshot, PositionSnapshot};
 pub use valuation::{AssetPnl, PositionValuation, Valuation};
 
@@ -75,6 +76,32 @@ use crate::decimal::{
 use crate::error::{MarginError, Result};
 use crate::ids::{Asset, ExecutionId, InstrumentId, ReservationId, TransferId};
 use crate::instrument::Instrument;
+
+/// Result of [`Ledger::book_execution_allowing_overdraft`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverdraftBooking {
+    /// The booking, new or duplicate.
+    pub booking: Booking,
+    /// Assets this booking left below their reservations, with the
+    /// shortfall it created. Empty when the balance covered it.
+    pub shortfalls: BTreeMap<Asset, Decimal>,
+}
+
+/// Result of a successful [`Ledger::reconcile`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Reconciliation {
+    /// Assets below their reservations, with the shortfall. See
+    /// [`Ledger::overdrafts`].
+    pub overdrafts: BTreeMap<Asset, Decimal>,
+}
+
+impl Reconciliation {
+    /// True when no asset is overdrawn.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.overdrafts.is_empty()
+    }
+}
 
 /// Ledger configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -435,9 +462,78 @@ impl Ledger {
     ///   execution would end with a negative available balance.
     /// - [`MarginError::Arithmetic`]: overflow or a non exact intermediate.
     pub fn book_execution(&mut self, execution: &Execution) -> Result<Booking> {
+        self.book(execution, None, false)
+            .map(|(booking, _)| booking)
+    }
+
+    /// Books one execution that consumes an open reservation, in one atomic
+    /// step.
+    ///
+    /// The reservation `reservation` is shrunk to `remaining_reserved` (and
+    /// removed when that is zero) and the execution is booked against the
+    /// balance freed this way. A duplicate execution returns
+    /// [`Booking::Duplicate`] and leaves the reservation untouched, so a
+    /// repeated fill message adjusts the reservation exactly once.
+    ///
+    /// # Errors
+    ///
+    /// As [`Ledger::book_execution`], plus:
+    ///
+    /// - [`MarginError::UnknownReservation`] if the reservation is not open;
+    /// - [`MarginError::InvalidInput`] if `remaining_reserved` is negative or
+    ///   larger than the current reservation (a fill never grows it);
+    /// - [`MarginError::PrecisionExceeded`] if `remaining_reserved` is finer
+    ///   than the reserved asset scale.
+    pub fn book_execution_with_reservation(
+        &mut self,
+        execution: &Execution,
+        reservation: &ReservationId,
+        remaining_reserved: Decimal,
+    ) -> Result<Booking> {
+        self.book(execution, Some((reservation, remaining_reserved)), false)
+            .map(|(booking, _)| booking)
+    }
+
+    /// Books an execution that **already happened** at a venue, even if it
+    /// overdraws the account.
+    ///
+    /// Same rules as [`Ledger::book_execution_with_reservation`] (or
+    /// [`Ledger::book_execution`] when `reservation` is `None`), except that
+    /// a debit beyond the available balance is booked anyway: the balance
+    /// goes below its reservations or below zero, and the shortfall per
+    /// asset is returned. A real execution must never be lost; the caller
+    /// is expected to halt trading on a shortfall. Overdrafts stay visible
+    /// in [`Ledger::overdrafts`] and [`Ledger::reconcile`] until funds are
+    /// deposited.
+    ///
+    /// # Errors
+    ///
+    /// Every error of [`Ledger::book_execution_with_reservation`] except
+    /// [`MarginError::InsufficientBalance`].
+    pub fn book_execution_allowing_overdraft(
+        &mut self,
+        execution: &Execution,
+        reservation: Option<(&ReservationId, Decimal)>,
+    ) -> Result<OverdraftBooking> {
+        self.book(execution, reservation, true)
+            .map(|(booking, shortfalls)| OverdraftBooking {
+                booking,
+                shortfalls,
+            })
+    }
+
+    fn book(
+        &mut self,
+        execution: &Execution,
+        reservation: Option<(&ReservationId, Decimal)>,
+        allow_overdraft: bool,
+    ) -> Result<(Booking, BTreeMap<Asset, Decimal>)> {
         if let Some((previous, index)) = self.executions.get(&execution.id) {
             if previous == execution {
-                return Ok(Booking::Duplicate(self.journal[*index].clone()));
+                return Ok((
+                    Booking::Duplicate(self.journal[*index].clone()),
+                    BTreeMap::new(),
+                ));
             }
             return Err(MarginError::ConflictingEntry {
                 kind: "execution",
@@ -495,27 +591,63 @@ impl Ledger {
             accumulate(&mut deltas, &fee.asset, -fee.amount)?;
         }
 
-        let mut new_balances = Vec::with_capacity(deltas.len());
-        for (asset, delta) in &deltas {
+        // Reservation consumed by this execution: (id, asset, remaining,
+        // released).
+        let reservation_change = match reservation {
+            Some((id, remaining)) => {
+                let (asset, amount) = self
+                    .reservations
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| MarginError::UnknownReservation { id: id.to_string() })?;
+                if remaining < Decimal::ZERO || remaining > amount {
+                    return Err(MarginError::invalid_input(
+                        "remaining_reserved",
+                        "must be between zero and the current reservation",
+                    ));
+                }
+                check_scale(
+                    remaining,
+                    self.asset_scale_or_err(&asset)?,
+                    "remaining_reserved",
+                )?;
+                let released = sub(amount, remaining, "reservation - remaining")?;
+                Some((id.clone(), asset, remaining, released))
+            }
+            None => None,
+        };
+
+        let mut touched: Vec<&Asset> = deltas.keys().collect();
+        if let Some((_, asset, _, _)) = &reservation_change {
+            if !deltas.contains_key(asset) {
+                touched.push(asset);
+            }
+        }
+        let mut new_balances = Vec::with_capacity(touched.len());
+        let mut shortfalls = BTreeMap::new();
+        for asset in touched {
             let balance = self.balance_of(asset)?;
-            let total = add(balance.total, *delta, "balance + delta")?;
-            if *delta < Decimal::ZERO {
-                let available_after = sub(total, balance.reserved, "total - reserved")?;
-                if available_after < Decimal::ZERO {
+            let delta = deltas.get(asset).copied().unwrap_or_default();
+            let reserved = match &reservation_change {
+                Some((_, reserved_asset, _, released)) if reserved_asset == asset => {
+                    sub(balance.reserved, *released, "reserved - released")?
+                }
+                _ => balance.reserved,
+            };
+            let total = add(balance.total, delta, "balance + delta")?;
+            if delta < Decimal::ZERO {
+                let available_after = sub(total, reserved, "total - reserved")?;
+                if available_after < Decimal::ZERO && allow_overdraft {
+                    shortfalls.insert(asset.clone(), -available_after);
+                } else if available_after < Decimal::ZERO {
                     return Err(MarginError::InsufficientBalance {
                         asset: asset.clone(),
-                        required: -*delta,
-                        available: balance.available()?,
+                        required: -delta,
+                        available: sub(balance.total, reserved, "total - reserved")?,
                     });
                 }
             }
-            new_balances.push((
-                asset.clone(),
-                Balance {
-                    total,
-                    reserved: balance.reserved,
-                },
-            ));
+            new_balances.push((asset.clone(), Balance { total, reserved }));
         }
 
         let position = self
@@ -549,6 +681,13 @@ impl Ledger {
         if let Some((asset, total)) = new_fee_total {
             self.fees_paid.insert(asset, total);
         }
+        if let Some((id, asset, remaining, _)) = reservation_change {
+            if remaining.is_zero() {
+                self.reservations.remove(&id);
+            } else {
+                self.reservations.insert(id, (asset, remaining));
+            }
+        }
         let index = self.journal.len();
         let cashflow = ExecutionCashflow {
             execution_id: execution.id.clone(),
@@ -568,7 +707,7 @@ impl Ledger {
         self.journal.push(cashflow.clone());
         self.executions
             .insert(execution.id.clone(), (execution.clone(), index));
-        Ok(Booking::Booked(cashflow))
+        Ok((Booking::Booked(cashflow), shortfalls))
     }
 
     // ----- reads --------------------------------------------------------
@@ -579,8 +718,9 @@ impl Ledger {
         self.balances.get(asset).map(|b| BalanceSnapshot {
             total: b.total,
             reserved: b.reserved,
-            // Both terms are non negative and reserved <= total (checked on
-            // every write), so this difference cannot overflow.
+            // Both terms are far from the Decimal limits (they were computed
+            // exactly), so this difference cannot overflow. It is negative
+            // only after an overdraft.
             available: b.total - b.reserved,
         })
     }
@@ -728,6 +868,18 @@ impl Ledger {
         })
     }
 
+    /// Assets whose total balance is below their reservations, with the
+    /// shortfall (`reserved - total`). Empty unless a real execution was
+    /// booked with [`Ledger::book_execution_allowing_overdraft`].
+    #[must_use]
+    pub fn overdrafts(&self) -> BTreeMap<Asset, Decimal> {
+        self.balances
+            .iter()
+            .filter(|(_, b)| b.total < b.reserved)
+            .map(|(asset, b)| (asset.clone(), b.reserved - b.total))
+            .collect()
+    }
+
     /// Recomputes the state from the transfers and the execution journal and
     /// compares it with the stored state.
     ///
@@ -739,11 +891,16 @@ impl Ledger {
     /// that the quote cash exchanged by trades equals
     /// `realized_pnl - cost_basis` (cost is conserved exactly).
     ///
+    /// An overdraft (a balance below its reservations, after booking a real
+    /// execution with [`Ledger::book_execution_allowing_overdraft`]) is not
+    /// a mismatch: the sums still agree. It is reported in the returned
+    /// [`Reconciliation`].
+    ///
     /// # Errors
     ///
     /// [`MarginError::ReconciliationMismatch`] naming the first failed check,
     /// or [`MarginError::Arithmetic`] on overflow.
-    pub fn reconcile(&self) -> Result<()> {
+    pub fn reconcile(&self) -> Result<Reconciliation> {
         let mut totals: BTreeMap<&Asset, Decimal> = BTreeMap::new();
         let mut reserved: BTreeMap<&Asset, Decimal> = BTreeMap::new();
         let mut fees: BTreeMap<&Asset, Decimal> = BTreeMap::new();
@@ -787,12 +944,12 @@ impl Ledger {
                 expected,
                 balance.reserved,
             )?;
-            if balance.total < balance.reserved {
+            if balance.reserved < Decimal::ZERO {
                 return Err(MarginError::ReconciliationMismatch {
-                    check: "balance.total >= balance.reserved",
+                    check: "balance.reserved >= 0",
                     key: asset.to_string(),
-                    expected: balance.reserved,
-                    actual: balance.total,
+                    expected: Decimal::ZERO,
+                    actual: balance.reserved,
                 });
             }
             let expected = fees.get(asset).copied().unwrap_or_default();
@@ -820,7 +977,9 @@ impl Ledger {
                 actual,
             )?;
         }
-        Ok(())
+        Ok(Reconciliation {
+            overdrafts: self.overdrafts(),
+        })
     }
 }
 

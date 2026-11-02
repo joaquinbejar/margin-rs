@@ -4,21 +4,25 @@ Risk and margin engine for the Xynthex market making lab; usable standalone.
 
 ## Status
 
-M1-04: the single accounting ledger for one account. Pretrade risk checks
-and margin models are not implemented yet.
+M1-04: the single accounting ledger for one account. M1-05: the pretrade
+risk gate that every order passes through. Margin models are not
+implemented yet.
 
 | Export | Purpose |
 |---|---|
 | `ledger::Ledger` | Accounting authority: balances per asset (available and reserved), positions per instrument with signed average cost, fees per asset, idempotent booking by execution id, cashflow per execution, snapshots, reconciliation. |
 | `ledger::Valuation` | Mark to market by asset under an explicit policy; `net_in` is the only conversion between assets. |
+| `risk::RiskGate` | Pretrade gate that owns the ledger: reservations for every order, hard limits on the joint exposure of positions and live orders, typed `RiskDecision` (accepted, reduced, rejected), circuit breaker with quote withdrawal. |
+| `risk::InstrumentLimits`, `OrderRequest`, `RiskReason`, `HaltReason` | Limits, requests and typed reasons. |
 | `SpotInstrument`, `Instrument` | Instrument definitions (spot only). |
-| `Asset`, `ExecutionId`, `InstrumentId`, `TransferId`, `ReservationId` | Validated identifiers. |
+| `Asset`, `ExecutionId`, `InstrumentId`, `OrderId`, `TransferId`, `ReservationId` | Validated identifiers. |
 | `Rounding` | Rounding mode for the notional and the released cost. |
 | `MarginError`, `Result<T>` | Typed error boundary (`#[non_exhaustive]`). |
 | `Decimal` | Re-export of `rust_decimal::Decimal`. |
 
 The full contract, the rounding and valuation policies and the mapping from
-market-maker-rs are in [docs/ledger.md](docs/ledger.md).
+market-maker-rs are in [docs/ledger.md](docs/ledger.md); the gate's rules
+and its market-maker-rs mapping are in [docs/risk-gate.md](docs/risk-gate.md).
 
 ## Usage
 
@@ -50,7 +54,8 @@ fn main() -> margin_rs::Result<()> {
     ledger.book_execution(&buy)?; // duplicate: ignored
 
     assert_eq!(ledger.balance(&usdc).map(|b| b.total), Some(Decimal::new(7998, 1)));
-    ledger.reconcile()
+    assert!(ledger.reconcile()?.is_clean());
+    Ok(())
 }
 ```
 

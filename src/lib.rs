@@ -12,7 +12,14 @@
 //!   explicit mark to market policy.
 //! - [`MarginError`] and [`Result`]: the typed error boundary.
 //!
-//! Pretrade risk checks and margin models are not implemented yet.
+//! - [`risk`]: the pretrade risk gate. Every order passes through
+//!   [`risk::RiskGate::submit`], which reserves balance or inventory in the
+//!   ledger and enforces hard limits on the joint exposure of positions and
+//!   live orders, with typed accepted, reduced and rejected decisions, quote
+//!   withdrawal on a circuit breaker, and exactly once reservation updates
+//!   on fills, rejects and confirmed cancels.
+//!
+//! Margin models are not implemented yet.
 //!
 //! ## Policies
 //!
@@ -53,10 +60,11 @@ pub mod error;
 pub mod ids;
 pub mod instrument;
 pub mod ledger;
+pub mod risk;
 
 pub use decimal::Rounding;
 pub use error::{MarginError, Result};
-pub use ids::{Asset, ExecutionId, InstrumentId, ReservationId, TransferId};
+pub use ids::{Asset, ExecutionId, InstrumentId, OrderId, ReservationId, TransferId};
 pub use instrument::{Instrument, SpotInstrument};
 pub use rust_decimal::Decimal;
 
