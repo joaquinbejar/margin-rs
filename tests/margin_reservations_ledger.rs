@@ -21,7 +21,8 @@ use margin_rs::initial_margin::ProductKind;
 use margin_rs::instrument::{LinearPerpetual, LinearTerms};
 use margin_rs::ledger::{Action, Execution, Ledger};
 use margin_rs::margin_reservations::{
-    MarginDecision, MarginInstrument, MarginOrder, MarginRejection, MarginReservationService,
+    BookedFill, MarginDecision, MarginInstrument, MarginOrder, MarginRejection,
+    MarginReservationService,
 };
 use margin_rs::risk::RiskGate;
 use margin_rs::rules::TieredLinearIm;
@@ -209,8 +210,14 @@ fn own_and_ledger_positions_agree() {
         &mut gate,
         &execution("e2", "ABC-PERP", Action::Sell, dec!(2000), dec!(2)),
     );
-    assert_eq!(on.apply_booked_fill(&gate, &oid("a"), &eid("e1")), Ok(true));
-    assert_eq!(on.apply_booked_fill(&gate, &oid("b"), &eid("e2")), Ok(true));
+    assert!(matches!(
+        on.apply_booked_fill(&mut gate, &oid("a"), &eid("e1"), &marks()),
+        Ok(BookedFill::Applied { .. })
+    ));
+    assert!(matches!(
+        on.apply_booked_fill(&mut gate, &oid("b"), &eid("e2"), &marks()),
+        Ok(BookedFill::Applied { .. })
+    ));
     own.apply_fill(&oid("a"), eid("e1"), dec!(1)).expect("fill");
     own.apply_fill(&oid("b"), eid("e2"), dec!(2)).expect("fill");
     on.release_on_effective_cancel(&oid("a"));
@@ -459,11 +466,8 @@ fn own_hold_counts_once_and_foreign_holds_never() {
     );
 }
 
-/// Fills are booked first and reported by execution id: the contracts are
-/// the booking's, a replay changes nothing, an unbooked fill is an error,
-/// and the hold follows the ledger's position.
-#[test]
-fn booked_fills_move_only_the_remaining_quantity() {
+/// a = buy 3 XYZ, b = buy 1 ABC: hold 8000.
+fn two_orders() -> (RiskGate, Service) {
     let mut gate = gate();
     let mut service = on_ledger();
     reserve(
@@ -478,44 +482,84 @@ fn booked_fills_move_only_the_remaining_quantity() {
         order("b", "ABC-PERP", Action::Buy, dec!(1)),
         &marks(),
     );
+    (gate, service)
+}
+
+/// Fills are booked first and reported by execution id: the contracts are
+/// the booking's, a replay changes nothing, and an unbooked fill or a
+/// failed hold update changes nothing (the fill can be reported again).
+#[test]
+fn booked_fills_move_only_the_remaining_quantity() {
+    let (mut gate, mut service) = two_orders();
+    assert_eq!(gate.hold(&hold()), dec!(8000));
 
     assert_eq!(
-        service.apply_booked_fill(&gate, &oid("a"), &eid("e1")),
+        service.apply_booked_fill(&mut gate, &oid("a"), &eid("e1"), &marks()),
         Err(MarginError::FillNotBooked { id: "e1".into() })
     );
     assert_eq!(service.remaining(&oid("a")), Some(dec!(3)));
 
+    // e1: 2 XYZ. Without the XYZ mark the hold cannot be computed: nothing
+    // is recorded, and the same fill is reported again with the mark.
     book(
         &mut gate,
         &execution("e1", "XYZ-PERP", Action::Buy, dec!(2000), dec!(2)),
     );
+    let mut no_xyz = marks();
+    no_xyz.remove(&iid("XYZ-PERP"));
     assert_eq!(
-        service.apply_booked_fill(&gate, &oid("a"), &eid("e1")),
-        Ok(true)
+        service.apply_booked_fill(&mut gate, &oid("a"), &eid("e1"), &no_xyz),
+        Err(MarginError::MissingMark {
+            instrument: iid("XYZ-PERP"),
+        })
     );
-    assert_eq!(service.remaining(&oid("a")), Some(dec!(1)));
+    assert_eq!(service.remaining(&oid("a")), Some(dec!(3)));
+    assert_eq!(gate.hold(&hold()), dec!(8000));
+    // XYZ: position 2 + open 1 = 3 (6000); ABC: open 1 (2000).
+    assert_eq!(
+        service.apply_booked_fill(&mut gate, &oid("a"), &eid("e1"), &marks()),
+        Ok(BookedFill::Applied {
+            contracts: dec!(2),
+            remaining: dec!(1),
+            overfill: None,
+            required: dec!(8000),
+            hold: dec!(8000),
+        })
+    );
     // Replay: nothing moves twice.
     assert_eq!(
-        service.apply_booked_fill(&gate, &oid("a"), &eid("e1")),
-        Ok(false)
+        service.apply_booked_fill(&mut gate, &oid("a"), &eid("e1"), &marks()),
+        Ok(BookedFill::Duplicate)
     );
     assert_eq!(service.remaining(&oid("a")), Some(dec!(1)));
-    // The same execution for another order, or a booking that does not
-    // match the order, is a conflict.
-    let conflict = Err(MarginError::ConflictingEntry {
-        kind: "fill",
-        id: "e1".into(),
-    });
+}
+
+/// A booked fill that does not match the order, or an execution already
+/// reported for another order, is a conflict and changes nothing.
+#[test]
+fn mismatched_fills_are_conflicts() {
+    let (mut gate, mut service) = two_orders();
+    book(
+        &mut gate,
+        &execution("e1", "XYZ-PERP", Action::Buy, dec!(2000), dec!(2)),
+    );
+    assert!(matches!(
+        service.apply_booked_fill(&mut gate, &oid("a"), &eid("e1"), &marks()),
+        Ok(BookedFill::Applied { .. })
+    ));
     assert_eq!(
-        service.apply_booked_fill(&gate, &oid("b"), &eid("e1")),
-        conflict
+        service.apply_booked_fill(&mut gate, &oid("b"), &eid("e1"), &marks()),
+        Err(MarginError::ConflictingEntry {
+            kind: "fill",
+            id: "e1".into(),
+        })
     );
     book(
         &mut gate,
-        &execution("e2", "XYZ-PERP", Action::Buy, dec!(2000), dec!(1)),
+        &execution("e2", "XYZ-PERP", Action::Buy, dec!(2000), dec!(2)),
     );
     assert_eq!(
-        service.apply_booked_fill(&gate, &oid("b"), &eid("e2")),
+        service.apply_booked_fill(&mut gate, &oid("b"), &eid("e2"), &marks()),
         Err(MarginError::ConflictingEntry {
             kind: "fill",
             id: "e2".into(),
@@ -526,40 +570,88 @@ fn booked_fills_move_only_the_remaining_quantity() {
         &execution("e3", "XYZ-PERP", Action::Sell, dec!(2000), dec!(1)),
     );
     assert_eq!(
-        service.apply_booked_fill(&gate, &oid("a"), &eid("e3")),
+        service.apply_booked_fill(&mut gate, &oid("a"), &eid("e3"), &marks()),
         Err(MarginError::ConflictingEntry {
             kind: "fill",
             id: "e3".into(),
         })
     );
     assert_eq!(
-        service.apply_booked_fill(&gate, &oid("zzz"), &eid("e2")),
+        service.apply_booked_fill(&mut gate, &oid("zzz"), &eid("e2"), &marks()),
         Err(MarginError::UnknownOrder { id: "zzz".into() })
     );
-    // e2 belongs to a: an overfill closes it with nothing remaining.
+    assert_eq!(service.remaining(&oid("a")), Some(dec!(1)));
+    assert_eq!(service.remaining(&oid("b")), Some(dec!(1)));
+}
+
+/// Overfills and fills after the order closed are applied and flagged, and
+/// the hold follows the ledger's position.
+#[test]
+fn overfills_are_flagged() {
+    let (mut gate, mut service) = two_orders();
+    book(
+        &mut gate,
+        &execution("e1", "XYZ-PERP", Action::Buy, dec!(2000), dec!(2)),
+    );
+    book(
+        &mut gate,
+        &execution("e2", "XYZ-PERP", Action::Buy, dec!(2000), dec!(2)),
+    );
+    book(
+        &mut gate,
+        &execution("e3", "XYZ-PERP", Action::Sell, dec!(2000), dec!(1)),
+    );
+    assert!(matches!(
+        service.apply_booked_fill(&mut gate, &oid("a"), &eid("e1"), &marks()),
+        Ok(BookedFill::Applied { .. })
+    ));
+    // e2 (2 XYZ) on a, with 1 remaining: an overfill of 1, flagged. The
+    // ledger holds 2 + 2 - 1 = 3 XYZ (e3 is booked though not reported):
+    // 6000, plus b's 2000.
     assert_eq!(
-        service.apply_booked_fill(&gate, &oid("a"), &eid("e2")),
-        Ok(true)
+        service.apply_booked_fill(&mut gate, &oid("a"), &eid("e2"), &marks()),
+        Ok(BookedFill::Applied {
+            contracts: dec!(2),
+            remaining: dec!(0),
+            overfill: Some(dec!(1)),
+            required: dec!(8000),
+            hold: dec!(8000),
+        })
     );
     assert_eq!(service.remaining(&oid("a")), None);
-
-    // Ledger position: 2 + 1 - 1 = 2 XYZ (e3 was booked though not
-    // reported); b still pending 1 ABC. Requirement 4000 + 2000.
+    // A late fill on the closed order: all of it is an overfill. 4 XYZ
+    // (8000) plus b's 2000; the cash is 2000 available + 8000 held.
+    book(
+        &mut gate,
+        &execution("e4", "XYZ-PERP", Action::Buy, dec!(2000), dec!(1)),
+    );
+    assert_eq!(
+        service.apply_booked_fill(&mut gate, &oid("a"), &eid("e4"), &marks()),
+        Ok(BookedFill::Applied {
+            contracts: dec!(1),
+            remaining: dec!(0),
+            overfill: Some(dec!(1)),
+            required: dec!(10000),
+            hold: dec!(10000),
+        })
+    );
+    assert_eq!(gate.hold(&hold()), dec!(10000));
     assert_eq!(
         requirement(&service, &gate),
-        (dec!(4000), dec!(2000), dec!(6000))
+        (dec!(8000), dec!(2000), dec!(10000))
     );
     assert_eq!(
         service.sync_hold(&mut gate, &hold(), &marks()),
-        Ok(dec!(6000))
+        Ok(dec!(10000))
     );
     assert_eq!(service.position(&iid("XYZ-PERP")), None);
     gate.ledger().reconcile().expect("reconciles");
 }
 
-/// A mandatory fill is booked even when its fee overdraws the account;
-/// the service follows it: collateral is negative, risk increasing orders
-/// are rejected and a reducing one is accepted with a hold of zero.
+/// A mandatory fill is booked even when its fee overdraws the account,
+/// and reporting it never fails for lack of cash: the hold shrinks to
+/// what the cash covers (zero). Collateral is then negative, risk
+/// increasing orders are rejected and a reducing one is accepted.
 #[test]
 fn mandatory_fills_into_debt() {
     let mut gate = gate();
@@ -573,13 +665,21 @@ fn mandatory_fills_into_debt() {
     let costly =
         execution("e1", "XYZ-PERP", Action::Buy, dec!(2000), dec!(1)).with_fee(usdc(), dec!(12000));
     let booked = gate.book_derivative_execution(&costly).expect("booked");
+    // 8000 available against a fee of 12000.
     assert_eq!(booked.shortfalls, BTreeMap::from([(usdc(), dec!(4000))]));
+    // Cash: 10000 - 12000 = -2000, of which 2000 held: available -4000,
+    // available + hold = -2000, so the hold becomes 0.
     assert_eq!(
-        service.apply_booked_fill(&gate, &oid("a"), &eid("e1")),
-        Ok(true)
+        service.apply_booked_fill(&mut gate, &oid("a"), &eid("e1"), &marks()),
+        Ok(BookedFill::Applied {
+            contracts: dec!(1),
+            remaining: dec!(0),
+            overfill: None,
+            required: dec!(2000),
+            hold: dec!(0),
+        })
     );
-    // Cash: 10000 - 12000 = -2000; the hold of 2000 stays reserved, so
-    // available is -4000 and available + hold = -2000.
+    assert_eq!(gate.hold(&hold()), dec!(0));
     assert_eq!(
         reserve(
             &mut service,
@@ -605,6 +705,11 @@ fn mandatory_fills_into_debt() {
         MarginDecision::Reserved { .. }
     ));
     assert_eq!(gate.hold(&hold()), dec!(0));
+    // sync_hold reports the uncovered requirement instead of lowering it.
+    assert!(matches!(
+        service.sync_hold(&mut gate, &hold(), &marks()),
+        Err(MarginError::InsufficientBalance { .. })
+    ));
 }
 
 /// Each mode refuses the other's operations.
@@ -641,7 +746,7 @@ fn modes_are_explicit() {
     ));
     let mut own = standalone();
     assert_eq!(
-        own.apply_booked_fill(&gate, &oid("a"), &eid("e")),
+        own.apply_booked_fill(&mut gate, &oid("a"), &eid("e"), &marks()),
         Err(MarginError::WrongReservationMode {
             operation: "apply_booked_fill",
             mode: "own positions",

@@ -53,8 +53,9 @@
 //! - the caller books each fill first
 //!   ([`RiskGate::book_derivative_execution`], mandatory), then reports it
 //!   with [`MarginReservationService::apply_booked_fill`], which takes the
-//!   contracts from the booking and only moves the order's remaining
-//!   quantity; a fill that is not booked yet is
+//!   contracts from the booking, moves only the order's remaining quantity,
+//!   flags an overfill ([`BookedFill::Applied`]) and sets the hold, all in
+//!   one atomic step; a fill that is not booked yet is
 //!   [`MarginError::FillNotBooked`] and changes nothing;
 //! - the hold is the service's own [`ReservationId`], fixed at
 //!   construction;
@@ -176,6 +177,31 @@ pub enum MarginDecision {
     Rejected {
         /// Why.
         reason: MarginRejection,
+    },
+}
+
+/// Result of [`MarginReservationService::apply_booked_fill`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BookedFill {
+    /// The fill was already reported for this order: nothing changed.
+    Duplicate,
+    /// The fill was applied.
+    Applied {
+        /// Contracts of the booking.
+        contracts: Decimal,
+        /// Contracts of the order still live after the fill (zero when the
+        /// fill closed it).
+        remaining: Decimal,
+        /// Contracts beyond what was remaining (all of them for a fill
+        /// reported after the order closed): booked in the ledger and
+        /// flagged here, never refused. `None` when the fill fit.
+        overfill: Option<Decimal>,
+        /// Account requirement after the fill.
+        required: Decimal,
+        /// The service's hold after the fill: the requirement, capped at
+        /// the cash (`available + hold`, never negative). Below `required`
+        /// when the cash does not cover it.
+        hold: Decimal,
     },
 }
 
@@ -699,21 +725,27 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
     }
 
     /// Reports a fill of `order` already booked in `gate`'s ledger under
-    /// `execution`, for a service on the ledger. See
+    /// `execution`, for a service on the ledger, and sets the service's hold
+    /// to the new requirement. See
     /// [positions](self#positions-own-or-read-from-the-ledger).
     ///
-    /// The contracts are those of the booking; only the order's remaining
-    /// quantity moves (the position is the ledger's). Returns `false` for a
-    /// fill already reported for this order (nothing changes, so the
-    /// remaining quantity never moves twice). A fill larger than the
-    /// remaining quantity, or reported after the order closed, is accepted
-    /// and leaves nothing remaining. Call
-    /// [`MarginReservationService::sync_hold`] afterwards to follow the
-    /// new position.
+    /// The contracts are those of the booking; the order's remaining
+    /// quantity falls by them (the position is the ledger's). A fill larger
+    /// than the remaining quantity, or reported after the order closed, is
+    /// applied and its excess reported in [`BookedFill::Applied`]'s
+    /// `overfill`. The hold becomes the requirement at `marks`, capped at
+    /// the cash (`available + hold`, never negative), as in
+    /// [`MarginReservationService::reserve_with_gate`]: a real fill is
+    /// never refused for lack of cash, and an uncovered requirement shows as
+    /// `hold < required`.
+    ///
+    /// Atomic: the new remaining quantity and hold are computed first, and
+    /// the hold, the remaining quantity and the execution id are only
+    /// recorded together. On any error neither the service nor the hold
+    /// changes (the booking stays in the ledger), so the same execution can
+    /// be reported again, for example once a missing mark is supplied.
     ///
     /// # Errors
-    ///
-    /// Nothing changes on any error.
     ///
     /// - [`MarginError::WrongReservationMode`] for a service with its own
     ///   positions.
@@ -723,26 +755,31 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
     /// - [`MarginError::UnknownOrder`] if the order was never reserved.
     /// - [`MarginError::FillNotBooked`] if the ledger has no execution with
     ///   this id.
+    /// - The errors of [`MarginReservationService::requirement_with_gate`]
+    ///   (a missing mark among them) and of [`RiskGate::set_hold`].
     pub fn apply_booked_fill(
         &mut self,
-        gate: &RiskGate,
+        gate: &mut RiskGate,
         order: &OrderId,
         execution: &ExecutionId,
-    ) -> Result<bool> {
-        if let Mode::Own(_) = self.mode {
+        marks: &BTreeMap<InstrumentId, Decimal>,
+    ) -> Result<BookedFill> {
+        let Mode::OnLedger(hold) = &self.mode else {
             return Err(self.wrong_mode("apply_booked_fill"));
-        }
+        };
+        let hold = hold.clone();
         let conflict = || MarginError::ConflictingEntry {
             kind: "fill",
             id: execution.to_string(),
         };
         if let Some((seen_order, _)) = self.fills.get(execution) {
             if seen_order == order {
-                return Ok(false);
+                return Ok(BookedFill::Duplicate);
             }
             return Err(conflict());
         }
         let pending = self.pending(order)?;
+        let snapshot = gate.ledger().snapshot();
         let booked = gate.ledger().execution_cashflow(execution).ok_or_else(|| {
             MarginError::FillNotBooked {
                 id: execution.to_string(),
@@ -752,9 +789,34 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
             return Err(conflict());
         }
         let contracts = booked.quantity;
-        let remaining = sub(pending.remaining, contracts, "remaining - fill")?.max(Decimal::ZERO);
+        let left = sub(pending.remaining, contracts, "remaining - fill")?;
+        let (remaining, overfill) = if left < Decimal::ZERO {
+            (Decimal::ZERO, Some(neg(left)))
+        } else {
+            (left, None)
+        };
+        // The order book with the fill, then the requirement and the hold
+        // it implies, all before anything is recorded.
+        let mut orders = self.orders.clone();
+        if remaining.is_zero() {
+            orders.remove(order);
+        } else if let Some(entry) = orders.get_mut(order) {
+            entry.remaining = remaining;
+        }
+        let currency = self.settlement()?;
+        let positions = self.positions_in(&snapshot)?;
+        let required = self.state(&orders, &positions, marks)?.total;
+        let cash = Self::cash_collateral_of(&snapshot, &hold, &currency)?;
+        let new_hold = required.min(cash.max(Decimal::ZERO));
+        gate.set_hold(&hold, currency, new_hold)?;
         self.commit_fill(order, execution.clone(), contracts, remaining);
-        Ok(true)
+        Ok(BookedFill::Applied {
+            contracts,
+            remaining,
+            overfill,
+            required,
+            hold: new_hold,
+        })
     }
 
     /// Settlement asset of the registered instruments.
@@ -842,19 +904,13 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
         Ok(decision)
     }
 
-    /// The cash collateral (`available + own hold` in `currency`) and, on
-    /// the ledger, the unrealized PnL terms of every open linear future or
-    /// perpetual settled in `currency` (market value, then minus basis, so
-    /// the caller sums them with the cash once), or the instrument whose
-    /// mark is missing. A service with its own positions counts no
-    /// unrealized PnL.
-    fn gate_collateral(
-        &self,
+    /// `available + own hold` in `currency`: the cash collateral, the
+    /// service's own hold counted once and no other.
+    fn cash_collateral_of(
         snapshot: &LedgerSnapshot,
         hold: &ReservationId,
         currency: &Asset,
-        marks: &BTreeMap<InstrumentId, Decimal>,
-    ) -> Result<(Decimal, core::result::Result<Vec<Decimal>, InstrumentId>)> {
+    ) -> Result<Decimal> {
         let available = snapshot
             .balances
             .get(currency)
@@ -870,7 +926,23 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
                 });
             }
         };
-        let cash = add(available, own, "available + hold")?;
+        add(available, own, "available + hold")
+    }
+
+    /// The cash collateral (`available + own hold` in `currency`) and, on
+    /// the ledger, the unrealized PnL terms of every open linear future or
+    /// perpetual settled in `currency` (market value, then minus basis, so
+    /// the caller sums them with the cash once), or the instrument whose
+    /// mark is missing. A service with its own positions counts no
+    /// unrealized PnL.
+    fn gate_collateral(
+        &self,
+        snapshot: &LedgerSnapshot,
+        hold: &ReservationId,
+        currency: &Asset,
+        marks: &BTreeMap<InstrumentId, Decimal>,
+    ) -> Result<(Decimal, core::result::Result<Vec<Decimal>, InstrumentId>)> {
+        let cash = Self::cash_collateral_of(snapshot, hold, currency)?;
         if let Mode::Own(_) = self.mode {
             return Ok((cash, Ok(Vec::new())));
         }

@@ -56,7 +56,7 @@ Fills are idempotent by execution id. Reusing an id with another order or quanti
 | Call | Effect |
 |---|---|
 | `reserve_with_gate(order, &mut gate, &hold, marks)` | As above, with the positions of the ledger and `collateral = available + own hold + sum(upnl)` in the settlement asset, one exact sum. `hold` must be the service's own |
-| `apply_booked_fill(&gate, order, execution_id)` | The fill must already be booked in the gate's ledger; its contracts are the booking's. Only the order's remaining quantity moves |
+| `apply_booked_fill(&mut gate, order, execution_id, marks)` | The fill must already be booked in the gate's ledger; its contracts are the booking's. Only the order's remaining quantity moves, and the hold is set to the new requirement capped at the cash. Returns `BookedFill` |
 | `sync_hold(&mut gate, &hold, marks)` | The hold follows the ledger's positions |
 | `requirement_with_gate(&gate, marks)` | The requirement, positions read from the ledger |
 
@@ -69,9 +69,11 @@ Fills are idempotent by execution id. Reusing an id with another order or quanti
 - not booked yet: `FillNotBooked`, nothing changes;
 - reported again for the same order: `Ok(false)`, nothing changes, so the remaining quantity never moves twice;
 - reported for another order, or booked with another instrument or side than the order: `ConflictingEntry`;
-- otherwise the remaining quantity falls by the booked contracts (an overfill closes the order).
+- otherwise `BookedFill::Applied { contracts, remaining, overfill, required, hold }`. The remaining quantity falls by the booked contracts. Contracts beyond what was remaining (all of them for a fill reported after the order closed) are reported in `overfill`: the fill is booked and flagged, never refused.
 
-The hold is then synced with `sync_hold`, which reads the position the ledger already holds, so it never follows a stale position.
+The new remaining quantity, the requirement (positions read from the ledger, which already holds the fill, so never stale) and the hold are computed first; the hold, the remaining quantity and the execution id are then recorded together. On any error, a missing mark for example, neither the service nor the hold changes and the same execution can be reported again.
+
+The hold after a fill is `min(required, max(available + own hold, 0))`, as on admission: a real fill is never refused for lack of cash, and an uncovered requirement shows as `hold < required`. `sync_hold` keeps its stricter contract and reports an uncovered requirement as an error.
 
 **Registry.** Every registered instrument must be a linear future or perpetual of the ledger with the same product, settlement asset and multiplier (`UnknownInstrument`, `InvalidInput` or `CurrencyMismatch` otherwise).
 

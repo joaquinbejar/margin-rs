@@ -18,7 +18,8 @@ follows [Semantic Versioning](https://semver.org/).
   `MarginReservationService::on_ledger` reads positions from the gate's
   ledger, counts the unrealized PnL of every open derivative in the
   settlement asset as collateral, uses its own fixed hold, and takes fills
-  already booked (`apply_booked_fill`, `requirement_with_gate`).
+  already booked (`apply_booked_fill`, which flags overfills and sets the
+  hold atomically, returning `BookedFill`; `requirement_with_gate`).
   `RiskGate::book_derivative_execution`, `RiskGate::book_funding` and
   `RiskGate::settle_expiry` post derivative executions, funding and expiries
   through the gate. New errors: `MarginError::FillNotBooked` and
