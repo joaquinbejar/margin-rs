@@ -154,10 +154,10 @@ impl Balance {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-struct Position {
-    quantity: Decimal,
-    cost_basis: Decimal,
-    realized_pnl: Decimal,
+pub(crate) struct Position {
+    pub(crate) quantity: Decimal,
+    pub(crate) cost_basis: Decimal,
+    pub(crate) realized_pnl: Decimal,
 }
 
 /// The accounting authority for one account. See the [module docs](self).
@@ -171,6 +171,7 @@ pub struct Ledger {
     fees_paid: BTreeMap<Asset, Decimal>,
     reservations: BTreeMap<ReservationId, (Asset, Decimal)>,
     transfers: BTreeMap<TransferId, Transfer>,
+    net_transfers: BTreeMap<Asset, Decimal>,
     executions: BTreeMap<ExecutionId, (Execution, usize)>,
     journal: Vec<ExecutionCashflow>,
 }
@@ -214,6 +215,7 @@ impl Ledger {
             None => {
                 self.assets.insert(asset.clone(), scale);
                 self.balances.insert(asset.clone(), Balance::default());
+                self.net_transfers.insert(asset.clone(), Decimal::ZERO);
                 self.fees_paid.insert(asset, Decimal::ZERO);
                 Ok(())
             }
@@ -358,6 +360,12 @@ impl Ledger {
                 });
             }
         }
+        let net = self
+            .net_transfers
+            .get(&transfer.asset)
+            .copied()
+            .unwrap_or_default();
+        let net = add(net, transfer.signed_amount(), "net transfers")?;
         self.balances.insert(
             transfer.asset.clone(),
             Balance {
@@ -365,6 +373,7 @@ impl Ledger {
                 reserved: balance.reserved,
             },
         );
+        self.net_transfers.insert(transfer.asset.clone(), net);
         self.transfers.insert(transfer.id.clone(), transfer);
         Ok(true)
     }
@@ -762,6 +771,9 @@ impl Ledger {
     #[must_use]
     pub fn snapshot(&self) -> LedgerSnapshot {
         LedgerSnapshot {
+            assets: self.assets.clone(),
+            instruments: self.instruments.clone(),
+            net_transfers: self.net_transfers.clone(),
             balances: self
                 .balances
                 .keys()
@@ -907,8 +919,11 @@ impl Ledger {
         let mut quantities: BTreeMap<&InstrumentId, Decimal> = BTreeMap::new();
         let mut trade_cash: BTreeMap<&InstrumentId, Decimal> = BTreeMap::new();
 
+        let mut transfer_sums: BTreeMap<&Asset, Decimal> = BTreeMap::new();
         for transfer in self.transfers.values() {
             let entry = totals.entry(&transfer.asset).or_default();
+            *entry = add(*entry, transfer.signed_amount(), "reconcile transfers")?;
+            let entry = transfer_sums.entry(&transfer.asset).or_default();
             *entry = add(*entry, transfer.signed_amount(), "reconcile transfers")?;
         }
         for (asset, amount) in self.reservations.values() {
@@ -955,6 +970,9 @@ impl Ledger {
             let expected = fees.get(asset).copied().unwrap_or_default();
             let actual = self.fees_paid.get(asset).copied().unwrap_or_default();
             mismatch("fees_paid", asset.as_str(), expected, actual)?;
+            let expected = transfer_sums.get(asset).copied().unwrap_or_default();
+            let actual = self.net_transfers.get(asset).copied().unwrap_or_default();
+            mismatch("net_transfers", asset.as_str(), expected, actual)?;
         }
         for (id, position) in &self.positions {
             let expected = quantities.get(id).copied().unwrap_or_default();
@@ -1031,7 +1049,7 @@ fn position_snapshot(
 /// - Crossing zero: the closing part is valued at `round(price * |q|)` and
 ///   the rest of the fill's rounded notional opens the new position, so the
 ///   cash of the fill is split without loss.
-fn apply_fill(
+pub(crate) fn apply_fill(
     position: Position,
     signed_quantity: Decimal,
     signed_value: Decimal,

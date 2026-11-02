@@ -10,14 +10,19 @@
 //!   signed average cost, fees per asset, idempotent booking by execution
 //!   identifier, per execution cashflow reconciliation, snapshots and an
 //!   explicit mark to market policy.
-//! - [`MarginError`] and [`Result`]: the typed error boundary.
-//!
 //! - [`risk`]: the pretrade risk gate. Every order passes through
 //!   [`risk::RiskGate::submit`], which reserves balance or inventory in the
 //!   ledger and enforces hard limits on the joint exposure of positions and
 //!   live orders, with typed accepted, reduced and rejected decisions, quote
 //!   withdrawal on a circuit breaker, and exactly once reservation updates
 //!   on fills, rejects and confirmed cancels.
+//! - [`valuation`]: account mark to market in one reporting asset over an
+//!   immutable ledger snapshot, with price source and freshness flags,
+//!   collateral equity that invalid marks cannot raise, and PnL with fees
+//!   counted once.
+//! - [`scenarios`]: spot inventory stress (hypothetical fills such as
+//!   hedges, price gaps and liquidation spread).
+//! - [`MarginError`] and [`Result`]: the typed error boundary.
 //!
 //! Margin models are not implemented yet.
 //!
@@ -61,6 +66,8 @@ pub mod ids;
 pub mod instrument;
 pub mod ledger;
 pub mod risk;
+pub mod scenarios;
+pub mod valuation;
 
 pub use decimal::Rounding;
 pub use error::{MarginError, Result};

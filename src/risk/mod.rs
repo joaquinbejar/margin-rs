@@ -295,11 +295,12 @@ pub struct OrderRecord {
 }
 
 impl OrderRecord {
-    /// Quantity still open.
+    /// Quantity still open: zero once filled, and never negative, even
+    /// after an overfill (where `filled > quantity`).
     #[must_use]
     pub fn remaining(&self) -> Decimal {
-        // filled <= quantity is enforced on every fill.
-        self.quantity - self.filled
+        // Both are small exact quantities, so the difference cannot overflow.
+        (self.quantity - self.filled).max(Decimal::ZERO)
     }
 
     fn reservation_id(&self) -> Result<ReservationId> {
@@ -333,7 +334,7 @@ pub struct RiskGate {
     limits: BTreeMap<InstrumentId, InstrumentLimits>,
     marks: BTreeMap<InstrumentId, (Decimal, u64)>,
     orders: BTreeMap<OrderId, OrderRecord>,
-    halt: Option<HaltReason>,
+    halts: Vec<HaltReason>,
 }
 
 impl RiskGate {
@@ -346,7 +347,7 @@ impl RiskGate {
             limits: BTreeMap::new(),
             marks: BTreeMap::new(),
             orders: BTreeMap::new(),
-            halt: None,
+            halts: Vec::new(),
         }
     }
 
@@ -425,10 +426,31 @@ impl RiskGate {
         Ok(())
     }
 
-    /// Current halt, if any.
+    /// Current halt, if any: the most severe reason recorded since the last
+    /// [`RiskGate::resume`] (see [`HaltReason::severity`]); among equally
+    /// severe reasons, the first one.
     #[must_use]
     pub fn halted(&self) -> Option<HaltReason> {
-        self.halt.clone()
+        let mut most: Option<&HaltReason> = None;
+        for reason in &self.halts {
+            if most.is_none_or(|m| reason.severity() > m.severity()) {
+                most = Some(reason);
+            }
+        }
+        most.cloned()
+    }
+
+    /// Every halt reason recorded since the last [`RiskGate::resume`], in
+    /// the order they happened.
+    #[must_use]
+    pub fn halt_reasons(&self) -> &[HaltReason] {
+        &self.halts
+    }
+
+    fn record_halt(&mut self, reason: HaltReason) {
+        if !self.halts.contains(&reason) {
+            self.halts.push(reason);
+        }
     }
 
     /// An order known to the gate.
@@ -495,10 +517,8 @@ impl RiskGate {
 
     fn decide(&self, request: &OrderRequest, now_ms: u64) -> RiskDecision {
         let mut reasons = Vec::new();
-        if let Some(reason) = &self.halt {
-            reasons.push(RiskReason::Halted {
-                reason: reason.clone(),
-            });
+        if let Some(reason) = self.halted() {
+            reasons.push(RiskReason::Halted { reason });
         }
         let Ok(spot) = self.spot(&request.instrument) else {
             reasons.push(RiskReason::UnknownInstrument);
@@ -1046,14 +1066,16 @@ impl RiskGate {
             reservation.map(|amount| (&reservation_id, amount)),
         )?;
 
+        // Both are recorded when both happen; halted() reports the more
+        // severe one (the accounting breach).
         if let Some(anomaly) = anomalies.first() {
-            self.halt.get_or_insert(HaltReason::ExecutionAnomaly {
+            self.record_halt(HaltReason::ExecutionAnomaly {
                 order: id.clone(),
                 anomaly: anomaly.clone(),
             });
         }
         if !booked.shortfalls.is_empty() {
-            self.halt.get_or_insert(HaltReason::AccountingBreach);
+            self.record_halt(HaltReason::AccountingBreach);
         }
         if let Some(record) = self.orders.get_mut(id) {
             record.filled = filled_after;
@@ -1074,10 +1096,11 @@ impl RiskGate {
     ///
     /// Returns the live orders that had no cancel pending; they are now
     /// [`OrderState::CancelPending`] and the caller must send their cancels.
-    /// Calling it again while halted returns no orders and keeps the first
-    /// reason.
+    /// Calling it again while halted returns no orders; the reason is added
+    /// to [`RiskGate::halt_reasons`] and [`RiskGate::halted`] reports the
+    /// most severe one.
     pub fn trip(&mut self, reason: HaltReason) -> Vec<OrderId> {
-        self.halt.get_or_insert(reason);
+        self.record_halt(reason);
         let to_cancel: Vec<OrderId> = self
             .orders
             .values()
@@ -1090,9 +1113,9 @@ impl RiskGate {
         to_cancel
     }
 
-    /// Lifts the halt.
+    /// Lifts the halt and clears every recorded reason.
     pub fn resume(&mut self) {
-        self.halt = None;
+        self.halts.clear();
     }
 }
 

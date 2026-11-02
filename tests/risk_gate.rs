@@ -1055,3 +1055,45 @@ fn no_fragmentation_exceeds_the_reservation() {
         gate.ledger().reconcile().expect("reconciles");
     }
 }
+
+/// When one fill is both an anomaly and an overdraft, both reasons are
+/// recorded and the more severe one, the accounting breach, is reported.
+///
+/// 100 USDC, buy 1 at 100 (100 reserved). The venue fills 2: debit 200,
+/// balance -100.
+#[test]
+fn anomaly_and_overdraft_are_both_recorded() {
+    let mut gate = gate(dec!(100), dec!(0), InstrumentLimits::default());
+    gate.submit(&buy("o1", dec!(100), dec!(1)), 0);
+    let outcome = gate
+        .on_fill(
+            &oid("o1"),
+            &report(fill("e1", Side::Buy, dec!(100), dec!(2)), dec!(2)),
+        )
+        .expect("booked");
+    let overfill = ExecutionAnomaly::Overfill {
+        remaining: dec!(1),
+        quantity: dec!(2),
+    };
+    assert_eq!(outcome.anomalies, vec![overfill.clone()]);
+    assert_eq!(
+        outcome.shortfalls,
+        BTreeMap::from([(asset("USDC"), dec!(100))])
+    );
+    assert_eq!(balance(&gate, "USDC"), (dec!(-100), dec!(0), dec!(-100)));
+    assert_eq!(gate.halted(), Some(HaltReason::AccountingBreach));
+    assert_eq!(
+        gate.halt_reasons(),
+        &[
+            HaltReason::ExecutionAnomaly {
+                order: oid("o1"),
+                anomaly: overfill,
+            },
+            HaltReason::AccountingBreach,
+        ]
+    );
+    assert_eq!(gate.order(&oid("o1")).map(|o| o.remaining()), Some(dec!(0)));
+    gate.resume();
+    assert_eq!(gate.halted(), None);
+    assert!(gate.halt_reasons().is_empty());
+}
