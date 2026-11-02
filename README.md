@@ -68,8 +68,10 @@ rounding, and no partial sum that can overflow while the result does not.
   and perpetuals are valued at instrument marks, and collateral counts
   `cash + sum(upnl)` per settlement asset as one net amount.
 - **PnL attribution** into realized, unrealized and fees, counted once.
-- **Spot inventory stress**: hypothetical fills (hedges), price gaps and a
-  liquidation spread.
+- **Stress** of spot inventory and open futures and perpetuals:
+  hypothetical fills (hedges, spot or derivative), asset and instrument
+  shocks and a liquidation spread, from the baseline marks, which are never
+  changed.
 
 ### Margin
 - **Versioned margin rules**: `TieredLinearIm` with progressive tiers, and
@@ -98,7 +100,7 @@ rounding, and no partial sum that can overflow while the result does not.
 | `ledger` | `Ledger`: balances, spot and derivative positions, fees, idempotent booking, funding, expiry, cashflows, snapshots, reconciliation, valuation by asset, legacy derivative settlements. |
 | `risk` | `RiskGate`: pretrade gate, reservations, hard limits, typed decisions, circuit breaker and quote withdrawal. |
 | `valuation` | Account mark to market in one reporting asset over a `LedgerSnapshot`, PnL attribution, collateral equity. |
-| `scenarios` | Spot inventory stress. |
+| `scenarios` | Stress of spot inventory and open futures and perpetuals. |
 | `initial_margin`, `rules` | `InitialMarginModel`, `PiecewiseLinearMargin` and `TieredLinearIm` (`linear-im/1`). |
 | `factors`, `covariance` | Factor exposures with units and portfolio variance. |
 | `collateral` | Collateral value with haircuts and a stale price policy. |

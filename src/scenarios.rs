@@ -1,48 +1,92 @@
-//! Spot inventory stress scenarios.
+//! Stress scenarios for spot inventory and open linear futures and
+//! perpetuals.
 //!
 //! [`stress`] revalues a [`LedgerSnapshot`] under a [`Scenario`] and
-//! compares it with the unstressed valuation. A scenario is applied in this
-//! order:
+//! compares it with the unstressed valuation. It never changes the
+//! snapshot, the marks or the ledger: it values a stressed copy of each. A
+//! scenario is applied in this order:
 //!
 //! 1. **Hypothetical fills** ([`Scenario::fill`]), for example hedges that
 //!    are expected to execute, are applied to a copy of the snapshot with
-//!    the ledger's booking rules (notional rounded once to the quote scale,
-//!    fee debited once from its asset, average cost positions). Balances are
-//!    not checked: a hypothetical fill may overdraw. Leaving a fill out of
-//!    the scenario models a failed hedge.
-//! 2. **Gaps** ([`Scenario::shock`]): the price of an asset is multiplied
-//!    by `1 + shock` (for example `-0.2` for a 20 % fall). Shocks are
-//!    applied exactly; the shock must be greater than -1.
-//! 3. **Liquidation spread** ([`Scenario::spread`]): every non reporting
-//!    asset with a positive balance is valued at `price * (1 - spread)`, the
-//!    proceeds of selling it across half the bid ask spread, and every one
-//!    with a negative balance (a debt) at `price * (1 + spread)`, the cost of
-//!    buying it back.
+//!    the ledger's booking rules. A spot fill exchanges its notional
+//!    (rounded once to the quote scale) for the base asset, with average
+//!    cost positions. A linear future or perpetual fill follows the
+//!    derivative booking of [`ledger`](crate::ledger) (half-even, only the
+//!    realized PnL moves cash), at the valuation time `marks.as_of_ms`: a
+//!    future at or past its expiry, or already settled, cannot take one. A
+//!    fee is debited once from its asset. Balances are not checked: a
+//!    hypothetical fill may overdraw, and it reserves nothing. Leaving a
+//!    fill out of the scenario models a failed hedge.
+//! 2. **Instrument shocks** ([`Scenario::instrument_shock`]): the mark of a
+//!    derivative is multiplied by `1 + shock`. Instrument shocks are not
+//!    linked to asset shocks (the instrument terms do not name an
+//!    underlying): a scenario that moves an asset and the derivatives on it
+//!    shocks both. Open derivatives without a shock are listed in
+//!    [`StressResult::unshocked_instruments`].
+//! 3. **Asset shocks** ([`Scenario::shock`]): the price of an asset is
+//!    multiplied by `1 + shock` (for example `-0.2` for a 20 % fall).
+//! 4. **Liquidation spread** ([`Scenario::spread`]), the cost of closing
+//!    across half the bid ask spread:
+//!    - an open derivative is valued at `mark * (1 - spread)` when long and
+//!      `mark * (1 + spread)` when short, by its contracts after the fills;
+//!    - a non reporting asset is valued at `price * (1 - spread)` when the
+//!      amount collateral counts for it is positive, and at
+//!      `price * (1 + spread)` when it is negative (a debt). That amount is
+//!      its balance plus the unrealized PnL of the derivatives settled in
+//!      it at valid instrument marks, the netting of
+//!      [`AccountValuation::collateral_equity`]. When a loss is at an
+//!      invalid instrument mark, collateral is unknown and the sign of the
+//!      balance plus all of that PnL is used. When that full net and the
+//!      counted one have different signs, collateral is valued
+//!      conservatively and reporting equity is not: the asset is listed in
+//!      [`StressResult::spread_sign_conflicts`].
 //!
-//! All parameters are validated first: shocks must name a registered, non
-//! reporting asset and be greater than -1, and the spread must be in
+//! Inverse futures and perpetuals are valued but not stressed yet: an open
+//! inverse position, a shock on one or a hypothetical fill on one is
+//! [`MarginError::UnsupportedInstrument`].
+//!
+//! Every stressed price, `price * (1 + shock) * (1 +- spread)`, is one exact
+//! product converted once: only the stressed price must be representable.
+//! Shocks are applied exactly and must be greater than -1. The stressed
+//! instrument marks are final before the asset factors are chosen, so the
+//! order has no cycle: the derivative values that choose them are the ones
+//! the stressed valuation reports.
+//!
+//! All parameters are validated first: asset shocks must name a registered,
+//! non reporting asset, instrument shocks a registered linear future or
+//! perpetual, both must be greater than -1, and the spread must be in
 //! `[0, 1)`. A shock on an asset without a mark has no effect and is listed
-//! in [`StressResult::ignored_shocks`]. Hypothetical fills follow the input
-//! rules of [`Ledger::book_execution`](crate::ledger::Ledger::book_execution)
+//! in [`StressResult::ignored_shocks`]; a shock on a derivative that is flat
+//! after the fills, in [`StressResult::ignored_instrument_shocks`].
+//! Hypothetical fills follow the input rules of
+//! [`Ledger::book_execution`](crate::ledger::Ledger::book_execution)
 //! (positive price and quantity within the instrument scales, fee within its
 //! asset scale).
 //!
 //! The stressed snapshot is then valued with [`value`] under the same
-//! policy, so invalid marks stay invalid: a held asset with an invalid mark
-//! adds nothing to collateral, and a debt with one makes collateral unknown
-//! (or, under the stale haircut policy, counts at `price * (1 + haircut)`).
+//! policy, so invalid marks stay invalid: a stressed mark keeps its time and
+//! source. A held asset with an invalid mark adds nothing to collateral, and
+//! a debt with one makes collateral unknown (or, under the stale haircut
+//! policy, counts at `price * (1 + haircut)`); a derivative gain at an
+//! invalid instrument mark is not counted, and a loss there makes collateral
+//! unknown.
 
 use std::collections::BTreeMap;
 
 use rust_decimal::Decimal;
 
-use crate::decimal::{Rounding, add, check_scale, mul_div_round, neg, product, sub, sum};
+use core::cmp::Ordering;
+
+use crate::decimal::{Rounding, add, check_scale, mul_div_round, neg, product, sub, sum, sum_sign};
 use crate::direction::Dir;
 use crate::error::{MarginError, Result};
 use crate::ids::{Asset, InstrumentId};
-use crate::instrument::Instrument;
+use crate::instrument::{ContractSize, Instrument, LinearTerms, SpotInstrument};
+use crate::ledger::derivative::apply_derivative_fill;
 use crate::ledger::{Action, Fee, LedgerSnapshot, Position, apply_fill};
-use crate::valuation::{AccountValuation, MarkSet, ValuationPolicy, value};
+use crate::valuation::{
+    AccountValuation, MarkSet, ValuationPolicy, collateral_upnl, derivative_values, value,
+};
 
 /// A fill assumed to happen in a scenario.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +110,8 @@ pub struct Scenario {
     pub name: String,
     /// Relative price change per asset.
     pub shocks: BTreeMap<Asset, Decimal>,
+    /// Relative mark change per linear future or perpetual.
+    pub instrument_shocks: BTreeMap<InstrumentId, Decimal>,
     /// Fraction of value lost when liquidating non reporting assets.
     pub liquidation_spread: Decimal,
     /// Fills applied before the shocks.
@@ -86,6 +132,14 @@ impl Scenario {
     #[must_use]
     pub fn shock(mut self, asset: Asset, relative: Decimal) -> Self {
         self.shocks.insert(asset, relative);
+        self
+    }
+
+    /// Adds a relative mark shock for the linear future or perpetual
+    /// `instrument`.
+    #[must_use]
+    pub fn instrument_shock(mut self, instrument: InstrumentId, relative: Decimal) -> Self {
+        self.instrument_shocks.insert(instrument, relative);
         self
     }
 
@@ -120,22 +174,37 @@ pub struct StressResult {
     pub collateral_change: Option<Decimal>,
     /// Shocked assets that have no mark, so the shock had no effect.
     pub ignored_shocks: Vec<Asset>,
+    /// Shocked derivatives that are flat after the hypothetical fills, so
+    /// the shock had no effect.
+    pub ignored_instrument_shocks: Vec<InstrumentId>,
+    /// Derivatives open after the hypothetical fills without an instrument
+    /// shock (an explicit shock of zero is a shock): their marks are not
+    /// moved by the asset shocks.
+    pub unshocked_instruments: Vec<InstrumentId>,
+    /// Assets whose liquidation spread was chosen for collateral against
+    /// the sign reporting equity would need: the amount collateral counts
+    /// and the full net with every unrealized PnL have different signs, so
+    /// the stressed reporting equity is not conservative for them.
+    pub spread_sign_conflicts: Vec<Asset>,
 }
 
 /// Values `snapshot` with and without `scenario`.
 ///
 /// # Errors
 ///
-/// - Every error of [`value`].
+/// - Every error of [`value`], for the snapshot and for the stressed copy
+///   (for example [`MarginError::MissingMark`] for a derivative opened by a
+///   hypothetical fill without an instrument mark).
 /// - [`MarginError::UnsupportedAction`] for a fill side that is not `Buy`
 ///   or `Sell`.
 /// - [`MarginError::UnknownInstrument`] or [`MarginError::UnknownAsset`] for
-///   a fill on an unknown instrument or with a fee in an unknown asset.
+///   a fill or an instrument shock on an unknown instrument, or a fee in an
+///   unknown asset.
 /// - [`MarginError::InvalidInput`] for a non positive fill price or
-///   quantity, a shock not greater than -1 or a spread outside `[0, 1)`.
-/// - [`MarginError::UnsupportedInstrument`] if a linear future or perpetual
-///   position is open: scenarios shock asset marks, not instrument marks,
-///   so they would leave its unrealized PnL unstressed.
+///   quantity, a fill on a settled future, an instrument shock on a spot
+///   instrument, a shock not greater than -1 or a spread outside `[0, 1)`.
+/// - [`MarginError::ExecutedAfterExpiry`] for a fill on a future at or past
+///   its expiry at `marks.as_of_ms`.
 /// - [`MarginError::Arithmetic`] if a result cannot be represented.
 pub fn stress(
     snapshot: &LedgerSnapshot,
@@ -143,27 +212,126 @@ pub fn stress(
     policy: &ValuationPolicy,
     scenario: &Scenario,
 ) -> Result<StressResult> {
-    // An open derivative would keep its instrument mark under every asset
-    // shock: refuse rather than report it unstressed.
-    for (id, position) in &snapshot.positions {
-        let derivative = match snapshot.instruments.get(id) {
+    validate_scenario(snapshot, policy, scenario)?;
+
+    let base = value(snapshot, marks, policy)?;
+
+    let mut stressed_snapshot = snapshot.clone();
+    for fill in &scenario.fills {
+        apply_hypothetical(
+            &mut stressed_snapshot,
+            fill,
+            policy.rounding,
+            marks.as_of_ms,
+        )?;
+    }
+
+    // Derivatives open after the fills, with their contracts.
+    let mut open: BTreeMap<&InstrumentId, Decimal> = BTreeMap::new();
+    for (id, position) in &stressed_snapshot.positions {
+        let derivative = match stressed_snapshot.instruments.get(id) {
             Some(Instrument::Spot(_)) | None => false,
-            Some(
-                Instrument::LinearFuture(_)
-                | Instrument::LinearPerpetual(_)
-                | Instrument::InverseFuture(_)
-                | Instrument::InversePerpetual(_),
-            ) => true,
+            Some(Instrument::LinearFuture(_) | Instrument::LinearPerpetual(_)) => true,
+            Some(Instrument::InverseFuture(_) | Instrument::InversePerpetual(_)) => {
+                if position.quantity.is_zero() {
+                    continue;
+                }
+                return Err(inverse_unsupported(id));
+            }
         };
         if derivative && !position.quantity.is_zero() {
-            return Err(MarginError::UnsupportedInstrument {
-                rule: "stress".to_string(),
-                instrument: id.clone(),
-                reason: "scenarios do not shock instrument marks yet",
-            });
+            open.insert(id, position.quantity);
         }
     }
-    // Validate every parameter before doing anything.
+    let ignored_shocks: Vec<Asset> = scenario
+        .shocks
+        .keys()
+        .filter(|asset| !marks.prices.contains_key(*asset))
+        .cloned()
+        .collect();
+    let ignored_instrument_shocks: Vec<InstrumentId> = scenario
+        .instrument_shocks
+        .keys()
+        .filter(|id| !open.contains_key(id))
+        .cloned()
+        .collect();
+    let unshocked_instruments: Vec<InstrumentId> = open
+        .keys()
+        .filter(|id| !scenario.instrument_shocks.contains_key(**id))
+        .map(|id| (*id).clone())
+        .collect();
+
+    let spread = scenario.liquidation_spread;
+    let sell = sub(Decimal::ONE, spread, "1 - spread")?;
+    let buy_back = add(Decimal::ONE, spread, "1 + spread")?;
+    let mut stressed_marks = marks.clone();
+
+    // Final instrument marks: mark * (1 + shock) * spread factor as one
+    // exact product, a long closed at the bid side and a short at the ask.
+    for (id, mark) in &mut stressed_marks.instruments {
+        let Some(contracts) = open.get(id) else {
+            continue;
+        };
+        let mut factors = vec![mark.price];
+        if let Some(shock) = scenario.instrument_shocks.get(id) {
+            factors.push(add(Decimal::ONE, *shock, "1 + shock")?);
+        }
+        if !spread.is_zero() {
+            factors.push(if contracts.is_sign_positive() {
+                sell
+            } else {
+                buy_back
+            });
+        }
+        mark.price = product(&factors, "stressed instrument mark")?;
+    }
+
+    let spread_sign_conflicts = stress_asset_prices(
+        &stressed_snapshot,
+        &mut stressed_marks,
+        policy,
+        scenario,
+        (sell, buy_back),
+    )?;
+
+    let stressed = value(&stressed_snapshot, &stressed_marks, policy)?;
+    let equity_change = match (stressed.equity, base.equity) {
+        (Some(s), Some(b)) => Some(sub(s, b, "stressed - base equity")?),
+        _ => None,
+    };
+    let collateral_change = match (stressed.collateral_equity, base.collateral_equity) {
+        (Some(s), Some(b)) => Some(sub(s, b, "stressed - base collateral")?),
+        _ => None,
+    };
+    Ok(StressResult {
+        name: scenario.name.clone(),
+        base,
+        stressed,
+        equity_change,
+        collateral_change,
+        ignored_shocks,
+        ignored_instrument_shocks,
+        unshocked_instruments,
+        spread_sign_conflicts,
+    })
+}
+
+/// Validates every parameter before anything is computed.
+fn validate_scenario(
+    snapshot: &LedgerSnapshot,
+    policy: &ValuationPolicy,
+    scenario: &Scenario,
+) -> Result<()> {
+    // Inverse positions are valued, but not stressed yet: refuse an open
+    // one rather than report it unstressed.
+    for (id, position) in &snapshot.positions {
+        if let Some(Instrument::InverseFuture(_) | Instrument::InversePerpetual(_)) =
+            snapshot.instruments.get(id)
+            && !position.quantity.is_zero()
+        {
+            return Err(inverse_unsupported(id));
+        }
+    }
     if scenario.liquidation_spread < Decimal::ZERO || scenario.liquidation_spread >= Decimal::ONE {
         return Err(MarginError::invalid_input(
             "liquidation_spread",
@@ -182,120 +350,223 @@ pub fn stress(
                 "the reporting asset cannot be shocked",
             ));
         }
-        if *shock <= -Decimal::ONE {
-            return Err(MarginError::invalid_input(
-                "shock",
-                "must be greater than -1",
-            ));
+        check_shock(*shock)?;
+    }
+    for (instrument, shock) in &scenario.instrument_shocks {
+        match snapshot.instruments.get(instrument) {
+            Some(Instrument::LinearFuture(_) | Instrument::LinearPerpetual(_)) => {}
+            Some(Instrument::InverseFuture(_) | Instrument::InversePerpetual(_)) => {
+                return Err(inverse_unsupported(instrument));
+            }
+            Some(Instrument::Spot(_)) => {
+                return Err(MarginError::invalid_input(
+                    "instrument shock",
+                    "a spot instrument is shocked through its base asset",
+                ));
+            }
+            None => {
+                return Err(MarginError::UnknownInstrument {
+                    instrument: instrument.clone(),
+                });
+            }
         }
+        check_shock(*shock)?;
     }
     for fill in &scenario.fills {
         Dir::from_action(fill.side, "fill side")?;
     }
+    Ok(())
+}
 
-    let base = value(snapshot, marks, policy)?;
-
-    let mut stressed_snapshot = snapshot.clone();
-    for fill in &scenario.fills {
-        apply_hypothetical(&mut stressed_snapshot, fill, policy.rounding)?;
-    }
-
-    let ignored_shocks: Vec<Asset> = scenario
-        .shocks
-        .keys()
-        .filter(|asset| !marks.prices.contains_key(*asset))
-        .cloned()
-        .collect();
-    let sell = sub(Decimal::ONE, scenario.liquidation_spread, "1 - spread")?;
-    let buy_back = add(Decimal::ONE, scenario.liquidation_spread, "1 + spread")?;
-    let mut stressed_marks = marks.clone();
+/// Final asset prices: `price * (1 + shock) * spread factor` as one exact
+/// product. The stressed derivative values, the ones the stressed
+/// valuation reports, choose the side of the spread for their settlement
+/// assets. Returns the assets whose collateral and full nets have
+/// different signs.
+fn stress_asset_prices(
+    stressed_snapshot: &LedgerSnapshot,
+    stressed_marks: &mut MarkSet,
+    policy: &ValuationPolicy,
+    scenario: &Scenario,
+    (sell, buy_back): (Decimal, Decimal),
+) -> Result<Vec<Asset>> {
+    let spread = scenario.liquidation_spread;
+    let (counted, full) = if spread.is_zero() {
+        (BTreeMap::new(), BTreeMap::new())
+    } else {
+        let derivatives = derivative_values(stressed_snapshot, stressed_marks, policy.max_age_ms)?;
+        let mut full: BTreeMap<Asset, Vec<Decimal>> = BTreeMap::new();
+        for value in derivatives.values() {
+            full.entry(value.settlement.clone())
+                .or_default()
+                .push(value.unrealized_pnl);
+        }
+        (collateral_upnl(&derivatives), full)
+    };
+    let mut spread_sign_conflicts = Vec::new();
     for (asset, mark) in &mut stressed_marks.prices {
-        // price * (1 + shock) * spread factor as one exact product: only the
-        // stressed price must be representable.
         let mut factors = vec![mark.price];
         if let Some(shock) = scenario.shocks.get(asset) {
             factors.push(add(Decimal::ONE, *shock, "1 + shock")?);
         }
-        if !scenario.liquidation_spread.is_zero() {
-            // Holdings are sold across the spread; debts are bought back
-            // across it.
-            let total = stressed_snapshot
+        if !spread.is_zero() {
+            let cash = stressed_snapshot
                 .balances
                 .get(asset)
                 .map(|b| b.total)
                 .unwrap_or_default();
-            if total > Decimal::ZERO {
-                factors.push(sell);
-            } else if total < Decimal::ZERO {
-                factors.push(buy_back);
+            let net_sign = |pnl: &[Decimal]| {
+                let mut values = Vec::with_capacity(pnl.len().saturating_add(1));
+                values.push(cash);
+                values.extend_from_slice(pnl);
+                sum_sign(&values, "balance + unrealized pnl")
+            };
+            let full_sign = net_sign(full.get(asset).map_or(&[], Vec::as_slice))?;
+            // `None` when a loss at an invalid mark makes collateral unknown.
+            let counted_sign = match counted.get(asset) {
+                None => Some(full_sign),
+                Some(Some(terms)) => Some(net_sign(terms)?),
+                Some(None) => None,
+            };
+            if counted_sign.is_some_and(|sign| sign != full_sign) {
+                spread_sign_conflicts.push(asset.clone());
+            }
+            match counted_sign.unwrap_or(full_sign) {
+                Ordering::Greater => factors.push(sell),
+                Ordering::Less => factors.push(buy_back),
+                Ordering::Equal => {}
             }
         }
         mark.price = product(&factors, "stressed price")?;
     }
+    Ok(spread_sign_conflicts)
+}
 
-    let stressed = value(&stressed_snapshot, &stressed_marks, policy)?;
-    let equity_change = match (stressed.equity, base.equity) {
-        (Some(s), Some(b)) => Some(sub(s, b, "stressed - base equity")?),
-        _ => None,
-    };
-    let collateral_change = match (stressed.collateral_equity, base.collateral_equity) {
-        (Some(s), Some(b)) => Some(sub(s, b, "stressed - base collateral")?),
-        _ => None,
-    };
-    Ok(StressResult {
-        name: scenario.name.clone(),
-        base,
-        stressed,
-        equity_change,
-        collateral_change,
-        ignored_shocks,
-    })
+/// Inverse futures and perpetuals are not stressed yet.
+#[cold]
+fn inverse_unsupported(instrument: &InstrumentId) -> MarginError {
+    MarginError::UnsupportedInstrument {
+        rule: "stress".to_string(),
+        instrument: instrument.clone(),
+        reason: "inverse futures and perpetuals are not stressed yet",
+    }
+}
+
+/// A relative shock must be greater than -1.
+fn check_shock(shock: Decimal) -> Result<()> {
+    if shock <= -Decimal::ONE {
+        return Err(MarginError::invalid_input(
+            "shock",
+            "must be greater than -1",
+        ));
+    }
+    Ok(())
 }
 
 fn apply_hypothetical(
     snapshot: &mut LedgerSnapshot,
     fill: &HypotheticalFill,
     rounding: Rounding,
+    as_of_ms: u64,
 ) -> Result<()> {
-    let spot = match snapshot.instruments.get(&fill.instrument).cloned() {
-        Some(Instrument::Spot(spot)) => spot,
-        Some(
-            Instrument::LinearFuture(_)
-            | Instrument::LinearPerpetual(_)
-            | Instrument::InverseFuture(_)
-            | Instrument::InversePerpetual(_),
-        ) => {
-            return Err(MarginError::UnsupportedInstrument {
-                rule: "stress".to_string(),
-                instrument: fill.instrument.clone(),
-                reason: "hypothetical derivative fills are not supported yet",
-            });
+    match snapshot.instruments.get(&fill.instrument).cloned() {
+        Some(Instrument::Spot(spot)) => apply_spot(snapshot, &spot, fill, rounding),
+        Some(Instrument::LinearFuture(future)) => {
+            if snapshot.settled_instruments.contains(&fill.instrument) {
+                return Err(MarginError::invalid_input(
+                    "fill",
+                    "a settled future cannot take a hypothetical fill",
+                ));
+            }
+            if as_of_ms >= future.expiry_ms() {
+                return Err(MarginError::ExecutedAfterExpiry {
+                    instrument: fill.instrument.clone(),
+                    executed_at_ms: as_of_ms,
+                    expiry_ms: future.expiry_ms(),
+                });
+            }
+            apply_derivative(snapshot, future.terms(), fill)
         }
-        None => {
-            return Err(MarginError::UnknownInstrument {
-                instrument: fill.instrument.clone(),
-            });
+        Some(Instrument::LinearPerpetual(perpetual)) => {
+            apply_derivative(snapshot, perpetual.terms(), fill)
         }
-    };
-    // The same input rules as Ledger::book_execution.
+        Some(Instrument::InverseFuture(_) | Instrument::InversePerpetual(_)) => {
+            Err(inverse_unsupported(&fill.instrument))
+        }
+        None => Err(MarginError::UnknownInstrument {
+            instrument: fill.instrument.clone(),
+        }),
+    }
+}
+
+/// Positive price and quantity, within the instrument scales: the input
+/// rules of `Ledger::book_execution`.
+fn check_fill(fill: &HypotheticalFill, price_scale: u32, quantity_scale: u32) -> Result<()> {
     if fill.price <= Decimal::ZERO {
         return Err(MarginError::invalid_input("price", "must be positive"));
     }
     if fill.quantity <= Decimal::ZERO {
         return Err(MarginError::invalid_input("quantity", "must be positive"));
     }
-    check_scale(fill.price, spot.price_scale(), "price")?;
-    check_scale(fill.quantity, spot.quantity_scale(), "quantity")?;
-    let scale_of = |asset: &Asset| {
-        snapshot
-            .assets
-            .get(asset)
-            .copied()
-            .ok_or_else(|| MarginError::UnknownAsset {
-                asset: asset.clone(),
-            })
-    };
-    let quote_scale = scale_of(spot.quote())?;
+    check_scale(fill.price, price_scale, "price")?;
+    check_scale(fill.quantity, quantity_scale, "quantity")
+}
+
+fn scale_of(snapshot: &LedgerSnapshot, asset: &Asset) -> Result<u32> {
+    snapshot
+        .assets
+        .get(asset)
+        .copied()
+        .ok_or_else(|| MarginError::UnknownAsset {
+            asset: asset.clone(),
+        })
+}
+
+/// Adds the fee to `deltas` and to the fees paid, after checking its scale.
+fn book_fee(
+    snapshot: &mut LedgerSnapshot,
+    fee: Option<&Fee>,
+    deltas: &mut BTreeMap<Asset, Vec<Decimal>>,
+) -> Result<()> {
+    if let Some(fee) = fee {
+        check_scale(fee.amount, scale_of(snapshot, &fee.asset)?, "fee")?;
+        deltas
+            .entry(fee.asset.clone())
+            .or_default()
+            .push(neg(fee.amount));
+        let paid = snapshot.fees_paid.entry(fee.asset.clone()).or_default();
+        *paid = add(*paid, fee.amount, "fees + fee")?;
+    }
+    Ok(())
+}
+
+/// Applies every change to one asset in one exact step, to its total and
+/// available balance (a hypothetical fill reserves nothing), so a fee in
+/// the same asset cannot make an intermediate overflow.
+fn apply_deltas(
+    snapshot: &mut LedgerSnapshot,
+    deltas: BTreeMap<Asset, Vec<Decimal>>,
+) -> Result<()> {
+    for (asset, changes) in deltas {
+        let balance = snapshot.balances.entry(asset).or_default();
+        let mut total = vec![balance.total];
+        total.extend(&changes);
+        let mut available = vec![balance.available];
+        available.extend(&changes);
+        balance.total = sum(&total, "balance + deltas")?;
+        balance.available = sum(&available, "available + deltas")?;
+    }
+    Ok(())
+}
+
+fn apply_spot(
+    snapshot: &mut LedgerSnapshot,
+    spot: &SpotInstrument,
+    fill: &HypotheticalFill,
+    rounding: Rounding,
+) -> Result<()> {
+    check_fill(fill, spot.price_scale(), spot.quantity_scale())?;
+    let quote_scale = scale_of(snapshot, spot.quote())?;
     let notional = mul_div_round(
         &[fill.price, fill.quantity],
         &[],
@@ -307,8 +578,6 @@ fn apply_hypothetical(
         Dir::Buy => (fill.quantity, notional),
         Dir::Sell => (neg(fill.quantity), neg(notional)),
     };
-    // Every change to one asset is summed in one exact step, so a fee in
-    // the base or quote asset cannot make an intermediate overflow.
     let mut deltas: BTreeMap<Asset, Vec<Decimal>> = BTreeMap::new();
     deltas
         .entry(spot.base().clone())
@@ -318,24 +587,8 @@ fn apply_hypothetical(
         .entry(spot.quote().clone())
         .or_default()
         .push(neg(signed_value));
-    if let Some(fee) = &fill.fee {
-        check_scale(fee.amount, scale_of(&fee.asset)?, "fee")?;
-        deltas
-            .entry(fee.asset.clone())
-            .or_default()
-            .push(neg(fee.amount));
-        let paid = snapshot.fees_paid.entry(fee.asset.clone()).or_default();
-        *paid = add(*paid, fee.amount, "fees + fee")?;
-    }
-    for (asset, changes) in deltas {
-        let balance = snapshot.balances.entry(asset).or_default();
-        let mut total = vec![balance.total];
-        total.extend(&changes);
-        let mut available = vec![balance.available];
-        available.extend(&changes);
-        balance.total = sum(&total, "balance + deltas")?;
-        balance.available = sum(&available, "available + deltas")?;
-    }
+    book_fee(snapshot, fill.fee.as_ref(), &mut deltas)?;
+    apply_deltas(snapshot, deltas)?;
     let position = snapshot
         .positions
         .get_mut(&fill.instrument)
@@ -357,5 +610,56 @@ fn apply_hypothetical(
     position.quantity = next.quantity;
     position.cost_basis = next.cost_basis;
     position.realized_pnl = next.realized_pnl;
+    Ok(())
+}
+
+/// A linear future or perpetual fill, booked like
+/// [`Ledger::book_execution`](crate::ledger::Ledger::book_execution): no
+/// asset is exchanged, the basis and contracts move, and only the realized
+/// PnL and the fee move cash.
+fn apply_derivative(
+    snapshot: &mut LedgerSnapshot,
+    terms: &LinearTerms,
+    fill: &HypotheticalFill,
+) -> Result<()> {
+    check_fill(fill, terms.price_scale(), terms.contract_scale())?;
+    let settlement = terms.settlement();
+    let scale = scale_of(snapshot, settlement)?;
+    let dir = Dir::from_action(fill.side, "fill side")?;
+    let position =
+        snapshot
+            .positions
+            .get(&fill.instrument)
+            .ok_or_else(|| MarginError::UnknownInstrument {
+                instrument: fill.instrument.clone(),
+            })?;
+    let effect = apply_derivative_fill(
+        Position {
+            quantity: position.quantity,
+            cost_basis: position.cost_basis,
+            realized_pnl: position.realized_pnl,
+        },
+        dir,
+        fill.price,
+        fill.quantity,
+        ContractSize::Multiplier(terms.multiplier()),
+        scale,
+    )?;
+    let mut deltas: BTreeMap<Asset, Vec<Decimal>> = BTreeMap::new();
+    deltas
+        .entry(settlement.clone())
+        .or_default()
+        .push(effect.realized);
+    book_fee(snapshot, fill.fee.as_ref(), &mut deltas)?;
+    apply_deltas(snapshot, deltas)?;
+    let position = snapshot
+        .positions
+        .get_mut(&fill.instrument)
+        .ok_or_else(|| MarginError::UnknownInstrument {
+            instrument: fill.instrument.clone(),
+        })?;
+    position.quantity = effect.position.quantity;
+    position.cost_basis = effect.position.cost_basis;
+    position.realized_pnl = effect.position.realized_pnl;
     Ok(())
 }

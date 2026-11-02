@@ -62,24 +62,29 @@ An open derivative position is valued at its **instrument mark**, `MarkSet::inst
 
 ## Stress scenarios
 
-Scenarios shock asset marks, not instrument marks: `stress` refuses an open linear future or perpetual with `UnsupportedInstrument` rather than report it unstressed.
+`stress` values the snapshot with and without a `Scenario`, from the baseline marks. It never changes the snapshot, the marks or the ledger: it values a stressed copy of each, with `valuation::value`, so open futures and perpetuals use the same rule as an unstressed valuation, `upnl = rhe(Q * M * mark) - basis`. It applies, in this order:
 
+1. **Hypothetical fills.** Fills such as a hedge that is expected to execute are applied to a copy of the snapshot with the ledger's booking rules. A spot fill rounds its notional once and positions use average cost. A linear future or perpetual fill uses the derivative booking of `docs/ledger.md` (half-even; the basis and contracts move, and only the realized PnL moves cash) at the valuation time `as_of_ms`: a future at or past its expiry is `ExecutedAfterExpiry`, and a settled future is `InvalidInput`. No funding or settlement is booked. The fee is debited once. Balances are not checked, and a fill reserves nothing. Leaving the hedge out models a failed hedge.
+2. **Instrument shocks.** `mark * (1 + shock)` per linear future or perpetual. The instrument terms name no underlying, so instrument shocks are not linked to asset shocks: a scenario that moves an asset and the derivatives on it shocks both. `StressResult::unshocked_instruments` lists the derivatives open after the fills without a shock (an explicit shock of 0 is a shock).
+3. **Asset shocks.** `price * (1 + shock)` per asset.
+4. **Liquidation spread**, the cost of closing across half the bid ask spread. `spread` is in `[0, 1)`.
+   - An open derivative is valued at `mark * (1 - spread)` when long and `mark * (1 + spread)` when short, by its contracts after the fills.
+   - A non-reporting asset is valued at `price * (1 - spread)` (the sale proceeds) when the amount collateral counts for it is positive, and at `price * (1 + spread)` (the buy-back cost) when it is negative. That amount is its balance plus the unrealized PnL of its derivatives at valid instrument marks, the netting of collateral equity. When a loss is at an invalid instrument mark, collateral is unknown and the sign of the balance plus all of that PnL is used.
+   - When that full net and the counted one have different signs (for example a debt of 100 and a gain of 150 at a stale mark), one price cannot be conservative for both: the collateral side is used, and the asset is listed in `StressResult::spread_sign_conflicts`, where the stressed reporting equity is not conservative.
 
-`stress` values the snapshot with and without a `Scenario`, applying in this order:
+Inverse futures and perpetuals are valued but not stressed yet: an open inverse position, a shock on one or a hypothetical fill on one is `UnsupportedInstrument`, never skipped.
 
-1. **Hypothetical fills.** Fills such as a hedge that is expected to execute are applied to a copy of the snapshot with the ledger's booking rules: the notional is rounded once, the fee is debited once, and positions use average cost. Balances are not checked. Leaving the hedge out models a failed hedge.
-2. **Gaps.** `price * (1 + shock)` per asset, applied exactly. The shock must be greater than -1.
-3. **Liquidation spread.** Each non-reporting asset with a positive balance is valued at `price * (1 - spread)`, which is the sale proceeds. Each one with a negative balance is valued at `price * (1 + spread)`, which is the buy-back cost. `spread` is in `[0, 1)`.
+Each stressed price, `price * (1 + shock) * (1 ± spread)`, is one exact product converted once, so only the stressed price must be representable. The instrument marks are final before the asset factors are chosen, and the derivative values that choose them are the ones the stressed valuation reports, so the order has no cycle.
 
 All parameters are validated before anything is computed:
 
-- a shock must name a registered asset other than the reporting asset, and be greater than -1;
+- an asset shock must name a registered asset other than the reporting asset, and an instrument shock a registered linear future or perpetual (a spot instrument is shocked through its base asset); both must be greater than -1;
 - the spread must be in `[0, 1)`;
 - hypothetical fills follow the ledger's input rules: positive price and quantity within the instrument scales, and a fee within its asset scale.
 
-A shock on an asset without a mark has no effect and is listed in `StressResult::ignored_shocks`.
+A shock on an asset without a mark has no effect and is listed in `StressResult::ignored_shocks`; a shock on a derivative that is flat after the fills, in `StressResult::ignored_instrument_shocks`.
 
-`StressResult` reports both valuations, `equity_change` and `collateral_change` (each `None` when a side is unknown), and `ignored_shocks`. Invalid marks stay invalid under stress.
+`StressResult` reports both valuations, `equity_change` and `collateral_change` (each `None` when a side is unknown), `ignored_shocks`, `ignored_instrument_shocks`, `unshocked_instruments` and `spread_sign_conflicts`. Invalid marks stay invalid under stress: a stressed mark keeps its time and source, a derivative gain at an invalid instrument mark is not counted in collateral, and a loss there makes collateral unknown.
 
 ## Snapshot additions
 
@@ -89,5 +94,6 @@ A shock on an asset without a mark has no effect and is listed in `StressResult:
 
 - Margin requirements (M3-03).
 - Portfolio risk (M3-02).
-- Derivatives. Negative balances only arise in hypothetical scenarios; the ledger never books one.
+- Negative balances only arise in hypothetical scenarios or from mandatory debits; see `docs/ledger.md`.
+- Shocks per underlying: the instrument terms do not name one.
 - Mark sourcing itself: the caller supplies marks.

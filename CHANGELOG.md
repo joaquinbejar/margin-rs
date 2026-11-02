@@ -25,6 +25,21 @@ follows [Semantic Versioning](https://semver.org/).
   the risk gate refuse an open inverse position with
   `UnsupportedInstrument` until parts B and C. See `docs/ledger.md`.
 
+- **Stress of open futures and perpetuals** (#31): `scenarios::stress`
+  values open linear futures and perpetuals at stressed instrument marks
+  instead of refusing them. `Scenario::instrument_shock` moves an
+  instrument mark by `1 + shock`; the liquidation spread closes a long at
+  `mark * (1 - spread)` and a short at `mark * (1 + spread)`, and takes the
+  side of a settlement asset from the net collateral counts for it (cash
+  plus the unrealized PnL at valid marks). Each stressed price is one exact
+  product. Hypothetical fills on futures and perpetuals use the ledger's
+  derivative booking at the valuation time (a future at or past expiry is
+  `ExecutedAfterExpiry`, a settled one `InvalidInput`). `StressResult`
+  reports `ignored_instrument_shocks`, `unshocked_instruments` (open
+  derivatives without a shock) and `spread_sign_conflicts` (assets where
+  the spread side chosen for collateral is not conservative for reporting
+  equity). The baseline marks, snapshot and ledger are never changed.
+
 - **Liquidation and margin reservations read the ledger** (#23, part C):
   `LiquidationAccount::from_ledger` builds the closeout account from a
   `LedgerSnapshot` (every open future and perpetual in the plan's currency,
@@ -93,6 +108,10 @@ follows [Semantic Versioning](https://semver.org/).
   `residual` and `closing_residual`. `Instrument` and `PositionKind` have
   new variants (both are `non_exhaustive`). Registering an inverse
   instrument requires the base scale plus its price scale to be at most 28.
+- **Breaking:** `Scenario` has a new field, `instrument_shocks`, and
+  `StressResult` three (`ignored_instrument_shocks`,
+  `unshocked_instruments`, `spread_sign_conflicts`): struct literals must
+  name them (#31).
 - **Breaking:** `Execution` has the new field `executed_at_ms` (and
   `Execution::with_executed_at`); it is part of the execution, so a repeat
   must carry the same time. It is optional for spot and required for a
