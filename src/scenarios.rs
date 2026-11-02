@@ -15,7 +15,17 @@
 //!    applied exactly; the shock must be greater than -1.
 //! 3. **Liquidation spread** ([`Scenario::spread`]): every non reporting
 //!    asset with a positive balance is valued at `price * (1 - spread)`, the
-//!    cost of selling it across half the bid ask spread.
+//!    proceeds of selling it across half the bid ask spread, and every one
+//!    with a negative balance (a debt) at `price * (1 + spread)`, the cost of
+//!    buying it back.
+//!
+//! All parameters are validated first: shocks must name a registered, non
+//! reporting asset and be greater than -1, and the spread must be in
+//! `[0, 1)`. A shock on an asset without a mark has no effect and is listed
+//! in [`StressResult::ignored_shocks`]. Hypothetical fills follow the input
+//! rules of [`Ledger::book_execution`](crate::ledger::Ledger::book_execution)
+//! (positive price and quantity within the instrument scales, fee within its
+//! asset scale).
 //!
 //! The stressed snapshot is then valued with [`value`] under the same
 //! policy, so invalid marks stay invalid and keep counting nothing toward
@@ -25,7 +35,7 @@ use std::collections::BTreeMap;
 
 use rust_decimal::Decimal;
 
-use crate::decimal::{Rounding, add, mul, mul_div_round, sub};
+use crate::decimal::{Rounding, add, check_scale, mul, mul_div_round, sub};
 use crate::error::{MarginError, Result};
 use crate::ids::{Asset, InstrumentId};
 use crate::instrument::Instrument;
@@ -103,8 +113,11 @@ pub struct StressResult {
     pub stressed: AccountValuation,
     /// `stressed.equity - base.equity`, when both are known.
     pub equity_change: Option<Decimal>,
-    /// `stressed.collateral_equity - base.collateral_equity`.
-    pub collateral_change: Decimal,
+    /// `stressed.collateral_equity - base.collateral_equity`, when both are
+    /// known.
+    pub collateral_change: Option<Decimal>,
+    /// Shocked assets that have no mark, so the shock had no effect.
+    pub ignored_shocks: Vec<Asset>,
 }
 
 /// Values `snapshot` with and without `scenario`.
@@ -123,6 +136,33 @@ pub fn stress(
     policy: &ValuationPolicy,
     scenario: &Scenario,
 ) -> Result<StressResult> {
+    // Validate every parameter before doing anything.
+    if scenario.liquidation_spread < Decimal::ZERO || scenario.liquidation_spread >= Decimal::ONE {
+        return Err(MarginError::invalid_input(
+            "liquidation_spread",
+            "must be in [0, 1)",
+        ));
+    }
+    for (asset, shock) in &scenario.shocks {
+        if !snapshot.assets.contains_key(asset) {
+            return Err(MarginError::UnknownAsset {
+                asset: asset.clone(),
+            });
+        }
+        if *asset == policy.reporting {
+            return Err(MarginError::invalid_input(
+                "shock",
+                "the reporting asset cannot be shocked",
+            ));
+        }
+        if *shock <= -Decimal::ONE {
+            return Err(MarginError::invalid_input(
+                "shock",
+                "must be greater than -1",
+            ));
+        }
+    }
+
     let base = value(snapshot, marks, policy)?;
 
     let mut stressed_snapshot = snapshot.clone();
@@ -130,41 +170,37 @@ pub fn stress(
         apply_hypothetical(&mut stressed_snapshot, fill, policy.rounding)?;
     }
 
-    if scenario.liquidation_spread < Decimal::ZERO || scenario.liquidation_spread >= Decimal::ONE {
-        return Err(MarginError::invalid_input(
-            "liquidation_spread",
-            "must be in [0, 1)",
-        ));
-    }
-    let keep = sub(Decimal::ONE, scenario.liquidation_spread, "1 - spread")?;
+    let ignored_shocks: Vec<Asset> = scenario
+        .shocks
+        .keys()
+        .filter(|asset| !marks.prices.contains_key(*asset))
+        .cloned()
+        .collect();
+    let sell = sub(Decimal::ONE, scenario.liquidation_spread, "1 - spread")?;
+    let buy_back = add(Decimal::ONE, scenario.liquidation_spread, "1 + spread")?;
     let mut stressed_marks = marks.clone();
     for (asset, mark) in &mut stressed_marks.prices {
         if let Some(shock) = scenario.shocks.get(asset) {
-            if *shock <= -Decimal::ONE {
-                return Err(MarginError::invalid_input(
-                    "shock",
-                    "must be greater than -1",
-                ));
-            }
             mark.price = mul(
                 mark.price,
                 add(Decimal::ONE, *shock, "1 + shock")?,
                 "price * (1 + shock)",
             )?;
         }
-        let holds = stressed_snapshot
+        if scenario.liquidation_spread.is_zero() {
+            continue;
+        }
+        // Holdings are sold across the spread; debts are bought back across
+        // it.
+        let total = stressed_snapshot
             .balances
             .get(asset)
-            .is_some_and(|b| b.total > Decimal::ZERO);
-        if holds && !scenario.liquidation_spread.is_zero() {
-            mark.price = mul(mark.price, keep, "price * (1 - spread)")?;
-        }
-    }
-    for asset in scenario.shocks.keys() {
-        if !snapshot.assets.contains_key(asset) {
-            return Err(MarginError::UnknownAsset {
-                asset: asset.clone(),
-            });
+            .map(|b| b.total)
+            .unwrap_or_default();
+        if total > Decimal::ZERO {
+            mark.price = mul(mark.price, sell, "price * (1 - spread)")?;
+        } else if total < Decimal::ZERO {
+            mark.price = mul(mark.price, buy_back, "price * (1 + spread)")?;
         }
     }
 
@@ -173,17 +209,17 @@ pub fn stress(
         (Some(s), Some(b)) => Some(sub(s, b, "stressed - base equity")?),
         _ => None,
     };
-    let collateral_change = sub(
-        stressed.collateral_equity,
-        base.collateral_equity,
-        "stressed - base collateral",
-    )?;
+    let collateral_change = match (stressed.collateral_equity, base.collateral_equity) {
+        (Some(s), Some(b)) => Some(sub(s, b, "stressed - base collateral")?),
+        _ => None,
+    };
     Ok(StressResult {
         name: scenario.name.clone(),
         base,
         stressed,
         equity_change,
         collateral_change,
+        ignored_shocks,
     })
 }
 
@@ -197,12 +233,15 @@ fn apply_hypothetical(
             instrument: fill.instrument.clone(),
         });
     };
+    // The same input rules as Ledger::book_execution.
     if fill.price <= Decimal::ZERO {
         return Err(MarginError::invalid_input("price", "must be positive"));
     }
     if fill.quantity <= Decimal::ZERO {
         return Err(MarginError::invalid_input("quantity", "must be positive"));
     }
+    check_scale(fill.price, spot.price_scale(), "price")?;
+    check_scale(fill.quantity, spot.quantity_scale(), "quantity")?;
     let scale_of = |asset: &Asset| {
         snapshot
             .assets
@@ -229,7 +268,7 @@ fn apply_hypothetical(
         (spot.quote().clone(), -signed_value),
     ];
     if let Some(fee) = &fill.fee {
-        scale_of(&fee.asset)?;
+        check_scale(fee.amount, scale_of(&fee.asset)?, "fee")?;
         deltas.push((fee.asset.clone(), -fee.amount));
         let paid = snapshot.fees_paid.entry(fee.asset.clone()).or_default();
         *paid = add(*paid, fee.amount, "fees + fee")?;

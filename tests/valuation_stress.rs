@@ -84,7 +84,7 @@ fn flat_price_reconciles_exactly() {
         (dec!(0), dec!(0), dec!(0.2))
     );
     assert_eq!(a.rounding_difference, dec!(0));
-    assert_eq!(v.collateral_equity, dec!(999.8));
+    assert_eq!(v.collateral_equity, Some(dec!(999.8)));
     assert_eq!(v.assets[&asset("BTC")].value, Some(dec!(200)));
 }
 
@@ -107,7 +107,7 @@ fn round_trip_reconciles_without_marks() {
         (a.realized, a.unrealized, a.fees),
         (dec!(0), dec!(0), dec!(0.4))
     );
-    assert_eq!(v.collateral_equity, dec!(999.6));
+    assert_eq!(v.collateral_equity, Some(dec!(999.6)));
 }
 
 /// Mark 110: equity 799.8 + 220 = 1019.8; unrealized 20; net 19.8.
@@ -122,7 +122,7 @@ fn price_move_is_unrealized_pnl() {
         (a.realized, a.unrealized, a.fees),
         (dec!(0), dec!(20), dec!(0.2))
     );
-    assert_eq!(v.collateral_equity, dec!(1019.8));
+    assert_eq!(v.collateral_equity, Some(dec!(1019.8)));
 }
 
 /// Acceptance 2: an invalid mark is flagged and cannot raise collateral
@@ -143,15 +143,15 @@ fn invalid_marks_are_flagged_and_do_not_create_collateral() {
         BTreeMap::from([(btc.clone(), MarkStatus::Stale { age_ms: 4000 })])
     );
     assert_eq!(stale.equity, Some(dec!(1199.8)));
-    assert_eq!(stale.collateral_equity, dec!(799.8));
-    assert_eq!(stale.assets[&btc].collateral_value, dec!(0));
+    assert_eq!(stale.collateral_equity, Some(dec!(799.8)));
+    assert_eq!(stale.assets[&btc].collateral_value, Some(dec!(0)));
 
     let haircut = ValuationPolicy {
         invalid_marks: InvalidMarkPolicy::HaircutStale { haircut: dec!(0.5) },
         ..policy()
     };
     let v = value(&snapshot, &btc_at(dec!(200), 1000), &haircut).expect("value");
-    assert_eq!(v.collateral_equity, dec!(999.8));
+    assert_eq!(v.collateral_equity, Some(dec!(999.8)));
 
     let missing = value(&snapshot, &MarkSet::new(5000), &policy()).expect("value");
     assert_eq!(
@@ -162,17 +162,17 @@ fn invalid_marks_are_flagged_and_do_not_create_collateral() {
         (missing.equity, missing.net_pnl, missing.attribution),
         (None, None, None)
     );
-    assert_eq!(missing.collateral_equity, dec!(799.8));
+    assert_eq!(missing.collateral_equity, Some(dec!(799.8)));
 
     let zero = value(&snapshot, &btc_at(dec!(0), 5000), &haircut).expect("value");
     assert_eq!(zero.flags[&btc], MarkStatus::NonPositive);
     assert_eq!(zero.equity, None);
-    assert_eq!(zero.collateral_equity, dec!(799.8));
+    assert_eq!(zero.collateral_equity, Some(dec!(799.8)));
 
     let future = value(&snapshot, &btc_at(dec!(150), 6000), &haircut).expect("value");
     assert_eq!(future.flags[&btc], MarkStatus::Future { ahead_ms: 1000 });
     assert_eq!(future.equity, Some(dec!(1099.8)));
-    assert_eq!(future.collateral_equity, dec!(799.8));
+    assert_eq!(future.collateral_equity, Some(dec!(799.8)));
 }
 
 /// Fees in a third asset are valued at its own mark and counted once.
@@ -301,7 +301,7 @@ fn spread_gap_and_failed_hedge() {
     .expect("stress");
     assert_eq!(gap.stressed.equity, Some(dec!(959.8)));
     assert_eq!(gap.equity_change, Some(dec!(-40)));
-    assert_eq!(gap.collateral_change, dec!(-40));
+    assert_eq!(gap.collateral_change, Some(dec!(-40)));
     assert_eq!(
         gap.stressed.attribution.map(|a| a.unrealized),
         Some(dec!(-40))
@@ -352,8 +352,8 @@ fn stress_keeps_invalid_marks_out_of_collateral() {
         &Scenario::new("up").shock(asset("BTC"), dec!(0.5)),
     )
     .expect("stress");
-    assert_eq!(up.stressed.collateral_equity, dec!(799.8));
-    assert_eq!(up.collateral_change, dec!(0));
+    assert_eq!(up.stressed.collateral_equity, Some(dec!(799.8)));
+    assert_eq!(up.collateral_change, Some(dec!(0)));
     assert_eq!(up.equity_change, Some(dec!(200)));
 
     let marks = btc_at(dec!(100), 5000);
@@ -388,6 +388,209 @@ fn stress_keeps_invalid_marks_out_of_collateral() {
         ),
         Err(MarginError::UnknownInstrument {
             instrument: InstrumentId::new("ETH-USDC").expect("id"),
+        })
+    );
+}
+
+fn sell_btc(quantity: Decimal) -> HypotheticalFill {
+    HypotheticalFill {
+        instrument: pair(),
+        side: Side::Sell,
+        price: dec!(100),
+        quantity,
+        fee: None,
+    }
+}
+
+/// M208-1 / C1: a debt always counts against collateral.
+///
+/// From the long of 2 BTC (USDC 799.8), a hypothetical sale of 3 BTC at 100
+/// leaves USDC 1099.8 and BTC -1. With a fresh BTC mark of 100, equity and
+/// collateral are 999.8. A stale, future, missing or non positive mark
+/// cannot drop the debt: collateral is unknown, or under a 50 % stale
+/// haircut the debt counts at 100 * 1.5 = 150 (collateral 949.8).
+#[test]
+fn debts_count_against_collateral_whatever_the_mark() {
+    let snapshot = long_two_btc().snapshot();
+    let short = Scenario::new("short").fill(sell_btc(dec!(3)));
+    let btc = asset("BTC");
+
+    let fresh = stress(&snapshot, &btc_at(dec!(100), 5000), &policy(), &short).expect("stress");
+    assert_eq!(fresh.stressed.equity, Some(dec!(999.8)));
+    assert_eq!(fresh.stressed.collateral_equity, Some(dec!(999.8)));
+    assert_eq!(
+        fresh.stressed.assets[&btc].collateral_value,
+        Some(dec!(-100))
+    );
+
+    for marks in [
+        btc_at(dec!(100), 1000),
+        btc_at(dec!(100), 6000),
+        btc_at(dec!(0), 5000),
+        MarkSet::new(5000),
+    ] {
+        let r = stress(&snapshot, &marks, &policy(), &short).expect("stress");
+        assert_eq!(r.stressed.collateral_equity, None, "{marks:?}");
+        assert_eq!(r.stressed.assets[&btc].collateral_value, None);
+        assert_eq!(r.collateral_change, None);
+    }
+    let stale = stress(&snapshot, &btc_at(dec!(100), 1000), &policy(), &short).expect("stress");
+    assert_eq!(stale.stressed.equity, Some(dec!(999.8)));
+
+    let haircut = ValuationPolicy {
+        invalid_marks: InvalidMarkPolicy::HaircutStale { haircut: dec!(0.5) },
+        ..policy()
+    };
+    let r = stress(&snapshot, &btc_at(dec!(100), 1000), &haircut, &short).expect("stress");
+    assert_eq!(r.stressed.collateral_equity, Some(dec!(949.8)));
+}
+
+/// M208-1: the reviewer's hedge on another quote asset.
+///
+/// 1000 USDC; BTC-USDT; BTC mark valid at 100, USDT stale. A hypothetical
+/// buy of 1 BTC at 100 USDT creates a 100 USDT debt: collateral is unknown
+/// rather than 1100; with a 10 % stale haircut the debt counts 110
+/// (collateral 1000 + 100 - 110 = 990). Equity stays 1000.
+#[test]
+fn hedge_debt_in_a_stale_quote_asset() {
+    let mut ledger = Ledger::default();
+    for (code, scale) in [("USDC", 6), ("USDT", 6), ("BTC", 8)] {
+        ledger.register_asset(asset(code), scale).expect("register");
+    }
+    let btc_usdt = InstrumentId::new("BTC-USDT").expect("id");
+    ledger
+        .register_instrument(
+            SpotInstrument::new(btc_usdt.clone(), asset("BTC"), asset("USDT"), 2, 8).expect("spot"),
+        )
+        .expect("register");
+    ledger
+        .deposit(TransferId::new("d").expect("id"), asset("USDC"), dec!(1000))
+        .expect("deposit");
+    let marks = MarkSet::new(5000)
+        .with(asset("BTC"), Mark::new(dec!(100), 5000, PriceSource::Mid))
+        .with(asset("USDT"), Mark::new(dec!(1), 1000, PriceSource::Index));
+    let hedge = Scenario::new("hedge").fill(HypotheticalFill {
+        instrument: btc_usdt,
+        side: Side::Buy,
+        price: dec!(100),
+        quantity: dec!(1),
+        fee: None,
+    });
+    let r = stress(&ledger.snapshot(), &marks, &policy(), &hedge).expect("stress");
+    assert_eq!(r.base.collateral_equity, Some(dec!(1000)));
+    assert_eq!(r.stressed.collateral_equity, None);
+    assert_eq!(r.stressed.equity, Some(dec!(1000)));
+
+    let haircut = ValuationPolicy {
+        invalid_marks: InvalidMarkPolicy::HaircutStale { haircut: dec!(0.1) },
+        ..policy()
+    };
+    let r = stress(&ledger.snapshot(), &marks, &haircut, &hedge).expect("stress");
+    assert_eq!(r.stressed.collateral_equity, Some(dec!(990)));
+}
+
+/// A fee that overdraws an asset without a mark makes collateral unknown;
+/// a debt is bought back across the liquidation spread.
+#[test]
+fn overdrawing_fees_and_debt_liquidation() {
+    let snapshot = long_two_btc().snapshot();
+    let marks = btc_at(dec!(100), 5000);
+    let bnb_fee = Scenario::new("bnb fee").fill(HypotheticalFill {
+        fee: Some(Fee {
+            asset: asset("BNB"),
+            amount: dec!(0.01),
+        }),
+        ..sell_btc(dec!(1))
+    });
+    let r = stress(&snapshot, &marks, &policy(), &bnb_fee).expect("stress");
+    assert_eq!(r.stressed.assets[&asset("BNB")].total, dec!(-0.01));
+    assert_eq!(r.stressed.collateral_equity, None);
+    assert_eq!(r.stressed.flags[&asset("BNB")], MarkStatus::Missing);
+
+    // Short 1 BTC bought back at 100 * 1.01 = 101: 1099.8 - 101 = 998.8.
+    let r = stress(
+        &snapshot,
+        &marks,
+        &policy(),
+        &Scenario::new("short spread")
+            .fill(sell_btc(dec!(3)))
+            .spread(dec!(0.01)),
+    )
+    .expect("stress");
+    assert_eq!(r.stressed.equity, Some(dec!(998.8)));
+}
+
+/// M208-C2: a closed position needs no base mark for its attribution.
+///
+/// Sell the 2 BTC at 110 without fee: USDC 1019.8, BTC 0, realized 20. No
+/// BTC mark is needed: equity 1019.8, attribution (20, 0, 0.2), clean.
+#[test]
+fn closed_position_attribution_needs_no_base_mark() {
+    let mut ledger = long_two_btc();
+    ledger
+        .book_execution(&exec("s1", Side::Sell, dec!(110), dec!(2)))
+        .expect("book");
+    let v = value(&ledger.snapshot(), &MarkSet::new(5000), &policy()).expect("value");
+    assert!(v.is_clean());
+    assert_eq!(v.equity, Some(dec!(1019.8)));
+    assert_eq!(v.net_pnl, Some(dec!(19.8)));
+    let a = v.attribution.expect("attribution");
+    assert_eq!(
+        (a.realized, a.unrealized, a.fees),
+        (dec!(20), dec!(0), dec!(0.2))
+    );
+    assert_eq!(a.rounding_difference, dec!(0));
+}
+
+/// Scenario parameters are validated before anything is computed.
+#[test]
+fn scenario_validation() {
+    let snapshot = long_two_btc().snapshot();
+    let marks = btc_at(dec!(100), 5000);
+    assert_eq!(
+        stress(
+            &snapshot,
+            &marks,
+            &policy(),
+            &Scenario::new("x").shock(asset("USDC"), dec!(-0.1))
+        ),
+        Err(MarginError::invalid_input(
+            "shock",
+            "the reporting asset cannot be shocked"
+        ))
+    );
+    // An invalid shock on an asset without a mark is still rejected.
+    assert_eq!(
+        stress(
+            &snapshot,
+            &marks,
+            &policy(),
+            &Scenario::new("x").shock(asset("BNB"), dec!(-2))
+        ),
+        Err(MarginError::invalid_input(
+            "shock",
+            "must be greater than -1"
+        ))
+    );
+    let r = stress(
+        &snapshot,
+        &marks,
+        &policy(),
+        &Scenario::new("x").shock(asset("BNB"), dec!(-0.5)),
+    )
+    .expect("stress");
+    assert_eq!(r.ignored_shocks, vec![asset("BNB")]);
+    assert_eq!(r.equity_change, Some(dec!(0)));
+    let fine = HypotheticalFill {
+        price: dec!(100.001),
+        ..sell_btc(dec!(1))
+    };
+    assert_eq!(
+        stress(&snapshot, &marks, &policy(), &Scenario::new("x").fill(fine)),
+        Err(MarginError::PrecisionExceeded {
+            field: "price",
+            scale: 3,
+            max_scale: 2,
         })
     );
 }

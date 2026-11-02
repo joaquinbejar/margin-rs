@@ -22,12 +22,18 @@
 //! - **Reporting equity** `= sum(total balance * price)`. Stale and future
 //!   marks are used but flagged; if an asset with a non zero balance has no
 //!   positive price, equity is `None` rather than a guess.
-//! - **Collateral equity** counts only what a mark can be trusted for:
-//!   valid marks at full value, stale marks only under the explicit
-//!   [`InvalidMarkPolicy::HaircutStale`] policy, and nothing else. Spot
-//!   balances are never negative, so leaving an asset out never raises
-//!   collateral: an invalid mark cannot create spendable equity. It is
-//!   rounded toward zero.
+//! - **Collateral equity** counts only what a mark can be trusted for, and
+//!   is rounded down (toward negative infinity):
+//!   - an asset held counts at a valid mark, at `price * (1 - haircut)` for
+//!     a stale mark under the explicit [`InvalidMarkPolicy::HaircutStale`]
+//!     policy, and otherwise not at all;
+//!   - a debt (a negative balance, for example after a hypothetical fill in
+//!     a stress scenario) always counts: in full at a valid mark, at
+//!     `price * (1 + haircut)` for a stale mark under the haircut policy,
+//!     and otherwise collateral equity is `None`, never a guess.
+//!
+//!   So an invalid mark can only lower collateral or make it unknown; it
+//!   can never create spendable equity.
 //!
 //! # PnL with fees counted once
 //!
@@ -122,7 +128,8 @@ impl MarkSet {
     }
 }
 
-/// What collateral equity may do with a mark that is not valid.
+/// What collateral equity may do with a mark that is not valid. See the
+/// [module docs](self) for how debts are treated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InvalidMarkPolicy {
     /// Count nothing for an asset without a valid mark. The default.
@@ -205,8 +212,10 @@ pub struct AssetValue {
     pub status: MarkStatus,
     /// `total * price` rounded, or `None` without a positive price.
     pub value: Option<Decimal>,
-    /// Contribution to collateral equity, rounded toward zero.
-    pub collateral_value: Decimal,
+    /// Contribution to collateral equity, rounded down (toward negative
+    /// infinity); `None` when it cannot be bounded (a debt without a usable
+    /// mark).
+    pub collateral_value: Option<Decimal>,
 }
 
 /// Split of the PnL into realized, unrealized and fees, in the reporting
@@ -244,8 +253,9 @@ pub struct AccountValuation {
     pub net_pnl: Option<Decimal>,
     /// Attribution of `net_pnl`.
     pub attribution: Option<PnlAttribution>,
-    /// Equity that marks can be trusted for. See the [module docs](self).
-    pub collateral_equity: Decimal,
+    /// Equity that marks can be trusted for, rounded down; `None` when a
+    /// debt cannot be valued conservatively. See the [module docs](self).
+    pub collateral_equity: Option<Decimal>,
 }
 
 impl AccountValuation {
@@ -328,6 +338,63 @@ fn validate(snapshot: &LedgerSnapshot, marks: &MarkSet, policy: &ValuationPolicy
     Ok(scale)
 }
 
+/// How one balance counts toward collateral equity.
+enum Collateral {
+    /// `product(factors)`.
+    Counted(Vec<Decimal>),
+    /// Contributes nothing (an asset held, without a trusted mark).
+    Nothing,
+    /// Cannot be bounded: a debt without a usable mark.
+    Unknown,
+}
+
+/// Collateral treatment of a balance of `total` with a mark in `state`.
+///
+/// Assets held (positive balances) count at a valid mark, at
+/// `price * (1 - haircut)` for a stale mark under
+/// [`InvalidMarkPolicy::HaircutStale`], and otherwise not at all. Debts
+/// (negative balances) always count: at a valid mark in full, at
+/// `price * (1 + haircut)` for a stale mark under the haircut policy (a
+/// haircut never shrinks a debt), and otherwise the collateral is unknown.
+fn collateral_factors(
+    total: Decimal,
+    state: MarkStatus,
+    price: Option<Decimal>,
+    policy: &ValuationPolicy,
+) -> Result<Collateral> {
+    if total.is_zero() {
+        return Ok(Collateral::Nothing);
+    }
+    let debt = total < Decimal::ZERO;
+    Ok(match (state, price) {
+        (MarkStatus::Valid, Some(p)) => Collateral::Counted(vec![total, p]),
+        (MarkStatus::Stale { .. }, Some(p)) => match policy.invalid_marks {
+            InvalidMarkPolicy::HaircutStale { haircut } => {
+                let factor = if debt {
+                    add(Decimal::ONE, haircut, "1 + haircut")?
+                } else {
+                    sub(Decimal::ONE, haircut, "1 - haircut")?
+                };
+                Collateral::Counted(vec![total, p, factor])
+            }
+            InvalidMarkPolicy::Exclude if debt => Collateral::Unknown,
+            InvalidMarkPolicy::Exclude => Collateral::Nothing,
+        },
+        _ if debt => Collateral::Unknown,
+        _ => Collateral::Nothing,
+    })
+}
+
+/// `sum(product(term))` rounded once toward negative infinity.
+fn floor_terms(terms: &[&[Decimal]], scale: u32, operation: &'static str) -> Result<Decimal> {
+    let away = sum_terms_round(terms, scale, Rounding::AwayFromZero, operation)?;
+    if away < Decimal::ZERO {
+        Ok(away)
+    } else {
+        sum_terms_round(terms, scale, Rounding::TowardZero, operation)
+    }
+}
+
 /// Values the account in `snapshot` at `marks`. See the
 /// [module docs](self).
 ///
@@ -360,6 +427,7 @@ pub fn value(
     let mut equity_terms: Vec<Vec<Decimal>> = Vec::new();
     let mut equity_known = true;
     let mut collateral_terms: Vec<Vec<Decimal>> = Vec::new();
+    let mut collateral_known = true;
     for (asset, balance) in &snapshot.balances {
         let state = status.get(asset).copied().unwrap_or(MarkStatus::Missing);
         let asset_price = price(asset);
@@ -379,26 +447,18 @@ pub fn value(
                 None => equity_known = false,
             }
         }
-        let collateral_factors: Option<Vec<Decimal>> = match (state, asset_price) {
-            (MarkStatus::Valid, Some(p)) => Some(vec![balance.total, p]),
-            (MarkStatus::Stale { .. }, Some(p)) => match policy.invalid_marks {
-                InvalidMarkPolicy::HaircutStale { haircut } => Some(vec![
-                    balance.total,
-                    p,
-                    sub(Decimal::ONE, haircut, "1 - haircut")?,
-                ]),
-                InvalidMarkPolicy::Exclude => None,
-            },
-            _ => None,
-        };
-        let collateral_value = match &collateral_factors {
-            Some(factors) => {
-                sum_terms_round(&[factors], scale, Rounding::TowardZero, "collateral")?
+        let collateral = collateral_factors(balance.total, state, asset_price, policy)?;
+        let collateral_value = match &collateral {
+            Collateral::Counted(factors) => {
+                Some(floor_terms(&[factors.as_slice()], scale, "collateral")?)
             }
-            None => Decimal::ZERO,
+            Collateral::Nothing => Some(Decimal::ZERO),
+            Collateral::Unknown => None,
         };
-        if let Some(factors) = collateral_factors {
-            collateral_terms.push(factors);
+        match collateral {
+            Collateral::Counted(factors) => collateral_terms.push(factors),
+            Collateral::Nothing => {}
+            Collateral::Unknown => collateral_known = false,
         }
         assets.insert(
             asset.clone(),
@@ -421,8 +481,12 @@ pub fn value(
     } else {
         None
     };
-    let collateral_equity =
-        round_terms(&collateral_terms, Rounding::TowardZero, "collateral equity")?;
+    let collateral_equity = if collateral_known {
+        let slices: Vec<&[Decimal]> = collateral_terms.iter().map(Vec::as_slice).collect();
+        Some(floor_terms(&slices, scale, "collateral equity")?)
+    } else {
+        None
+    };
 
     // Net transfers.
     let mut transfer_terms = Vec::new();
@@ -457,18 +521,20 @@ pub fn value(
                 instrument: id.clone(),
             });
         };
-        if position.quantity.is_zero()
-            && position.cost_basis.is_zero()
-            && position.realized_pnl.is_zero()
-        {
-            continue;
+        // Each term needs only the price it multiplies, and zero terms need
+        // none: a closed position with realized PnL needs the quote only.
+        if !position.realized_pnl.is_zero() || !position.cost_basis.is_zero() {
+            needed.insert(spot.quote());
+            if let Some(quote) = price(spot.quote()) {
+                realized_terms.push(vec![position.realized_pnl, quote]);
+                unrealized_terms.push(vec![-position.cost_basis, quote]);
+            }
         }
-        needed.insert(spot.base());
-        needed.insert(spot.quote());
-        if let (Some(base), Some(quote)) = (price(spot.base()), price(spot.quote())) {
-            realized_terms.push(vec![position.realized_pnl, quote]);
-            unrealized_terms.push(vec![position.quantity, base]);
-            unrealized_terms.push(vec![-position.cost_basis, quote]);
+        if !position.quantity.is_zero() {
+            needed.insert(spot.base());
+            if let Some(base) = price(spot.base()) {
+                unrealized_terms.push(vec![position.quantity, base]);
+            }
         }
     }
     let mut fee_terms = Vec::new();

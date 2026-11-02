@@ -22,15 +22,24 @@ Cash posting and valuation are separate.
 | Figure | Definition | Invalid marks |
 |---|---|---|
 | `equity` | `sum(total balance * price)`, rounded once (policy rounding) | Stale and future marks are used and flagged. A held asset with a missing or non-positive price gives `None`, not a guess |
-| `collateral_equity` | Value that marks can be trusted for, rounded toward zero | Only valid marks count, plus stale marks under the explicit `InvalidMarkPolicy::HaircutStale { haircut }`, which counts `price * (1 - haircut)`. Everything else counts 0 |
+| `collateral_equity` | Value that marks can be trusted for, rounded down (toward negative infinity) | See the rules below |
 
-Spot balances are never negative. Leaving an asset out therefore never raises collateral: **an invalid mark cannot create spendable equity without an explicit policy**. A stale mark above the true price cannot inflate collateral either.
+Collateral rules, per balance:
+
+| Balance | Valid mark | Stale, `HaircutStale { haircut }` | Stale with `Exclude`, future, non-positive, missing |
+|---|---|---|---|
+| Held (positive) | `total * price` | `total * price * (1 - haircut)` | 0 |
+| Debt (negative) | `total * price` | `total * price * (1 + haircut)`: a haircut never shrinks a debt | unknown, so `collateral_equity` is `None` |
+
+A debt can appear in a stress scenario after a hypothetical fill, or from a fee charged in an asset that is not held. A debt always counts, and an asset without a trusted mark never adds value. **An invalid mark can only lower collateral or make it unknown; it cannot create spendable equity.**
+
+With `Exclude`, a stale mark above the true price cannot inflate collateral. With `HaircutStale`, a stale mark counts at its price less the haircut, so the policy must be chosen with that in mind.
 
 ## PnL with fees counted once
 
 - Fees are debited from the balance of the asset they were charged in, so equity includes them once.
 - `net_pnl = equity - net_transfers`, where deposits minus withdrawals are valued at the same marks. This identity is exact.
-- `PnlAttribution` splits `net_pnl` in the reporting asset:
+- `PnlAttribution` splits `net_pnl` in the reporting asset. Each term needs only the price it multiplies, and zero terms need none: a closed position with realized PnL needs the quote mark only, not the base mark.
   - `realized = sum(realized_pnl * price(quote))`, gross of fees;
   - `unrealized = sum(quantity * price(base) - cost_basis * price(quote))`;
   - `fees = sum(fees_paid * price(asset))`.
@@ -42,9 +51,17 @@ Spot balances are never negative. Leaving an asset out therefore never raises co
 
 1. **Hypothetical fills.** Fills such as a hedge that is expected to execute are applied to a copy of the snapshot with the ledger's booking rules: the notional is rounded once, the fee is debited once, and positions use average cost. Balances are not checked. Leaving the hedge out models a failed hedge.
 2. **Gaps.** `price * (1 + shock)` per asset, applied exactly. The shock must be greater than -1.
-3. **Liquidation spread.** Each non-reporting asset with a positive balance is valued at `price * (1 - spread)`, with `spread` in `[0, 1)`.
+3. **Liquidation spread.** Each non-reporting asset with a positive balance is valued at `price * (1 - spread)`, which is the sale proceeds. Each one with a negative balance is valued at `price * (1 + spread)`, which is the buy-back cost. `spread` is in `[0, 1)`.
 
-`StressResult` reports both valuations, `equity_change` and `collateral_change`. Invalid marks stay invalid under stress.
+All parameters are validated before anything is computed:
+
+- a shock must name a registered asset other than the reporting asset, and be greater than -1;
+- the spread must be in `[0, 1)`;
+- hypothetical fills follow the ledger's input rules: positive price and quantity within the instrument scales, and a fee within its asset scale.
+
+A shock on an asset without a mark has no effect and is listed in `StressResult::ignored_shocks`.
+
+`StressResult` reports both valuations, `equity_change` and `collateral_change` (each `None` when a side is unknown), and `ignored_shocks`. Invalid marks stay invalid under stress.
 
 ## Snapshot additions
 
@@ -54,5 +71,5 @@ Spot balances are never negative. Leaving an asset out therefore never raises co
 
 - Margin requirements (M3-03).
 - Portfolio risk (M3-02).
-- Derivatives and negative balances.
+- Derivatives. Negative balances only arise in hypothetical scenarios; the ledger never books one.
 - Mark sourcing itself: the caller supplies marks.
