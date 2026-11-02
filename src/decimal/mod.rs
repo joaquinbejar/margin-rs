@@ -162,6 +162,25 @@ pub(crate) fn sum(values: &[Decimal], operation: &'static str) -> Result<Decimal
     total.to_decimal(common).ok_or_else(error)
 }
 
+/// Exact `sum(product(term))`, without rounding: intermediate products and
+/// partial sums stay in wide integers and only the result must be
+/// representable.
+pub(crate) fn sum_products(terms: &[&[Decimal]], operation: &'static str) -> Result<Decimal> {
+    let error = || MarginError::arithmetic(operation);
+    let mut products = Vec::with_capacity(terms.len());
+    for term in terms {
+        products.push(wide_product(term).ok_or_else(error)?);
+    }
+    let common = products.iter().map(|(_, s)| *s).max().unwrap_or(0);
+    let mut total = Wide::ZERO;
+    for (value, scale) in products {
+        total = total
+            .checked_add(value.scale_up(common - scale).ok_or_else(error)?)
+            .ok_or_else(error)?;
+    }
+    total.to_decimal(common).ok_or_else(error)
+}
+
 /// Quadratic form `e' C e` where `e_i` is the exact sum of `groups[i]`,
 /// rounded once to `scale`. The sums stay in wide integers until the final
 /// rounding, so neither a partial sum nor a net `e_i` needs to be
@@ -617,6 +636,26 @@ mod tests {
             Err(MarginError::arithmetic("t"))
         );
         assert_eq!(product(&[], "t"), Ok(dec!(1)));
+    }
+
+    #[test]
+    fn exact_sum_of_products_without_rounding() {
+        // MAX * 2 - MAX * 2 + 0.1 * 3: intermediates overflow, the result is 0.3.
+        assert_eq!(
+            sum_products(
+                &[
+                    &[Decimal::MAX, dec!(2)],
+                    &[Decimal::MIN, dec!(2)],
+                    &[dec!(0.1), dec!(3)]
+                ],
+                "t"
+            ),
+            Ok(dec!(0.3))
+        );
+        assert_eq!(
+            sum_products(&[&[Decimal::MAX, dec!(2)]], "t"),
+            Err(MarginError::arithmetic("t"))
+        );
     }
 
     #[test]

@@ -663,3 +663,65 @@ fn long_two_btc_free() -> Ledger {
         .expect("deposit");
     ledger
 }
+
+/// Exact aggregation audit: a stressed price is one exact product.
+/// 7e28 * 1.5 overflows, but 7e28 * 1.5 * 0.5 = 5.25e28 does not.
+#[test]
+fn stressed_price_is_one_exact_product() {
+    let mut ledger = Ledger::default();
+    ledger.register_asset(asset("USDC"), 6).expect("register");
+    ledger.register_asset(asset("BTC"), 8).expect("register");
+    ledger
+        .deposit(
+            TransferId::new("d").expect("id"),
+            asset("BTC"),
+            dec!(0.000001),
+        )
+        .expect("deposit");
+    let marks = MarkSet::new(0).with(
+        asset("BTC"),
+        Mark::new(dec!(70000000000000000000000000000), 0, PriceSource::Index),
+    );
+    let scenario = Scenario::new("x")
+        .shock(asset("BTC"), dec!(0.5))
+        .spread(dec!(0.5));
+    let r = stress(&ledger.snapshot(), &marks, &policy(), &scenario).expect("stress");
+    assert_eq!(r.stressed.equity, Some(dec!(52500000000000000000000)));
+}
+
+/// Exact aggregation audit: all changes to one asset from a hypothetical
+/// fill are applied in one exact step. Holding MAX - 1 BTC, a buy of 2 BTC
+/// with a 2 BTC fee leaves MAX - 1 although MAX + 1 never fits.
+#[test]
+fn hypothetical_fill_changes_apply_in_one_step() {
+    let mut ledger = long_two_btc_free();
+    ledger
+        .deposit(
+            TransferId::new("big").expect("id"),
+            asset("BTC"),
+            Decimal::MAX - dec!(2),
+        )
+        .expect("deposit");
+    let fill = HypotheticalFill {
+        instrument: pair(),
+        side: Side::Buy,
+        price: dec!(1),
+        quantity: dec!(2),
+        fee: Some(Fee {
+            asset: asset("BTC"),
+            amount: dec!(2),
+        }),
+    };
+    let marks = btc_at(dec!(0.00000001), 5000);
+    let r = stress(
+        &ledger.snapshot(),
+        &marks,
+        &policy(),
+        &Scenario::new("x").fill(fill),
+    )
+    .expect("stress");
+    assert_eq!(
+        r.stressed.assets[&asset("BTC")].total,
+        Decimal::MAX - dec!(1)
+    );
+}

@@ -36,7 +36,7 @@ use std::collections::BTreeMap;
 
 use rust_decimal::Decimal;
 
-use crate::decimal::{Rounding, add, check_scale, mul, mul_div_round, sub};
+use crate::decimal::{Rounding, add, check_scale, mul_div_round, product, sub, sum};
 use crate::error::{MarginError, Result};
 use crate::ids::{Asset, InstrumentId};
 use crate::instrument::Instrument;
@@ -181,28 +181,27 @@ pub fn stress(
     let buy_back = add(Decimal::ONE, scenario.liquidation_spread, "1 + spread")?;
     let mut stressed_marks = marks.clone();
     for (asset, mark) in &mut stressed_marks.prices {
+        // price * (1 + shock) * spread factor as one exact product: only the
+        // stressed price must be representable.
+        let mut factors = vec![mark.price];
         if let Some(shock) = scenario.shocks.get(asset) {
-            mark.price = mul(
-                mark.price,
-                add(Decimal::ONE, *shock, "1 + shock")?,
-                "price * (1 + shock)",
-            )?;
+            factors.push(add(Decimal::ONE, *shock, "1 + shock")?);
         }
-        if scenario.liquidation_spread.is_zero() {
-            continue;
+        if !scenario.liquidation_spread.is_zero() {
+            // Holdings are sold across the spread; debts are bought back
+            // across it.
+            let total = stressed_snapshot
+                .balances
+                .get(asset)
+                .map(|b| b.total)
+                .unwrap_or_default();
+            if total > Decimal::ZERO {
+                factors.push(sell);
+            } else if total < Decimal::ZERO {
+                factors.push(buy_back);
+            }
         }
-        // Holdings are sold across the spread; debts are bought back across
-        // it.
-        let total = stressed_snapshot
-            .balances
-            .get(asset)
-            .map(|b| b.total)
-            .unwrap_or_default();
-        if total > Decimal::ZERO {
-            mark.price = mul(mark.price, sell, "price * (1 - spread)")?;
-        } else if total < Decimal::ZERO {
-            mark.price = mul(mark.price, buy_back, "price * (1 + spread)")?;
-        }
+        mark.price = product(&factors, "stressed price")?;
     }
 
     let stressed = value(&stressed_snapshot, &stressed_marks, policy)?;
@@ -264,20 +263,34 @@ fn apply_hypothetical(
         Side::Buy => (fill.quantity, notional),
         Side::Sell => (-fill.quantity, -notional),
     };
-    let mut deltas: Vec<(Asset, Decimal)> = vec![
-        (spot.base().clone(), signed_quantity),
-        (spot.quote().clone(), -signed_value),
-    ];
+    // Every change to one asset is summed in one exact step, so a fee in
+    // the base or quote asset cannot make an intermediate overflow.
+    let mut deltas: BTreeMap<Asset, Vec<Decimal>> = BTreeMap::new();
+    deltas
+        .entry(spot.base().clone())
+        .or_default()
+        .push(signed_quantity);
+    deltas
+        .entry(spot.quote().clone())
+        .or_default()
+        .push(-signed_value);
     if let Some(fee) = &fill.fee {
         check_scale(fee.amount, scale_of(&fee.asset)?, "fee")?;
-        deltas.push((fee.asset.clone(), -fee.amount));
+        deltas
+            .entry(fee.asset.clone())
+            .or_default()
+            .push(-fee.amount);
         let paid = snapshot.fees_paid.entry(fee.asset.clone()).or_default();
         *paid = add(*paid, fee.amount, "fees + fee")?;
     }
-    for (asset, delta) in deltas {
+    for (asset, changes) in deltas {
         let balance = snapshot.balances.entry(asset).or_default();
-        balance.total = add(balance.total, delta, "balance + delta")?;
-        balance.available = add(balance.available, delta, "available + delta")?;
+        let mut total = vec![balance.total];
+        total.extend(&changes);
+        let mut available = vec![balance.available];
+        available.extend(&changes);
+        balance.total = sum(&total, "balance + deltas")?;
+        balance.available = sum(&available, "available + deltas")?;
     }
     let position = snapshot
         .positions

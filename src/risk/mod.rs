@@ -96,7 +96,7 @@ pub use decision::{
     ExecutionAnomaly, FillReport, HaltReason, OrderPurpose, OrderRequest, RiskDecision, RiskReason,
 };
 
-use crate::decimal::{Rounding, add, check_scale, mul, mul_div_round, sub};
+use crate::decimal::{Rounding, add, check_scale, mul, mul_div_round, sub, sum, sum_products};
 use crate::error::{MarginError, Result};
 use crate::ids::{Asset, InstrumentId, OrderId, ReservationId, TransferId};
 use crate::instrument::{Instrument, SpotInstrument};
@@ -658,11 +658,12 @@ impl RiskGate {
         // Largest quantity this order can add before the worst case position
         // on its side reaches `bound` in absolute value.
         let headroom = |bound: Decimal| -> Result<Decimal> {
-            let used = match request.side {
-                Side::Buy => add(position, open_buys, "position + open buys")?,
-                Side::Sell => sub(open_sells, position, "open sells - position")?,
+            // bound - worst case, in one exact step.
+            let room = match request.side {
+                Side::Buy => sum(&[bound, -position, -open_buys], "limit - worst case")?,
+                Side::Sell => sum(&[bound, -open_sells, position], "limit - worst case")?,
             };
-            floor(sub(bound, used, "limit - worst case")?)
+            floor(room)
         };
         if let Some(limit) = limits.max_position {
             let room = headroom(limit)?;
@@ -750,7 +751,13 @@ impl RiskGate {
                 let fee_part = if rate.is_zero() {
                     Decimal::ZERO
                 } else {
-                    up(mul(rate, cash, "rate * lot cash")?, "round up lot fee")?
+                    mul_div_round(
+                        &[rate, cash],
+                        &[],
+                        scale,
+                        Rounding::AwayFromZero,
+                        "round up lot fee",
+                    )?
                 };
                 let on_grid = add(cash, fee_part, "lot cash + fee")?;
                 // Bound 2, exact: (1 + rate) * (lot cost + h) + fee ulp,
@@ -762,15 +769,14 @@ impl RiskGate {
                     Rounding::TowardZero => Decimal::ZERO,
                     Rounding::AwayFromZero => ulp,
                 };
-                let exact = add(lot_cost, h, "lot cost + h")
-                    .and_then(|v| mul(add(Decimal::ONE, rate, "1 + rate")?, v, "(1 + rate) * v"))
-                    .and_then(|v| {
-                        if rate.is_zero() {
-                            Ok(v)
-                        } else {
-                            add(v, ulp, "+ fee ulp")
-                        }
-                    });
+                // (1 + rate) * (lot cost + h) + fee ulp, in one exact step.
+                let fee_ulp = if rate.is_zero() { Decimal::ZERO } else { ulp };
+                let exact = add(Decimal::ONE, rate, "1 + rate").and_then(|one_plus| {
+                    sum_products(
+                        &[&[one_plus, lot_cost], &[one_plus, h], &[fee_ulp]],
+                        "exact lot bound",
+                    )
+                });
                 let per_lot = match exact {
                     Ok(bound) if bound < on_grid => bound,
                     _ => on_grid,
@@ -803,15 +809,15 @@ impl RiskGate {
     }
 
     fn open_quantities(&self, instrument: &InstrumentId) -> Result<(Decimal, Decimal)> {
-        let mut buys = Decimal::ZERO;
-        let mut sells = Decimal::ZERO;
+        let mut buys = Vec::new();
+        let mut sells = Vec::new();
         for order in self.live_orders().filter(|o| &o.instrument == instrument) {
             match order.side {
-                Side::Buy => buys = add(buys, order.remaining(), "open buys")?,
-                Side::Sell => sells = add(sells, order.remaining(), "open sells")?,
+                Side::Buy => buys.push(order.remaining()),
+                Side::Sell => sells.push(order.remaining()),
             }
         }
-        Ok((buys, sells))
+        Ok((sum(&buys, "open buys")?, sum(&sells, "open sells")?))
     }
 
     fn spot(&self, instrument: &InstrumentId) -> Result<SpotInstrument> {

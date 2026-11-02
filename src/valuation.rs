@@ -56,7 +56,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rust_decimal::Decimal;
 
-use crate::decimal::{Rounding, add, sub, sum_terms_round};
+use crate::decimal::{Rounding, add, sub, sum, sum_terms_round};
 use crate::error::{MarginError, Result};
 use crate::ids::Asset;
 use crate::instrument::Instrument;
@@ -563,16 +563,13 @@ pub fn value(
             let realized = round_terms(&realized_terms, rounding, "realized")?;
             let unrealized = round_terms(&unrealized_terms, rounding, "unrealized")?;
             let fees = round_terms(&fee_terms, rounding, "fees")?;
-            let explained = sub(
-                add(realized, unrealized, "realized + unrealized")?,
-                fees,
-                "gross - fees",
-            )?;
+            // net - (realized + unrealized - fees), in one exact step.
+            let rounding_difference = sum(&[net, -realized, -unrealized, fees], "net - explained")?;
             Some(PnlAttribution {
                 realized,
                 unrealized,
                 fees,
-                rounding_difference: sub(net, explained, "net - explained")?,
+                rounding_difference,
             })
         }
         _ => None,
