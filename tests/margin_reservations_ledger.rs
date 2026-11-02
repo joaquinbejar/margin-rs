@@ -341,6 +341,104 @@ fn exposure_outside_the_service_is_margined() {
     );
 }
 
+/// The four paths margin and value a derivative outside the service, at
+/// a loss, flat and at a gain. Order a (1 XYZ, 2000) is held first; then
+/// OTHER-PERP long 500 at 100 is booked: at mark `m` its requirement is
+/// 50m and its upnl 500(m - 100), and the cash is 8000 available + 2000
+/// held.
+///
+/// | m | requirement | sync_hold | b = 3 XYZ (6000) | fill of a: required, hold |
+/// |---|---|---|---|---|
+/// | 90 | 4500 + 2000 | 6500 | 12500 vs 5000: rejected | 6500, 6500 |
+/// | 100 | 5000 + 2000 | 7000 | 13000 vs 10000: rejected | 7000, 7000 |
+/// | 110 | 5500 + 2000 | 7500 | 13500 vs 15000: accepted, hold 10000 | 13500, 10000 |
+#[test]
+fn every_path_margins_exposure_outside_the_service() {
+    type Case = (Decimal, Decimal, MarginDecision, Decimal, Decimal);
+    let rejected = |required, collateral, shortfall| MarginDecision::Rejected {
+        reason: MarginRejection::InsufficientMargin {
+            required,
+            collateral,
+            shortfall,
+        },
+    };
+    let cases: [Case; 3] = [
+        (
+            dec!(90),
+            dec!(4500),
+            rejected(dec!(12500), dec!(5000), dec!(7500)),
+            dec!(6500),
+            dec!(6500),
+        ),
+        (
+            dec!(100),
+            dec!(5000),
+            rejected(dec!(13000), dec!(10000), dec!(3000)),
+            dec!(7000),
+            dec!(7000),
+        ),
+        (
+            dec!(110),
+            dec!(5500),
+            MarginDecision::Reserved {
+                required: dec!(13500),
+                reserved: dec!(6000),
+            },
+            dec!(13500),
+            dec!(10000),
+        ),
+    ];
+    for (mark, other, decision, required, held) in cases {
+        let mut gate = gate();
+        let mut service = on_ledger();
+        let mut at = marks();
+        at.insert(iid("OTHER-PERP"), mark);
+        reserve(
+            &mut service,
+            &mut gate,
+            order("a", "XYZ-PERP", Action::Buy, dec!(1)),
+            &at,
+        );
+        book(
+            &mut gate,
+            &execution("x", "OTHER-PERP", Action::Buy, dec!(100), dec!(500)),
+        );
+        let state = service.requirement_with_gate(&gate, &at).expect("state");
+        assert_eq!(
+            (state.positions, state.pending, state.total),
+            (other, dec!(2000), other + dec!(2000))
+        );
+        assert_eq!(
+            service.sync_hold(&mut gate, &hold(), &at),
+            Ok(other + dec!(2000))
+        );
+        assert_eq!(
+            reserve(
+                &mut service,
+                &mut gate,
+                order("b", "XYZ-PERP", Action::Buy, dec!(3)),
+                &at
+            ),
+            decision
+        );
+        book(
+            &mut gate,
+            &execution("f", "XYZ-PERP", Action::Buy, dec!(2000), dec!(1)),
+        );
+        assert_eq!(
+            service.apply_booked_fill(&mut gate, &oid("a"), &eid("f"), &at),
+            Ok(BookedFill::Applied {
+                contracts: dec!(1),
+                remaining: dec!(0),
+                overfill: None,
+                required,
+                hold: held,
+            })
+        );
+        assert_eq!(gate.hold(&hold()), held);
+    }
+}
+
 /// A loss on a derivative the service does not trade lowers collateral.
 /// OTHER-PERP: long 10 at 100 (basis 1000).
 /// - Mark 90: upnl -100, requirement 90; collateral 9900 against 5 XYZ
