@@ -1738,10 +1738,12 @@ impl Ledger {
     /// the net funding is checked per asset. Per instrument, it checks that
     /// the position quantity equals the net traded quantity and that the
     /// quote cash exchanged by trades equals `realized_pnl - cost_basis`
-    /// (cost is conserved exactly). For a future or perpetual the
+    /// (cost is conserved exactly). For a linear future or perpetual the
     /// same identity holds with the signed virtual notionals (`-N` for a
-    /// buy, `+N` for a sell, the expiry close included), recomputed from
-    /// every fill and compared in wide integers.
+    /// buy, `+N` for a sell, the expiry close included): their sum equals
+    /// `realized_pnl - basis`. For an inverse one the signed virtual values
+    /// (`-V` for a buy, `+V` for a sell) sum to `-realized_pnl - basis`.
+    /// Both are recomputed from every fill and compared in wide integers.
     ///
     /// An overdraft (a balance below its reservations, after booking a real
     /// execution with [`Ledger::book_execution_allowing_overdraft`]) is not

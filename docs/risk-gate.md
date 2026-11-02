@@ -129,7 +129,7 @@ A repeated report (same execution id and content) returns a `Duplicate` booking 
 
 ## Mapping from market-maker-rs (contract for the adapter)
 
-The market-maker-rs integration belongs to market-maker-rs, which does not depend on margin-rs yet. The table below is the contract it implements.
+The market-maker-rs integration belongs to market-maker-rs, which uses margin-rs optionally through its `margin` feature. The table below is the contract it implements.
 
 | market-maker-rs (`origin/main` a869711) | margin-rs |
 |---|---|

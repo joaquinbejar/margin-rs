@@ -47,8 +47,10 @@ was unpublished are not listed one by one.
 - `book_settlement` (`DerivativeSettlement`) posts the cash of derivatives
   that are not registered in the ledger (legacy path).
 - `reconcile()` checks balances, fees, transfers and funding per asset,
-  and per derivative the contracts and the identity `sum of signed virtual
-  notionals = realized_pnl - basis`, in wide integers.
+  and per derivative the contracts and, in wide integers, the identity
+  `sum of signed virtual notionals (-N buy, +N sell) = realized_pnl -
+  basis` for a linear contract and `sum of signed virtual values (-V buy,
+  +V sell) = -realized_pnl - basis` for an inverse one.
 
 #### Pretrade risk (`risk`)
 
@@ -132,9 +134,10 @@ was unpublished are not listed one by one.
   ledger would book it, even where rounding to a coarse cash quantum opens
   windows the unrounded figures do not have. Exact bounds in wide integers
   limit an exact walk, which shares a budget of `SEARCH_BUDGET` (4096)
-  evaluations per plan. Beyond it the plan takes a count proven valid and
-  reports `LiquidationPlan::minimal == false`, or fails with
-  `MarginError::CloseoutSearchLimit`. Counts that would leave a position
+  evaluations per plan. Beyond it the plan takes the first count certified
+  to meet the target, and `LiquidationPlan::minimal` is `false` when that
+  count is not proven the smallest; with no certified count the plan
+  fails with `MarginError::CloseoutSearchLimit`. Counts that would leave a position
   no `Decimal` can hold are skipped arithmetically.
 - A `contract_step` whose multiples below a level's size (or the
   position's) are not exact at the step's scale is refused with
@@ -173,4 +176,6 @@ was unpublished are not listed one by one.
 - Options are not covered by the ledger, the margin rules or the closeout.
 - The journal and the set of seen ids grow for the life of a ledger;
   pruning and checkpoints are future work.
-- market-maker-rs does not depend on margin-rs yet.
+- market-maker-rs uses margin-rs optionally through its `margin` feature,
+  pinned by git to an earlier revision; updating it to this release is
+  pending.

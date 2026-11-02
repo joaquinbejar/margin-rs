@@ -14,15 +14,15 @@ categories = ["finance"]
 # Not published yet: the owner decides the first release.
 publish = false
 include = [
-    "src/**/*",
-    "tests/**/*.rs",
-    "Cargo.toml",
-    "README.md",
-    "CHANGELOG.md",
-    "docs/*.md",
-    "LICENSE",
-    "Makefile",
-    "rust-toolchain.toml",
+    "/src/**/*",
+    "/tests/**/*.rs",
+    "/Cargo.toml",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/docs/*.md",
+    "/LICENSE",
+    "/Makefile",
+    "/rust-toolchain.toml",
 ]
 
 [lib]

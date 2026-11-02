@@ -97,7 +97,7 @@ Precision: the products and their sum are computed exactly and rounded once to t
 
 ## Mapping from market-maker-rs (contract for the adapter)
 
-The market-maker-rs side, wiring `BacktestEngine` and `InventoryPosition::update_fill` to read from the ledger and its reconciliation tests, belongs to market-maker-rs, which does not depend on margin-rs yet.
+The market-maker-rs side, wiring `BacktestEngine` and `InventoryPosition::update_fill` to read from the ledger and its reconciliation tests, belongs to market-maker-rs, which uses margin-rs optionally through its `margin` feature.
 
 The adapter maps types as follows:
 

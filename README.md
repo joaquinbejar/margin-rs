@@ -13,10 +13,10 @@ Rust with exact decimal arithmetic throughout. It provides a single
 accounting ledger, a pretrade risk gate, mark to market valuation and stress,
 versioned margin rules, collateral with haircuts, margin reserved for pending
 orders, maintenance states, and staged closeout plans. It can be used on its
-own or as the accounting and risk layer of a market making stack. The
-integration with
-[market-maker-rs](https://github.com/joaquinbejar/market-maker-rs) is
-planned: market-maker-rs does not depend on margin-rs yet.
+own or as the accounting and risk layer of a market making stack:
+[market-maker-rs](https://github.com/joaquinbejar/market-maker-rs) uses it
+optionally through its `margin` feature, pinned by git to an earlier
+revision; updating it to this release is pending.
 
 ## Overview
 
@@ -107,8 +107,10 @@ rounding, and no partial sum that can overflow while the result does not.
   deficit and debt).
 - **Certified search**: the smallest count of each level is found as the
   ledger would book it, within a budget of `SEARCH_BUDGET` evaluations per
-  plan. Beyond it the plan takes a count proven valid and reports
-  `LiquidationPlan::minimal == false`, or fails with `CloseoutSearchLimit`.
+  plan. Beyond it the plan takes the first count certified to meet the
+  target, and `LiquidationPlan::minimal` is `false` when that count is not
+  proven the smallest; with no certified count the plan fails with
+  `CloseoutSearchLimit`.
   A `contract_step` whose counts are not exact at its scale is refused.
 - **From and back to the ledger**: `LiquidationAccount::from_ledger` reads
   the account, and `ForcedReduction::execution` books each forced fill, so
@@ -337,8 +339,10 @@ See [docs/exact-arithmetic.md](docs/exact-arithmetic.md).
   release.
 - Rust edition 2024, MSRV 1.88. CI runs the latest stable and the MSRV.
 - Small dependency set: `financial_types`, `thiserror` and `rust_decimal`
-  (without default features). margin-rs never depends on market-maker-rs. Planned
-  integration: market-maker-rs does not depend on margin-rs yet.
+  (without default features). margin-rs never depends on market-maker-rs.
+  market-maker-rs uses margin-rs optionally through its `margin` feature,
+  pinned by git to an earlier revision; updating it to this release is
+  pending.
   `Cargo.lock` is committed so CI, including the MSRV job, is
   reproducible.
 
@@ -351,7 +355,7 @@ make fmt         # Format the code
 make fmt-check   # Check formatting
 make lint        # Clippy with warnings as errors
 make doc         # Documentation with warnings as errors
-make msrv        # Build and test on the MSRV (1.88)
+make msrv        # Check every target on the MSRV (1.88)
 make pre-push    # fmt-check, lint, test, doc and msrv
 ```
 
@@ -395,6 +399,6 @@ Repositories by the same author that this project depends on, and repositories t
 
 | Repository | Description |
 |------------|-------------|
-| [market-maker-rs](https://github.com/joaquinbejar/market-maker-rs) · [crates.io](https://crates.io/crates/market-maker-rs) | Quantitative market making strategies, starting with the Avellaneda-Stoikov model. Planned integration: it does not depend on margin-rs yet. |
+| [market-maker-rs](https://github.com/joaquinbejar/market-maker-rs) · [crates.io](https://crates.io/crates/market-maker-rs) | Quantitative market making strategies, starting with the Avellaneda-Stoikov model. It uses margin-rs optionally through its `margin` feature, pinned by git to an earlier revision; updating it to this release is pending. |
 
 <!-- related-projects:end -->

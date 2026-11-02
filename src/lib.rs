@@ -51,8 +51,11 @@
 //!   plan (cancel, reduce, residual) against scenario liquidity, with the
 //!   deficit left explicit. The smallest closeout of each level is found by
 //!   a certified search within [`liquidation::SEARCH_BUDGET`] evaluations
-//!   per plan ([`liquidation::LiquidationPlan::minimal`] is `false` when
-//!   the budget runs out). The account is read with
+//!   per plan. Beyond it the plan takes the first count certified to meet
+//!   the target, and [`liquidation::LiquidationPlan::minimal`] is `false`
+//!   when that count is not proven the smallest; with no certified count
+//!   the plan fails with [`MarginError::CloseoutSearchLimit`]. The account
+//!   is read with
 //!   [`liquidation::LiquidationAccount::from_ledger`], and each forced fill
 //!   is booked back with [`liquidation::ForcedReduction::execution`], so the
 //!   booked plan leaves exactly the planned state.
@@ -62,8 +65,9 @@
 //!
 //! - Edition 2024, MSRV 1.88; CI checks both the latest stable and the MSRV.
 //! - Small default dependency set; the crate never depends on
-//!   market-maker-rs. Planned integration: market-maker-rs does not depend
-//!   on margin-rs yet.
+//!   market-maker-rs. market-maker-rs uses margin-rs optionally through its
+//!   `margin` feature, pinned by git to an earlier revision; updating it to
+//!   this release is pending.
 //! - No binary floating point arithmetic (`clippy::float_arithmetic`).
 //!   Money, prices and quantities are [`Decimal`]s; every operation is
 //!   checked and exact, and the few rounding steps are explicit (see
