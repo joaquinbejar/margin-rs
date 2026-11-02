@@ -641,9 +641,11 @@ impl Ledger {
     /// perpetual, after the duplicate and conflict checks:
     ///
     /// - [`MarginError::InvalidInput`]: a reservation is given (a derivative
-    ///   fill consumes none).
-    /// - [`MarginError::Expired`]: the future was settled at expiry; a real
-    ///   fill delivered after the settlement needs manual resolution.
+    ///   fill consumes none), or the execution has no `executed_at_ms`.
+    /// - [`MarginError::ExecutedAfterExpiry`]: a future's fill executed at or
+    ///   after its expiry, whether or not the future was settled. A fill
+    ///   executed before the expiry and delivered after the settlement is
+    ///   booked and closed at the settlement price.
     /// - [`MarginError::InvalidInput`] or [`MarginError::PrecisionExceeded`]:
     ///   price, contracts or fee off their grids.
     /// - [`MarginError::Arithmetic`]: a stored result (realized PnL, basis,
@@ -705,12 +707,24 @@ impl Ledger {
         let spot = match instrument {
             Instrument::Spot(spot) => spot.clone(),
             Instrument::LinearFuture(future) => {
-                let terms = future.terms().clone();
-                return self.book_derivative(execution, dir, &terms, reservation, allow_overdraft);
+                let (terms, expiry) = (future.terms().clone(), Some(future.expiry_ms()));
+                return self.book_derivative(
+                    execution,
+                    dir,
+                    (&terms, expiry),
+                    reservation,
+                    allow_overdraft,
+                );
             }
             Instrument::LinearPerpetual(perpetual) => {
                 let terms = perpetual.terms().clone();
-                return self.book_derivative(execution, dir, &terms, reservation, allow_overdraft);
+                return self.book_derivative(
+                    execution,
+                    dir,
+                    (&terms, None),
+                    reservation,
+                    allow_overdraft,
+                );
             }
         };
 
@@ -915,7 +929,7 @@ impl Ledger {
         &mut self,
         execution: &Execution,
         dir: Dir,
-        terms: &LinearTerms,
+        (terms, expiry_ms): (&LinearTerms, Option<u64>),
         reservation: Option<(&ReservationId, Decimal)>,
         allow_overdraft: bool,
     ) -> Result<(Booking, BTreeMap<Asset, Decimal>)> {
@@ -931,11 +945,35 @@ impl Ledger {
                 "a derivative execution does not consume a reservation",
             ));
         }
-        if self.settled_instruments.contains_key(&execution.instrument) {
-            return Err(MarginError::Expired {
+        // Every derivative fill carries its execution time (the ledger reads
+        // no clock), and a future's must be before its expiry.
+        let Some(executed_at_ms) = execution.executed_at_ms else {
+            return Err(MarginError::invalid_input(
+                "executed_at_ms",
+                "a derivative execution needs its execution time",
+            ));
+        };
+        if let Some(expiry_ms) = expiry_ms
+            && executed_at_ms >= expiry_ms
+        {
+            return Err(MarginError::ExecutedAfterExpiry {
                 instrument: execution.instrument.clone(),
+                executed_at_ms,
+                expiry_ms,
             });
         }
+        // A real fill executed before the expiry but delivered after the
+        // future was settled is still booked: it is closed at once at the
+        // settlement price.
+        let settlement_price = match self.settled_instruments.get(&execution.instrument) {
+            Some(id) => Some(
+                self.expiries
+                    .get(id)
+                    .map(|(settlement, _)| settlement.price)
+                    .ok_or(MarginError::arithmetic("expiry settlement index"))?,
+            ),
+            None => None,
+        };
         if execution.price <= Decimal::ZERO {
             return Err(MarginError::invalid_input("price", "must be positive"));
         }
@@ -955,7 +993,7 @@ impl Ledger {
             .get(&execution.instrument)
             .copied()
             .unwrap_or_default();
-        let effect = derivative::apply_derivative_fill(
+        let mut effect = derivative::apply_derivative_fill(
             position,
             dir,
             execution.price,
@@ -963,6 +1001,24 @@ impl Ledger {
             terms.multiplier(),
             scale,
         )?;
+        if let Some(price) = settlement_price {
+            let opposite = match dir {
+                Dir::Buy => Dir::Sell,
+                Dir::Sell => Dir::Buy,
+            };
+            let close = derivative::apply_derivative_fill(
+                effect.position,
+                opposite,
+                price,
+                execution.quantity,
+                terms.multiplier(),
+                scale,
+            )?;
+            effect.realized = add(effect.realized, close.realized, "realized pnl")?;
+            effect.position = close.position;
+            effect.fill.released_basis = close.fill.released_basis;
+            effect.fill.closed_at_settlement = Some(price);
+        }
 
         // Only the realized PnL and the fee move cash.
         let mut changes: BTreeMap<Asset, Vec<Decimal>> = BTreeMap::new();
@@ -1277,13 +1333,14 @@ impl Ledger {
     /// `price`, with the closing rules of an execution and no fee, and marks
     /// the instrument as settled.
     ///
-    /// Settlement is terminal. Afterwards no execution or funding can be
-    /// booked on the instrument ([`MarginError::Expired`]), except that an
-    /// identical historical execution is still a duplicate. The ledger has
-    /// no clock: a real fill executed before the expiry but delivered after
-    /// this settlement is rejected with `Expired` and needs manual
-    /// resolution, so book every fill before settling. A flat position is
-    /// settled with no cash. The cash is mandatory, as for an execution.
+    /// Settlement is terminal: the instrument cannot be settled again. The
+    /// ledger has no clock, so a real fill delivered after the settlement
+    /// (a late fill) is still booked, never rejected: it is closed at once
+    /// at this settlement price, leaving the position flat, its realized PnL
+    /// is the fill against the settlement price, and the cashflow carries
+    /// [`DerivativeFill::closed_at_settlement`] so the caller can
+    /// investigate. A flat position is settled with no cash. The cash is
+    /// mandatory, as for an execution.
     ///
     /// # Errors
     ///
@@ -1379,6 +1436,7 @@ impl Ledger {
                     virtual_notional: Some(Decimal::ZERO),
                     closing_notional: None,
                     released_basis: Decimal::ZERO,
+                    closed_at_settlement: None,
                 },
             )
         } else {
@@ -1779,6 +1837,26 @@ impl Ledger {
                     scale,
                 )?;
                 add_virtual(&mut virtual_cash, &cashflow.instrument, term)?;
+                // A fill after the settlement is closed at the settlement
+                // price: the opposite leg, with no net contracts.
+                if let Some(price) = fill.closed_at_settlement {
+                    let (opposite, back) = match dir {
+                        Dir::Buy => (Dir::Sell, neg(cashflow.quantity)),
+                        Dir::Sell => (Dir::Buy, cashflow.quantity),
+                    };
+                    let term = derivative::signed_virtual_cash(
+                        opposite,
+                        price,
+                        cashflow.quantity,
+                        fill.multiplier,
+                        scale,
+                    )?;
+                    add_virtual(&mut virtual_cash, &cashflow.instrument, term)?;
+                    quantity_terms
+                        .entry(&cashflow.instrument)
+                        .or_default()
+                        .push(back);
+                }
             } else {
                 let cash = match dir {
                     Dir::Buy => neg(cashflow.notional),

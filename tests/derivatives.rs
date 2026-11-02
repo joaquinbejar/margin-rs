@@ -94,8 +94,10 @@ fn deposit(ledger: &mut Ledger, id: &str, amount: Decimal) {
         .unwrap();
 }
 
+/// A derivative fill, executed at 500 unless set otherwise (BTC-DEC
+/// expires at 1000).
 fn exec(id: &str, instrument: &str, side: Action, price: Decimal, contracts: Decimal) -> Execution {
-    Execution::new(eid(id), iid(instrument), side, price, contracts)
+    Execution::new(eid(id), iid(instrument), side, price, contracts).with_executed_at(500)
 }
 
 /// Books through the mandatory path and returns the booking.
@@ -422,7 +424,7 @@ fn funding_is_signed_cash_counted_once_as_realized() {
 fn a_future_settles_once_at_expiry() {
     let mut ledger = ledger_with_cash(dec!(100));
     let future = iid("BTC-DEC");
-    let buy = exec("e1", "BTC-DEC", Action::Buy, dec!(50), dec!(2));
+    let buy = exec("e1", "BTC-DEC", Action::Buy, dec!(50), dec!(2)).with_executed_at(500);
     book(&mut ledger, &buy);
     let settle = |id: &str, price: Decimal, as_of_ms: u64| ExpirySettlement {
         id: eid(id),
@@ -459,14 +461,67 @@ fn a_future_settles_once_at_expiry() {
         ledger.settle_expiry(&settle("s2", dec!(52.5), 1000)),
         Err(MarginError::ConflictingEntry { .. })
     ));
-    // Terminal: an identical historical fill is still a duplicate, a new
-    // fill (even one executed before the expiry) is Expired.
+    // An identical historical fill is still a duplicate.
     assert!(!book(&mut ledger, &buy).is_new());
-    let late = exec("e2", "BTC-DEC", Action::Sell, dec!(51), dec!(1));
-    assert!(matches!(
-        ledger.book_execution_allowing_overdraft(&late, None),
-        Err(MarginError::Expired { .. })
-    ));
+
+    // A late buy of 1 at 51, executed at 900 (before the expiry at 1000)
+    // but delivered after the settlement at 52.50: it is booked, never
+    // rejected, and closed at once at the settlement price. Realized
+    // (52.50 - 51) * 1 * 1 = 1.50, the position stays flat.
+    let late = exec("e2", "BTC-DEC", Action::Buy, dec!(51), dec!(1))
+        .with_fee(asset("USD"), dec!(0.05))
+        .with_executed_at(900);
+    let booked = book(&mut ledger, &late);
+    let flow = booked.cashflow();
+    assert_eq!(flow.realized_pnl, dec!(1.5));
+    assert_eq!(
+        flow.derivative.as_ref().unwrap().closed_at_settlement,
+        Some(dec!(52.5))
+    );
+    assert_eq!(flow.deltas[&asset("USD")], dec!(1.45));
+    let position = ledger.position(&future).unwrap();
+    assert_eq!((position.quantity, position.cost_basis), (dec!(0), dec!(0)));
+    assert_eq!(position.realized_pnl, dec!(6.5));
+    assert_eq!(cash(&ledger), dec!(106.45));
+    // Its replay is a duplicate.
+    assert!(!book(&mut ledger, &late).is_new());
+    ledger.reconcile().unwrap();
+}
+
+#[test]
+fn a_late_fill_on_a_settled_short_is_closed_at_the_settlement_price() {
+    // Short 2 at 50, settled at 52.50 (realized -5), then a late sell of 1
+    // at 51: realized (51 - 52.50) * 1 = -1.50, flat.
+    let mut ledger = ledger_with_cash(dec!(100));
+    book(
+        &mut ledger,
+        &exec("e1", "BTC-DEC", Action::Sell, dec!(50), dec!(2)).with_executed_at(500),
+    );
+    let settled = ledger
+        .settle_expiry(&ExpirySettlement {
+            id: eid("s1"),
+            instrument: iid("BTC-DEC"),
+            price: dec!(52.5),
+            as_of_ms: 1000,
+        })
+        .unwrap();
+    assert_eq!(settled.cashflow.realized_pnl, dec!(-5));
+    let late = book(
+        &mut ledger,
+        &exec("e2", "BTC-DEC", Action::Sell, dec!(51), dec!(1)).with_executed_at(900),
+    );
+    assert_eq!(late.cashflow().realized_pnl, dec!(-1.5));
+    assert_eq!(
+        late.cashflow()
+            .derivative
+            .as_ref()
+            .unwrap()
+            .closed_at_settlement,
+        Some(dec!(52.5))
+    );
+    let position = ledger.position(&iid("BTC-DEC")).unwrap();
+    assert_eq!((position.quantity, position.cost_basis), (dec!(0), dec!(0)));
+    assert_eq!(cash(&ledger), dec!(93.5));
     ledger.reconcile().unwrap();
 }
 
@@ -594,5 +649,65 @@ fn ids_are_shared_across_executions_funding_and_expiry() {
         }),
         Err(MarginError::ConflictingEntry { .. })
     ));
+    ledger.reconcile().unwrap();
+}
+
+#[test]
+fn a_future_fill_needs_a_time_before_the_expiry() {
+    let mut ledger = ledger_with_cash(dec!(100));
+    let fill = |id: &str| Execution::new(eid(id), iid("BTC-DEC"), Action::Buy, dec!(50), dec!(1));
+    let before = ledger.snapshot();
+    // No time: refused, no implicit assumption, for a future and a
+    // perpetual alike.
+    for instrument in ["BTC-DEC", "BTC-PERP"] {
+        let untimed = Execution::new(eid("e1"), iid(instrument), Action::Buy, dec!(50), dec!(1));
+        assert!(matches!(
+            ledger.book_execution_allowing_overdraft(&untimed, None),
+            Err(MarginError::InvalidInput {
+                field: "executed_at_ms",
+                ..
+            })
+        ));
+    }
+    // At the expiry (1000) or after: causally impossible, even before the
+    // future is settled.
+    for at in [1000, 1001] {
+        assert_eq!(
+            ledger.book_execution_allowing_overdraft(&fill("e1").with_executed_at(at), None),
+            Err(MarginError::ExecutedAfterExpiry {
+                instrument: iid("BTC-DEC"),
+                executed_at_ms: at,
+                expiry_ms: 1000,
+            })
+        );
+    }
+    assert_eq!(ledger.snapshot(), before);
+
+    // Just before the expiry it books.
+    book(&mut ledger, &fill("e1").with_executed_at(999));
+    // The time is part of the execution: the same id at another time
+    // conflicts, the identical repeat is a duplicate.
+    assert!(matches!(
+        ledger.book_execution_allowing_overdraft(&fill("e1").with_executed_at(998), None),
+        Err(MarginError::ConflictingEntry { .. })
+    ));
+    assert!(!book(&mut ledger, &fill("e1").with_executed_at(999)).is_new());
+
+    // After the settlement, a fill executed after the expiry is still
+    // refused, with no effect.
+    ledger
+        .settle_expiry(&ExpirySettlement {
+            id: eid("s1"),
+            instrument: iid("BTC-DEC"),
+            price: dec!(52.5),
+            as_of_ms: 1000,
+        })
+        .unwrap();
+    let settled = ledger.snapshot();
+    assert!(matches!(
+        ledger.book_execution_allowing_overdraft(&fill("e2").with_executed_at(1200), None),
+        Err(MarginError::ExecutedAfterExpiry { .. })
+    ));
+    assert_eq!(ledger.snapshot(), settled);
     ledger.reconcile().unwrap();
 }

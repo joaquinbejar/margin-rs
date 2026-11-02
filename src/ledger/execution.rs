@@ -47,6 +47,12 @@ pub struct Execution {
     pub quantity: Decimal,
     /// Fee charged by this fill, if any.
     pub fee: Option<Fee>,
+    /// When the venue executed the fill, in milliseconds since the epoch
+    /// (the unit and epoch of a future's expiry). Part of the execution: a
+    /// repeat must carry the same time. Optional for spot; required for a
+    /// linear future or perpetual, and a future's fills must be executed
+    /// strictly before its expiry.
+    pub executed_at_ms: Option<u64>,
 }
 
 impl Execution {
@@ -66,6 +72,7 @@ impl Execution {
             price,
             quantity,
             fee: None,
+            executed_at_ms: None,
         }
     }
 
@@ -73,6 +80,14 @@ impl Execution {
     #[must_use]
     pub fn with_fee(mut self, asset: Asset, amount: Decimal) -> Self {
         self.fee = Some(Fee { asset, amount });
+        self
+    }
+
+    /// Returns the execution with its execution time, in milliseconds since
+    /// the epoch.
+    #[must_use]
+    pub fn with_executed_at(mut self, executed_at_ms: u64) -> Self {
+        self.executed_at_ms = Some(executed_at_ms);
         self
     }
 }

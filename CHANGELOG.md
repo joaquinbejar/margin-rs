@@ -20,10 +20,15 @@ follows [Semantic Versioning](https://semver.org/).
   received) and `Ledger::settle_expiry` (`ExpirySettlement`,
   `ExpiryCashflow`), mandatory and idempotent in the id space shared with
   executions and settlements; `PostingBooking`, `Ledger::funding`,
-  `Ledger::funding_journal`, `Ledger::expiry_journal`, `Ledger::is_settled`
-  and `MarginError::Expired`.
+  `Ledger::funding_journal`, `Ledger::expiry_journal` and
+  `Ledger::is_settled`. A real fill executed before a future's expiry but
+  delivered after its settlement is still booked, never rejected: it is
+  closed at once at the settlement price and flagged in
+  `DerivativeFill::closed_at_settlement`. A fill executed at or after the
+  expiry is causally impossible: `MarginError::ExecutedAfterExpiry`.
 - `ExecutionCashflow::derivative` (`DerivativeFill`: multiplier, virtual
-  and closing notionals, released basis), `PositionKind`, and
+  and closing notionals, released basis, settlement price of a late fill),
+  `PositionKind`, and
   `Instrument::{kind, multiplier, linear_terms}`.
 - `reconcile()` checks funding per asset and, per derivative, the contracts
   and the virtual identity `sum of signed virtual notionals = realized_pnl -
@@ -31,6 +36,11 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** `Execution` has the new field `executed_at_ms` (and
+  `Execution::with_executed_at`); it is part of the execution, so a repeat
+  must carry the same time. It is optional for spot and required for a
+  linear future or perpetual; a future's fills must be executed strictly
+  before its expiry.
 - **Breaking:** an execution of a linear future or perpetual is mandatory:
   `book_execution` and `book_execution_with_reservation` refuse it with
   `InvalidInput` and no effect, and `book_execution_allowing_overdraft`

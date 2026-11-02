@@ -137,15 +137,19 @@ pub enum MarginError {
         reason: &'static str,
     },
 
-    /// The instrument has expired and was settled
-    /// ([`Ledger::settle_expiry`](crate::ledger::Ledger::settle_expiry)): no
-    /// further execution or funding can be booked on it. A real fill
-    /// delivered after the settlement needs manual resolution; it is never
-    /// ignored.
-    #[error("instrument {instrument} has expired and was settled")]
-    Expired {
-        /// Instrument identifier.
+    /// A fill of a future executed at or after its expiry: causally
+    /// impossible, so it is refused with no effect. A fill executed before
+    /// the expiry is always booked, even after the settlement.
+    #[error(
+        "execution on {instrument} at {executed_at_ms} ms is not before its expiry at {expiry_ms} ms"
+    )]
+    ExecutedAfterExpiry {
+        /// Future instrument.
         instrument: InstrumentId,
+        /// When the fill was executed.
+        executed_at_ms: u64,
+        /// The future's expiry.
+        expiry_ms: u64,
     },
 
     /// The margin rule does not cover this instrument.

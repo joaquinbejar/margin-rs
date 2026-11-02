@@ -49,6 +49,10 @@ pub struct DerivativeFill {
     /// (positive for a long): the whole basis on a full close or a crossing,
     /// zero when the fill opens or increases.
     pub released_basis: Decimal,
+    /// Set for a late fill on a future already settled at expiry: the
+    /// settlement price at which the fill was closed at once. The position
+    /// stays flat and the realized PnL is the fill against that price.
+    pub closed_at_settlement: Option<Decimal>,
 }
 
 /// A funding payment of a perpetual, booked with
@@ -190,6 +194,7 @@ pub(crate) fn apply_derivative_fill(
                 virtual_notional,
                 closing_notional: None,
                 released_basis: Decimal::ZERO,
+                closed_at_settlement: None,
             },
         });
     }
@@ -224,6 +229,7 @@ pub(crate) fn apply_derivative_fill(
                 virtual_notional,
                 closing_notional: None,
                 released_basis: released,
+                closed_at_settlement: None,
             },
         });
     }
@@ -258,6 +264,7 @@ pub(crate) fn apply_derivative_fill(
             virtual_notional,
             closing_notional: closing.to_decimal(scale),
             released_basis: basis,
+            closed_at_settlement: None,
         },
     })
 }
