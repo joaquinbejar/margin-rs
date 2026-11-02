@@ -19,6 +19,7 @@
 //! produced, and one that cannot is an error that leaves the caller's state
 //! untouched.
 
+pub(crate) mod grid;
 mod wide;
 
 use rust_decimal::Decimal;

@@ -75,7 +75,6 @@ fn policy(target: CloseoutTarget) -> LiquidationPolicy {
         target,
         fee_rate: dec!(0.0005),
         contract_step: Decimal::ONE,
-        scale: 6,
     }
 }
 
@@ -662,6 +661,170 @@ mod plan {
         assert!(matches!(
             plan_liquidation(&rule(), &precise, &liquidity, &good),
             Err(MarginError::PrecisionExceeded { .. })
+        ));
+    }
+}
+
+/// Review round 2 of #22: C1 (step arithmetic near the Decimal limits),
+/// C2 (the feasible counts on a level are an interval that need not reach
+/// its end) and n1 (basis sign).
+mod review {
+    use super::*;
+    use margin_rs::initial_margin::RuleId;
+    use margin_rs::rules::MarginTier;
+
+    fn tiny(contracts: Decimal, basis: Decimal, cash: Decimal) -> LiquidationAccount {
+        LiquidationAccount {
+            view: view(vec![perp(
+                "BTC-PERP",
+                contracts,
+                dec!(0.000000000000000001),
+            )]),
+            basis: BTreeMap::from([(iid("BTC-PERP"), basis)]),
+            cash,
+            resting_orders: vec![],
+        }
+    }
+
+    fn at_mark(contracts: Decimal) -> BTreeMap<InstrumentId, Vec<LiquidityLevel>> {
+        bids(&[(dec!(0.000000000000000001), contracts)])
+    }
+
+    /// C1: closing Decimal::MAX contracts with a step of 2 used to compute
+    /// ceil(MAX / 2) * 2 and overflow; the last count is the cap.
+    #[test]
+    fn step_two_closes_decimal_max() {
+        let mut flat = policy(CloseoutTarget::Flat);
+        flat.fee_rate = Decimal::ZERO;
+        flat.contract_step = dec!(2);
+        let plan = plan(
+            &tiny(Decimal::MAX, dec!(1), dec!(0)),
+            &at_mark(Decimal::MAX),
+            &flat,
+        );
+        assert_eq!(plan.outcome, CloseoutOutcome::TargetMet);
+        assert_eq!(plan.reductions[0].contracts, Decimal::MAX);
+        assert!(plan.after.positions.is_empty());
+    }
+
+    /// C1: a step of 0.5 on Decimal::MAX contracts has more grid points
+    /// than a Decimal can count, and bisection midpoints above MAX / 2.
+    /// Notional 79228162514.264338 (basis equal, so upnl 0), mm 5 %; with
+    /// cash 2e9 the plan must close about MAX - 4e28 contracts, the
+    /// smallest count that meets the target.
+    #[test]
+    fn half_steps_on_decimal_max_find_the_smallest_count() {
+        let mut target = policy(CloseoutTarget::Maintenance);
+        target.fee_rate = Decimal::ZERO;
+        target.contract_step = dec!(0.5);
+        let account = tiny(Decimal::MAX, dec!(79228162514.264338), dec!(2000000000));
+        let result = plan(&account, &at_mark(Decimal::MAX), &target);
+        assert_eq!(result.before.collateral, dec!(2000000000));
+        assert_eq!(result.outcome, CloseoutOutcome::TargetMet);
+        let taken = result.reductions[0].contracts;
+        assert!(taken > dec!(39000000000000000000000000000));
+        assert!(taken < dec!(40000000000000000000000000000));
+        assert!(result.after.collateral >= result.after.maintenance);
+        // One count less on the grid (rounded to an integer at this size)
+        // does not meet the target.
+        let short = plan(&account, &at_mark(taken - Decimal::ONE), &target);
+        assert_eq!(short.outcome, CloseoutOutcome::LiquidityExhausted);
+    }
+
+    /// C2 (MM-REVIEWER, flat xynthex-linear-im/1): A long 10 at 110 marked
+    /// 100, B long 1 at 31 marked 100, cash 67: collateral 36 < mm 55.
+    /// Selling n of A at 99: cash 67 - 11.0495n, collateral 36 - 1.0495n,
+    /// mm 55 - 5n. The target holds for n in [5, 6]; closing all 10 would
+    /// leave a debt of 43.495.
+    #[test]
+    fn feasible_window_inside_the_level_flat_rule() {
+        let account = LiquidationAccount {
+            view: view(vec![
+                perp("A-PERP", dec!(10), dec!(100)),
+                perp("B-PERP", dec!(1), dec!(100)),
+            ]),
+            basis: BTreeMap::from([(iid("A-PERP"), dec!(1100)), (iid("B-PERP"), dec!(31))]),
+            cash: dec!(67),
+            resting_orders: vec![],
+        };
+        let liquidity = BTreeMap::from([(
+            iid("A-PERP"),
+            vec![LiquidityLevel {
+                price: dec!(99),
+                contracts: dec!(10),
+            }],
+        )]);
+        let plan = plan(&account, &liquidity, &policy(CloseoutTarget::Maintenance));
+        assert_eq!(plan.before.collateral, dec!(36));
+        assert_eq!(plan.outcome, CloseoutOutcome::TargetMet);
+        assert_eq!(plan.reductions.len(), 1);
+        assert_eq!(plan.reductions[0].contracts, dec!(5));
+        assert_eq!(plan.after.cash, dec!(11.7525));
+        assert_eq!(plan.after.collateral, dec!(30.7525));
+        assert_eq!(plan.after.maintenance, dec!(30));
+        assert_eq!(plan.debt, dec!(0));
+    }
+
+    /// C2 (codex, two tiers): rates 10 % below a notional of 500 and 90 %
+    /// above. Long 10 at 100 marked 100, cash 140, bid 85: closing 4 gives
+    /// collateral 80 < mm 140, closing 5 gives 65 >= 50.
+    #[test]
+    fn feasible_window_with_increasing_tiers() {
+        let tiered = TieredLinearIm::new(
+            RuleId::new("two-tier-test", 1),
+            usdc(),
+            6,
+            vec![
+                MarginTier {
+                    floor: Decimal::ZERO,
+                    initial_rate: dec!(0.1),
+                    maintenance_rate: dec!(0.1),
+                },
+                MarginTier {
+                    floor: dec!(500),
+                    initial_rate: dec!(0.9),
+                    maintenance_rate: dec!(0.9),
+                },
+            ],
+        )
+        .expect("rule");
+        let account = LiquidationAccount {
+            view: view(vec![perp("BTC-PERP", dec!(10), dec!(100))]),
+            basis: BTreeMap::from([(iid("BTC-PERP"), dec!(1000))]),
+            cash: dec!(140),
+            resting_orders: vec![],
+        };
+        let mut target = policy(CloseoutTarget::Maintenance);
+        target.fee_rate = Decimal::ZERO;
+        let plan = plan_liquidation(&tiered, &account, &bids(&[(dec!(85), dec!(10))]), &target)
+            .expect("plan");
+        assert_eq!(plan.before.maintenance, dec!(500));
+        assert_eq!(plan.outcome, CloseoutOutcome::TargetMet);
+        assert_eq!(plan.reductions[0].contracts, dec!(5));
+        assert_eq!(plan.after.cash, dec!(65));
+        assert_eq!(plan.after.collateral, dec!(65));
+        assert_eq!(plan.after.maintenance, dec!(50));
+        assert_eq!(plan.debt, dec!(0));
+    }
+
+    /// n1: the basis must be non zero and have the sign of the position.
+    #[test]
+    fn basis_sign_must_match_the_position() {
+        let liquidity = bids(&[(dec!(94), dec!(10))]);
+        let good = policy(CloseoutTarget::Maintenance);
+        for basis in [dec!(0), dec!(-1000)] {
+            let mut account = long_btc(dec!(90));
+            account.basis.insert(iid("BTC-PERP"), basis);
+            assert!(matches!(
+                plan_liquidation(&rule(), &account, &liquidity, &good),
+                Err(MarginError::InvalidInput { field: "basis", .. })
+            ));
+        }
+        let mut short = long_btc(dec!(90));
+        short.view.positions[0].contracts = dec!(-10);
+        assert!(matches!(
+            plan_liquidation(&rule(), &short, &liquidity, &good),
+            Err(MarginError::InvalidInput { field: "basis", .. })
         ));
     }
 }

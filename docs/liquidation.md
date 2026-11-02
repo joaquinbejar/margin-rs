@@ -46,15 +46,23 @@ The primary specification is Xynthex `docs/design/economics.md` section 11.1, at
 
 ```text
 plan_liquidation(&model, &LiquidationAccount { view, basis, cash, resting_orders },
-                 &liquidity, &LiquidationPolicy { target, fee_rate, contract_step, scale })
+                 &liquidity, &LiquidationPolicy { target, fee_rate, contract_step })
 ```
+
+`model` implements `PiecewiseLinearMargin`, which `TieredLinearIm` and therefore `xynthex-linear-im/1` do. The trait's contract has three parts:
+
+- margins are additive across positions;
+- each position's IM and MM are convex, non-decreasing, piecewise linear functions of its notional, and the slope changes only at `notional_breakpoints` (the tier floors);
+- every amount is rounded to `cash_scale`, which the plan uses as its cash quantum, so cash, PnL and margins always share one scale.
+
+Each open position needs a non-zero `basis` with the sign of the position.
 
 ### Stages
 
 1. **Cancel.** The plan cancels every resting order first, so the closeout never races the account's own orders.
 2. **Reduce.** Instruments are taken in order, largest maintenance requirement first, with ties broken by instrument id.
    - For each instrument, the plan walks its liquidity from the best level: the highest bid when selling a long, the lowest ask when buying back a short.
-   - On each level it takes the smallest number of `contract_step`s that meets the target. If that is not possible, it takes the whole level.
+   - On each level it takes the smallest number of `contract_step`s that meets the target (see "Search within a level" below). If no count on the level meets it, the plan takes the whole level.
    - A partial closeout is the normal case.
 3. **Residual.** If the target is still not met, the plan reports what is left:
    - `unfilled`: the contracts still open, for each instrument whose liquidity ran out;
@@ -86,7 +94,7 @@ plan_liquidation(&model, &LiquidationAccount { view, basis, cash, resting_orders
 
 ### Cash conventions
 
-These follow Xynthex economics 10.3 and 10.4, at the same commit. `c` is the policy scale (USDC: 6).
+These follow Xynthex economics 10.3 and 10.4, at the same commit. `c` is the rule's `cash_scale` (USDC: 6).
 
 | Figure | Formula |
 |---|---|
@@ -101,9 +109,30 @@ These follow Xynthex economics 10.3 and 10.4, at the same commit. `c` is the pol
 
 Marks stay those of the `ExposureView` for the whole plan. The scenario prices for the closeout are the liquidity levels.
 
-### Minimality
+### Search within a level
 
-On a level, the plan bisects between a count that misses the target and one that meets it. The count it returns always meets the target, and the count one step smaller does not. The target is monotone in the size closed, up to the rounding of single cash quanta, so this is the smallest count. The test `the_plan_takes_the_smallest_count_that_meets_the_target` checks it for cash levels from 60 to 97.5.
+On one level, let `n` be the number of contracts closed.
+
+- `cash(n)` is linear in `n`: the price, the released basis and the fee are all proportional to `n`.
+- `excess(n) = collateral(n) - margin(n)` is concave. Collateral is linear in `n`, and the margin is convex in the notional, which falls linearly in `n`.
+
+So `min(cash, excess)` is concave, and the counts that meet the target form an interval `[a, b]`. That interval need not reach the end of the level, because closing more can push cash below zero. The two review cases from round 2 are both of this kind:
+
+- MM-REVIEWER: two positions under the flat rule;
+- codex: two increasing tiers.
+
+In each, the plan must close 5 contracts. Closing all 10 would leave debt that could have been avoided.
+
+The plan finds `a` exactly, up to the rounding of single cash quanta, in three steps:
+
+1. It evaluates the target exactly at the points where a concave piecewise linear function can peak:
+   - both ends of the level;
+   - the grid points on either side of each margin breakpoint;
+   - the grid points on either side of each sign change of `excess - cash` within a linear segment, found by bisecting on that sign.
+2. If none of these points meets the target, no count on the level does, and the plan takes the whole level.
+3. Otherwise it bisects between 0, which does not meet the target, and the smallest candidate that does. The result is a count that meets the target while the count one grid step below it does not.
+
+Counts sit on the `contract_step` grid. Grid indices are wide integers, so `k * step`, `ceil(available / step)` and the bisection midpoints never overflow, even for `Decimal::MAX` contracts with a step of 0.5. Near the limits of `Decimal`, a fractional count with too many digits is rounded down to the scale of the cap.
 
 ## Ledger postings
 

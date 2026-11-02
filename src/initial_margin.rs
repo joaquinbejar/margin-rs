@@ -154,3 +154,25 @@ pub trait InitialMarginModel {
     /// for a product the rule does not cover.
     fn requirement(&self, view: &ExposureView) -> Result<MarginRequirement>;
 }
+
+/// A margin rule whose requirement the closeout planner can search
+/// exactly ([`crate::liquidation::plan_liquidation`]).
+///
+/// Contract, for every position the rule covers:
+///
+/// - the requirement of an account is the sum of the requirements of its
+///   positions (no netting between positions);
+/// - a position's initial and maintenance margin are, up to the final
+///   rounding to [`PiecewiseLinearMargin::cash_scale`], continuous, convex,
+///   non decreasing and piecewise linear functions of its notional
+///   `|Qc| * M * mark`, with slope changes only at
+///   [`PiecewiseLinearMargin::notional_breakpoints`].
+pub trait PiecewiseLinearMargin: InitialMarginModel {
+    /// Number of decimals every requirement is rounded to: the cash
+    /// quantum of the rule's currency.
+    fn cash_scale(&self) -> u32;
+
+    /// Notionals at which the margin of `position` changes slope,
+    /// ascending and positive; empty for a single linear rate.
+    fn notional_breakpoints(&self, position: &ExposurePosition) -> Vec<Decimal>;
+}

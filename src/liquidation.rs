@@ -2,7 +2,8 @@
 //!
 //! [`plan_liquidation`] simulates one closeout of an account's linear
 //! futures and perpetuals against supplied scenario liquidity, under one
-//! [`InitialMarginModel`] (for example `xynthex-linear-im/1`), and returns a
+//! [`PiecewiseLinearMargin`] rule (for example `xynthex-linear-im/1` or any
+//! [`TieredLinearIm`](crate::rules::TieredLinearIm)), and returns a
 //! [`LiquidationPlan`]. It is a pure function: it books nothing and changes
 //! no state. There is no live liquidator.
 //!
@@ -25,9 +26,10 @@
 //!    largest maintenance requirement first (ties by instrument id),
 //!    walking that instrument's liquidity from the best level. On each
 //!    level the plan takes the smallest number of contract steps after
-//!    which the target is met, or the whole level when the level is not
-//!    enough. Partial closeouts are the normal case: a position is only
-//!    closed as far as the target needs.
+//!    which the target is met (see [search](self#search-within-a-level)),
+//!    or the whole level when no count on it meets the target. Partial
+//!    closeouts are the normal case: a position is only closed as far as
+//!    the target needs.
 //! 3. **Residual.** When the target is still not met (liquidity ran out,
 //!    or the account is flat and still short), the remaining exposure, the
 //!    deficit and the debt are reported explicitly. The plan never erases a
@@ -45,8 +47,9 @@
 //! # Cash conventions
 //!
 //! From Xynthex `docs/design/economics.md` sections 10.3 and 10.4, at
-//! commit `c1b437b612b0a33610a3cbb777938c41fcdde331`, with `c` the policy
-//! scale:
+//! commit `c1b437b612b0a33610a3cbb777938c41fcdde331`, with `c` the rule's
+//! [`cash_scale`](PiecewiseLinearMargin::cash_scale) (so cash, PnL and
+//! margins share one quantum):
 //!
 //! - `basis` is the signed cash value of the open position at entry prices
 //!   (a long has a positive basis);
@@ -65,26 +68,46 @@
 //! Marks stay those of the [`ExposureView`] for the whole plan: the
 //! scenario's prices for the closeout are the liquidity levels.
 //!
-//! # Minimality
+//! # Search within a level
 //!
-//! Within one level the number of steps is found by bisection between a
-//! count that does not meet the target and one that does, so the plan
-//! always takes a count that meets the target and whose predecessor does
-//! not. The target is monotone in the size closed up to the rounding of
-//! single cash quanta, so this is the smallest such count in all practical
-//! cases; it never stops short of the target.
+//! On one level, with `n` the contracts closed there, `cash(n)` is linear
+//! (price, released basis and fee are all proportional to `n`) and
+//! `excess(n) = collateral(n) - margin(n)` is concave: collateral is linear
+//! and, by the [`PiecewiseLinearMargin`] contract, the margin is a convex
+//! piecewise linear function of the notional, which falls linearly in `n`.
+//! So `g(n) = min(cash(n), excess(n))` is concave and the counts that meet
+//! the target (`g(n) >= 0`) form an interval `[a, b]`, which need not
+//! reach the end of the level: closing more can push cash below zero.
+//!
+//! The plan finds it exactly, up to the rounding of single cash quanta:
+//!
+//! 1. it evaluates `g` exactly at the candidates where a concave piecewise
+//!    linear function can peak: the ends of the level, the grid points
+//!    around each margin breakpoint, and the grid points where
+//!    `excess - cash` changes sign inside each linear segment (found by
+//!    bisection on its sign);
+//! 2. if no candidate meets the target, no count on the level does, and
+//!    the plan takes the whole level;
+//! 3. otherwise it bisects between 0 (which does not meet the target) and
+//!    the smallest candidate that does, and takes `a`: a count that meets
+//!    the target and whose predecessor on the grid does not.
+//!
+//! Counts live on the grid of [`LiquidationPolicy::contract_step`],
+//! indexed in wide integers, so no product of a step count or bisection
+//! midpoint can overflow.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use rust_decimal::Decimal;
 
+use crate::decimal::grid::{ContractGrid, GridIndex};
 use crate::decimal::{
-    MAX_SCALE, Rounding, add, check_configured_scale, check_scale, mul, mul_div_round, sub, sum,
+    MAX_SCALE, Rounding, add, check_scale, mul_div_round, sub, sum, sum_products,
 };
 use crate::error::{MarginError, Result};
 use crate::ids::{AccountId, Asset, ExecutionId, InstrumentId, OrderId, VenueId};
 use crate::initial_margin::{
-    ExposurePosition, ExposureView, InitialMarginModel, MarginRequirement, RuleId,
+    ExposurePosition, ExposureView, MarginRequirement, PiecewiseLinearMargin, RuleId,
 };
 use crate::ledger::{DerivativeSettlement, Side};
 
@@ -110,9 +133,6 @@ pub struct LiquidationPolicy {
     /// Smallest number of contracts the plan trades at a time, positive.
     /// The last step of a position or level may be smaller.
     pub contract_step: Decimal,
-    /// Scale of the cash quantum (USDC: 6). Use the scale the margin rule
-    /// rounds to, so cash, PnL and margins share one quantum.
-    pub scale: u32,
 }
 
 /// Liquidity available at one price to close a position.
@@ -332,9 +352,10 @@ struct Planner<'a, M> {
     model: &'a M,
     policy: &'a LiquidationPolicy,
     account: &'a LiquidationAccount,
+    scale: u32,
 }
 
-impl<M: InitialMarginModel> Planner<'_, M> {
+impl<M: PiecewiseLinearMargin> Planner<'_, M> {
     fn requirement(&self, state: &State) -> Result<MarginRequirement> {
         self.model.requirement(&ExposureView {
             account: self.account.view.account.clone(),
@@ -363,7 +384,7 @@ impl<M: InitialMarginModel> Planner<'_, M> {
                     open.exposure.mark,
                 ],
                 &[],
-                self.policy.scale,
+                self.scale,
                 Rounding::HalfEven,
                 "Qc * M * mark",
             )?;
@@ -394,6 +415,126 @@ impl<M: InitialMarginModel> Planner<'_, M> {
         }
     }
 
+    fn target_margin(&self, summary: &AccountSummary) -> Decimal {
+        match self.policy.target {
+            CloseoutTarget::Maintenance => summary.maintenance,
+            CloseoutTarget::Initial => summary.initial,
+            CloseoutTarget::Flat => Decimal::ZERO,
+        }
+    }
+
+    /// `excess - cash = collateral - margin - cash`, exact.
+    fn gap(&self, summary: &AccountSummary) -> Result<Decimal> {
+        sum(
+            &[
+                summary.collateral,
+                -self.target_margin(summary),
+                -summary.cash,
+            ],
+            "excess - cash",
+        )
+    }
+
+    /// The fill of position `index` on one level. See the
+    /// [search](self#search-within-a-level).
+    fn close_on_level(
+        &self,
+        state: &State,
+        current: &AccountSummary,
+        index: usize,
+        level: usize,
+        offer: &LiquidityLevel,
+    ) -> Result<(State, ForcedReduction, AccountSummary)> {
+        let exposure = &state.positions[index].exposure;
+        let size = exposure.contracts.abs();
+        let grid = ContractGrid::new(self.policy.contract_step, offer.contracts.min(size))?;
+        let at = |k: GridIndex| -> Result<(State, ForcedReduction, AccountSummary)> {
+            let n = grid.contracts(k)?;
+            let (next, reduction) = self.reduce(state, index, level, offer.price, n)?;
+            let summary = self.summary(&next)?;
+            Ok((next, reduction, summary))
+        };
+        let summary_at = |k: GridIndex| -> Result<AccountSummary> {
+            if k == GridIndex::ZERO {
+                Ok(current.clone())
+            } else {
+                Ok(at(k)?.2)
+            }
+        };
+        let last = grid.last();
+        if self.policy.target == CloseoutTarget::Flat {
+            return at(last);
+        }
+
+        // Segment ends: no fill, the grid points around each breakpoint
+        // (where the notional crosses a floor: n = |Qc| - floor / (M * mark)),
+        // and the whole level.
+        let mut ends = vec![GridIndex::ZERO, last];
+        for floor in self.model.notional_breakpoints(exposure) {
+            let numerator = sum_products(
+                &[&[size, exposure.multiplier, exposure.mark], &[-floor]],
+                "|Qc| * M * mark - floor",
+            )?;
+            let k = grid.floor_index_of(numerator, &[exposure.multiplier, exposure.mark])?;
+            ends.push(k);
+            if let Some(next) = grid.next(k) {
+                ends.push(next);
+            }
+        }
+        ends.sort();
+        ends.dedup();
+
+        // Where excess - cash changes sign inside a segment, min(cash,
+        // excess) can peak: bisect to the two grid points around it.
+        let mut candidates = ends.clone();
+        for pair in ends.windows(2) {
+            let (mut low, mut high) = (pair[0], pair[1]);
+            let low_sign = self.gap(&summary_at(low)?)? >= Decimal::ZERO;
+            let high_sign = self.gap(&summary_at(high)?)? >= Decimal::ZERO;
+            if low_sign == high_sign {
+                continue;
+            }
+            while !ContractGrid::adjacent(low, high) {
+                let middle = ContractGrid::midpoint(low, high);
+                if (self.gap(&summary_at(middle)?)? >= Decimal::ZERO) == low_sign {
+                    low = middle;
+                } else {
+                    high = middle;
+                }
+            }
+            candidates.push(low);
+            candidates.push(high);
+        }
+        candidates.retain(|k| *k != GridIndex::ZERO);
+        candidates.sort();
+        candidates.dedup();
+
+        let mut found = None;
+        for k in candidates {
+            let attempt = at(k)?;
+            if self.met(&attempt.2) {
+                found = Some((k, attempt));
+                break;
+            }
+        }
+        let Some((mut high, mut chosen)) = found else {
+            return at(last);
+        };
+        // 0 does not meet the target (the caller checked), `high` does.
+        let mut low = GridIndex::ZERO;
+        while !ContractGrid::adjacent(low, high) {
+            let middle = ContractGrid::midpoint(low, high);
+            let attempt = at(middle)?;
+            if self.met(&attempt.2) {
+                high = middle;
+                chosen = attempt;
+            } else {
+                low = middle;
+            }
+        }
+        Ok(chosen)
+    }
+
     /// Closes `contracts` of position `index` at `price`.
     fn reduce(
         &self,
@@ -403,7 +544,7 @@ impl<M: InitialMarginModel> Planner<'_, M> {
         price: Decimal,
         contracts: Decimal,
     ) -> Result<(State, ForcedReduction)> {
-        let scale = self.policy.scale;
+        let scale = self.scale;
         let open = &state.positions[index];
         let position = open.exposure.contracts;
         let size = position.abs();
@@ -465,7 +606,6 @@ impl<M: InitialMarginModel> Planner<'_, M> {
 
     fn validate(&self, liquidity: &BTreeMap<InstrumentId, Vec<LiquidityLevel>>) -> Result<()> {
         let policy = self.policy;
-        check_configured_scale(policy.scale, "scale")?;
         if policy.fee_rate < Decimal::ZERO || policy.fee_rate >= Decimal::ONE {
             return Err(MarginError::invalid_input("fee_rate", "must be in [0, 1)"));
         }
@@ -476,7 +616,7 @@ impl<M: InitialMarginModel> Planner<'_, M> {
             ));
         }
         let account = self.account;
-        check_scale(account.cash, policy.scale, "cash")?;
+        check_scale(account.cash, self.scale, "cash")?;
         let mut orders = BTreeSet::new();
         if !account.resting_orders.iter().all(|o| orders.insert(o)) {
             return Err(MarginError::invalid_input(
@@ -492,13 +632,20 @@ impl<M: InitialMarginModel> Planner<'_, M> {
             .map(|p| (&p.instrument, p.contracts))
             .collect();
         for (instrument, basis) in &account.basis {
-            if !open.contains_key(instrument) {
+            let Some(contracts) = open.get(instrument) else {
                 return Err(MarginError::invalid_input(
                     "basis",
                     "given for an instrument without an open position",
                 ));
+            };
+            // A long is bought at positive prices, a short sold at them.
+            if basis.is_zero() || basis.is_sign_negative() != contracts.is_sign_negative() {
+                return Err(MarginError::invalid_input(
+                    "basis",
+                    "must be non zero and have the sign of the position",
+                ));
             }
-            check_scale(*basis, policy.scale, "basis")?;
+            check_scale(*basis, self.scale, "basis")?;
         }
         if open.keys().any(|i| !account.basis.contains_key(*i)) {
             return Err(MarginError::invalid_input(
@@ -539,11 +686,6 @@ impl<M: InitialMarginModel> Planner<'_, M> {
     }
 }
 
-/// Number of contracts in `k` steps, capped at `available`.
-fn steps(k: Decimal, step: Decimal, available: Decimal) -> Result<Decimal> {
-    Ok(mul(k, step, "k * step")?.min(available))
-}
-
 /// Plans the closeout of `account`. See the [module docs](self).
 ///
 /// `liquidity` gives, per instrument, the levels available on the closing
@@ -553,15 +695,17 @@ fn steps(k: Decimal, step: Decimal, available: Decimal) -> Result<Decimal> {
 /// # Errors
 ///
 /// - [`MarginError::InvalidInput`] for an invalid policy (fee rate outside
-///   `[0, 1)`, non positive step), a basis missing for an open position or
-///   given for a closed one, repeated resting orders, or liquidity levels
-///   that are not positive or not ordered from the best price.
+///   `[0, 1)`, non positive step), a basis missing for an open position,
+///   given for a closed one, zero or of the opposite sign to the position,
+///   repeated resting orders, or liquidity levels that are not positive or
+///   not ordered from the best price.
 /// - [`MarginError::PrecisionExceeded`] if cash or a basis has more digits
-///   than the policy scale.
+///   than the rule's [`cash_scale`](PiecewiseLinearMargin::cash_scale).
 /// - Every error of the model's
-///   [`requirement`](InitialMarginModel::requirement) on the view.
+///   [`requirement`](crate::initial_margin::InitialMarginModel::requirement)
+///   on the view.
 /// - [`MarginError::Arithmetic`] if an amount cannot be represented.
-pub fn plan_liquidation<M: InitialMarginModel>(
+pub fn plan_liquidation<M: PiecewiseLinearMargin>(
     model: &M,
     account: &LiquidationAccount,
     liquidity: &BTreeMap<InstrumentId, Vec<LiquidityLevel>>,
@@ -571,6 +715,7 @@ pub fn plan_liquidation<M: InitialMarginModel>(
         model,
         policy,
         account,
+        scale: model.cash_scale(),
     };
     planner.validate(liquidity)?;
     let initial_requirement = model.requirement(&account.view)?;
@@ -653,43 +798,8 @@ pub fn plan_liquidation<M: InitialMarginModel>(
             if size.is_zero() {
                 break;
             }
-            let available_here = available.contracts.min(size);
-            let max_steps = mul_div_round(
-                &[available_here],
-                &[policy.contract_step],
-                0,
-                Rounding::AwayFromZero,
-                "available / step",
-            )?;
-            let try_steps = |k: Decimal| -> Result<(State, ForcedReduction, AccountSummary)> {
-                let n = steps(k, policy.contract_step, available_here)?;
-                let (next, reduction) = planner.reduce(&state, index, level, available.price, n)?;
-                let summary = planner.summary(&next)?;
-                Ok((next, reduction, summary))
-            };
-            let mut chosen = try_steps(max_steps)?;
-            if planner.met(&chosen.2) {
-                // Bisection: `low` does not meet the target, `high` does.
-                let mut low = Decimal::ZERO;
-                let mut high = max_steps;
-                while sub(high, low, "high - low")? > Decimal::ONE {
-                    let middle = mul_div_round(
-                        &[add(low, high, "low + high")?],
-                        &[Decimal::TWO],
-                        0,
-                        Rounding::TowardZero,
-                        "(low + high) / 2",
-                    )?;
-                    let attempt = try_steps(middle)?;
-                    if planner.met(&attempt.2) {
-                        high = middle;
-                        chosen = attempt;
-                    } else {
-                        low = middle;
-                    }
-                }
-            }
-            let (next, reduction, summary) = chosen;
+            let (next, reduction, summary) =
+                planner.close_on_level(&state, &current, index, level, available)?;
             state = next;
             reductions.push(reduction);
             current = summary;
