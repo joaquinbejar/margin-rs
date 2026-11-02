@@ -100,12 +100,16 @@ pub struct ExecutionCashflow {
     /// Executed quantity.
     pub quantity: Decimal,
     /// `price * quantity`, computed exactly.
-    pub notional_exact: Decimal,
+    ///
+    /// `None` when the exact product needs more than 28 fractional digits
+    /// (for example price and quantity scales of 18 each); `notional` is
+    /// still the exact product rounded once.
+    pub notional_exact: Option<Decimal>,
     /// Notional rounded to the quote asset scale; the amount of quote asset
     /// actually exchanged.
     pub notional: Decimal,
-    /// `notional - notional_exact`.
-    pub rounding_residual: Decimal,
+    /// `notional - notional_exact`, when `notional_exact` is known.
+    pub rounding_residual: Option<Decimal>,
     /// Fee charged, if any.
     pub fee: Option<Fee>,
     /// Signed change of the total balance of each asset touched.

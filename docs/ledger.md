@@ -32,21 +32,25 @@ Example: a buy of 1 BTC with a fee of 0.001 BTC gives a position of 1 and a BTC 
    - Each spot instrument has a price scale and a quantity scale, and the quantity scale may not exceed the base asset scale.
    - An input with more significant fractional digits than its scale allows fails with `PrecisionExceeded`. Inputs are never truncated. Trailing zeros do not count.
 5. **Exact arithmetic.**
-   - Every sum, difference and product is checked and exact.
-   - `rust_decimal` can silently drop digits when a result does not fit its 96-bit mantissa. The crate detects this and returns `Arithmetic` instead.
+   - `rust_decimal` operations can silently drop digits when an exact result needs a mantissa wider than 96 bits or more than 28 fractional digits. The crate never relies on them for arithmetic.
+   - Instead it works on the integer mantissas in 768-bit integers (`src/decimal/wide.rs`), so every intermediate is exact.
+   - A sum, difference or product is either the exact result or `Arithmetic`, when that result cannot be represented. The ledger is unchanged in that case.
+   - Products and ratios that are rounded (below) are computed exactly and rounded **once**, from the exact quotient and remainder. A result that can be represented at the target scale is therefore always produced, including with 18-digit price, quantity and asset scales.
    - Binary floating point is banned crate wide (`clippy::float_arithmetic = deny`).
 
 ## Rounding
 
-A value is rounded in exactly two places. Both use the ledger's `Rounding` mode, which defaults to half even.
+A value is rounded only in the places below. Each rounding is a single step from the exact value, using the ledger's `Rounding` mode (half even by default; also half away from zero, toward zero, away from zero).
 
-1. **Notional.** `price * quantity` is computed exactly and then rounded to the quote asset scale. The rounded value is the cash that changes hands. The cashflow records `notional_exact`, `notional` and `rounding_residual = notional - notional_exact`.
+1. **Notional.** `price * quantity` is computed exactly and then rounded to the quote asset scale. The rounded value is the cash that changes hands. The cashflow records `notional`, and also `notional_exact` and `rounding_residual = notional - notional_exact` when a `Decimal` can hold the exact product. It cannot when price and quantity scales of 18 each give 36 fractional digits; then both fields are `None`.
 
    Fragmented fills therefore round once per fill. For example, three fills at 100.01 for 0.33333333, 0.33333333 and 0.33333334 cost 100.009999 in total, while a single fill would cost 100.01. The residuals sum to the difference, here -0.000001.
 
 2. **Released cost.** When a fill reduces a position by `r` out of `|q|`, the cost basis released is `round(cost_basis * r / |q|)`, rounded to the quote asset scale. A fill that closes the position releases the whole remaining cost basis.
 
    The cost released over a full close therefore always sums exactly to the cost paid. Realized PnL is `-(fill value) - released`, so total realized PnL equals total quote cash exchanged by trades.
+
+3. **Valuation.** `round(quantity * mark)`, described under the valuation policy.
 
 When a fill crosses zero, it closes the old position at `round(price * |q|)`. The rest of the fill's rounded notional opens the new position, so the fill's cash is split without loss.
 
@@ -85,7 +89,7 @@ Each booked execution returns an `ExecutionCashflow` with:
 
 `Valuation::net_in(target, rates)` converts each asset's `net_pnl` with an explicit rate, defined as the price of one unit in `target`. It fails with `MissingConversionRate` when a rate is missing.
 
-Precision: each product is computed to 28 significant digits, and the sum is rounded once to the target asset scale. The result is therefore within half a unit in the last place of the target asset, for example ±0.0000005 USDC at scale 6. This is the only tolerance in the crate. Nothing else is approximate.
+Precision: the products and their sum are computed exactly and rounded once to the target asset scale. The result is the exact converted sum rounded to that scale, so under half even it is within half a unit in the last place, for example ±0.0000005 USDC at scale 6. The rates are taken as exact. Apart from the explicit roundings above, nothing is approximate.
 
 ## Mapping from market-maker-rs (contract for the adapter)
 

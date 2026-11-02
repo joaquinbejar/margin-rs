@@ -95,7 +95,7 @@ fn buy_then_partial_sell_matches_hand_calculation() {
     let cf = book(&mut ledger, &buy);
     assert_eq!(cf.sequence, 0);
     assert_eq!(cf.notional, dec!(200));
-    assert_eq!(cf.rounding_residual, dec!(0));
+    assert_eq!(cf.rounding_residual, Some(dec!(0)));
     assert_eq!(
         cf.deltas,
         BTreeMap::from([(asset("BTC"), dec!(2)), (usdc.clone(), dec!(-200.2))])
@@ -271,8 +271,8 @@ fn fragmented_fills_round_per_fill_and_reconcile() {
             &exec(&format!("f{i}"), Side::Buy, dec!(100.01), *quantity),
         );
         assert_eq!(cf.notional, notional);
-        exact_sum += cf.notional_exact;
-        residual_sum += cf.rounding_residual;
+        exact_sum += cf.notional_exact.expect("representable");
+        residual_sum += cf.rounding_residual.expect("representable");
     }
     assert_eq!(exact_sum, dec!(100.01));
     assert_eq!(residual_sum, dec!(-0.000001));
@@ -297,7 +297,7 @@ fn exact_round_trip_restores_balances() {
         &mut ledger,
         &exec("b", Side::Buy, dec!(43210.99), dec!(1.23456789)),
     );
-    assert_eq!(buy.notional_exact, dec!(53346.9007491111));
+    assert_eq!(buy.notional_exact, Some(dec!(53346.9007491111)));
     assert_eq!(buy.notional, dec!(53346.900749));
     book(
         &mut ledger,
@@ -677,4 +677,154 @@ fn registration_rules() {
             asset: asset("SOL")
         })
     );
+}
+
+/// M104-1: a deposit whose sum rust_decimal would round is rejected and
+/// leaves the balance unchanged, in both orders.
+#[test]
+fn deposits_that_would_lose_digits_are_rejected() {
+    for (first, second) in [(dec!(0.1), Decimal::MAX), (Decimal::MAX, dec!(0.1))] {
+        let mut ledger = Ledger::default();
+        let usd = asset("USD");
+        ledger.register_asset(usd.clone(), 1).expect("register");
+        assert_eq!(ledger.deposit(tid("a"), usd.clone(), first), Ok(true));
+        let before = ledger.snapshot();
+        assert_eq!(
+            ledger.deposit(tid("b"), usd.clone(), second),
+            Err(MarginError::arithmetic("balance + transfer"))
+        );
+        assert_eq!(ledger.snapshot(), before);
+        assert_eq!(total(&ledger, "USD"), first);
+        ledger.reconcile().expect("reconciles");
+    }
+}
+
+/// M104-2: the cost released by a partial close is rounded once from the
+/// exact ratio.
+///
+/// Quote scale 18, base scale 0, price scale 18. Buy 2e18 units at 1e-18
+/// (cost 2) and 1 unit at 1 (cost 3, quantity 2000000000000000001). Sell 1
+/// at 1e-18: the exact released cost 3 / 2000000000000000001 is just below
+/// 1.5e-18, so half even releases 1e-18 and the realized PnL is 0.
+#[test]
+fn partial_close_releases_cost_rounded_once() {
+    let mut ledger = Ledger::default();
+    let (quote, base) = (asset("QUOTE"), asset("UNIT"));
+    let id = InstrumentId::new("UNIT-QUOTE").expect("id");
+    ledger.register_asset(quote.clone(), 18).expect("register");
+    ledger.register_asset(base.clone(), 0).expect("register");
+    ledger
+        .register_instrument(
+            SpotInstrument::new(id.clone(), base, quote.clone(), 18, 0).expect("spot"),
+        )
+        .expect("register");
+    ledger.deposit(tid("d"), quote, dec!(3)).expect("deposit");
+    let tick = dec!(0.000000000000000001);
+    let fill = |name: &str, side, price, quantity| {
+        Execution::new(eid(name), id.clone(), side, price, quantity)
+    };
+    book(
+        &mut ledger,
+        &fill("b1", Side::Buy, tick, dec!(2000000000000000000)),
+    );
+    book(&mut ledger, &fill("b2", Side::Buy, dec!(1), dec!(1)));
+    let cf = book(&mut ledger, &fill("s1", Side::Sell, tick, dec!(1)));
+    assert_eq!(cf.realized_pnl, dec!(0));
+    assert_eq!(cf.position_after.quantity, dec!(2000000000000000000));
+    assert_eq!(cf.position_after.cost_basis, dec!(2.999999999999999999));
+    ledger.reconcile().expect("reconciles");
+}
+
+/// M104-4: an 18/18 position (ETH quantity scale 18 against DAI scale 18)
+/// can be opened, reduced and valued, with price scales 2 and 18.
+///
+/// Buy 1.123456789012345678 ETH at 3000.12: notional 3370.505181851718515481
+/// (exact 3370.50518185171851548136). Sell 0.123456789012345678 at 3000.12:
+/// proceeds 370.385181851718515481, released cost the same, realized 0,
+/// cost basis 3000.12 for 1 ETH. Mark 3000.123456789012345678: market value
+/// 3000.123456789012345678, unrealized 0.003456789012345678.
+#[test]
+fn eighteen_digit_scales_open_reduce_and_value() {
+    let mut ledger = Ledger::default();
+    let (dai, eth) = (asset("DAI"), asset("ETH"));
+    let pair = InstrumentId::new("ETH-DAI").expect("id");
+    let fine = InstrumentId::new("ETH-DAI-FINE").expect("id");
+    ledger.register_asset(dai.clone(), 18).expect("register");
+    ledger.register_asset(eth.clone(), 18).expect("register");
+    ledger
+        .register_instrument(
+            SpotInstrument::new(pair.clone(), eth.clone(), dai.clone(), 2, 18).expect("spot"),
+        )
+        .expect("register");
+    ledger
+        .register_instrument(
+            SpotInstrument::new(fine.clone(), eth.clone(), dai.clone(), 18, 18).expect("spot"),
+        )
+        .expect("register");
+    ledger
+        .deposit(tid("d"), dai.clone(), dec!(10000))
+        .expect("deposit");
+
+    let buy = book(
+        &mut ledger,
+        &Execution::new(
+            eid("b"),
+            pair.clone(),
+            Side::Buy,
+            dec!(3000.12),
+            dec!(1.123456789012345678),
+        ),
+    );
+    assert_eq!(buy.notional, dec!(3370.505181851718515481));
+    assert_eq!(buy.notional_exact, Some(dec!(3370.50518185171851548136)));
+    assert_eq!(buy.rounding_residual, Some(dec!(-0.00000000000000000036)));
+    let sell = book(
+        &mut ledger,
+        &Execution::new(
+            eid("s"),
+            pair.clone(),
+            Side::Sell,
+            dec!(3000.12),
+            dec!(0.123456789012345678),
+        ),
+    );
+    assert_eq!(sell.notional, dec!(370.385181851718515481));
+    assert_eq!(sell.realized_pnl, dec!(0));
+    assert_eq!(sell.position_after.quantity, dec!(1));
+    assert_eq!(sell.position_after.cost_basis, dec!(3000.12));
+    assert_eq!(total(&ledger, "DAI"), dec!(6999.88));
+
+    let valuation = ledger
+        .valuation(&BTreeMap::from([(
+            pair.clone(),
+            dec!(3000.123456789012345678),
+        )]))
+        .expect("valuation");
+    assert_eq!(
+        valuation.positions[&pair].market_value,
+        dec!(3000.123456789012345678)
+    );
+    assert_eq!(
+        valuation.positions[&pair].unrealized_pnl,
+        dec!(0.003456789012345678)
+    );
+
+    // Price scale 18 too: 1.123456789012345678 * 3000.123456789012345678
+    // has 36 fractional digits; rounded half even at 18 it is
+    // 3370.509065404802618515.
+    let fine_buy = book(
+        &mut ledger,
+        &Execution::new(
+            eid("fb"),
+            fine.clone(),
+            Side::Buy,
+            dec!(3000.123456789012345678),
+            dec!(1.123456789012345678),
+        ),
+    );
+    assert_eq!(fine_buy.notional, dec!(3370.509065404802618515));
+    // The exact product needs 36 fractional digits: not representable.
+    assert_eq!(fine_buy.notional_exact, None);
+    assert_eq!(fine_buy.rounding_residual, None);
+    ledger.reconcile().expect("reconciles");
 }

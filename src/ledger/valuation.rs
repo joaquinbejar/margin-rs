@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use rust_decimal::Decimal;
 
-use crate::decimal::{Rounding, round};
+use crate::decimal::{Rounding, sum_products_round};
 use crate::error::{MarginError, Result};
 use crate::ids::{Asset, InstrumentId};
 
@@ -80,12 +80,11 @@ impl Valuation {
     ///
     /// # Precision
     ///
-    /// Each `net_pnl * rate` product is computed to 28 significant digits;
-    /// the sum is rounded once to the scale of `target` with the ledger's
-    /// rounding mode. The result is therefore within half a unit of the last
-    /// digit of `target` (for example 0.0000005 USDC at scale 6) of the exact
-    /// value, plus the 28 digit truncation of each product, which is far
-    /// below that bound for amounts within the configured scales.
+    /// The products and their sum are computed exactly, then rounded once
+    /// to the scale of `target` with the ledger's rounding mode. The result
+    /// is the exact converted sum rounded to `target`'s precision: within
+    /// half a unit of its last digit under half even rounding (for example
+    /// 0.0000005 USDC at scale 6). The rates themselves are taken as exact.
     ///
     /// # Errors
     ///
@@ -101,13 +100,13 @@ impl Valuation {
             .ok_or_else(|| MarginError::UnknownAsset {
                 asset: target.clone(),
             })?;
-        let mut total = Decimal::ZERO;
+        let mut terms = Vec::with_capacity(self.by_asset.len());
         for (asset, pnl) in &self.by_asset {
             if pnl.net_pnl.is_zero() {
                 continue;
             }
-            let term = if asset == target {
-                pnl.net_pnl
+            let rate = if asset == target {
+                Decimal::ONE
             } else {
                 let rate = *rates
                     .get(asset)
@@ -118,14 +117,46 @@ impl Valuation {
                 if rate <= Decimal::ZERO {
                     return Err(MarginError::invalid_input("rate", "must be positive"));
                 }
-                pnl.net_pnl
-                    .checked_mul(rate)
-                    .ok_or(MarginError::arithmetic("net_pnl * rate"))?
+                rate
             };
-            total = total
-                .checked_add(term)
-                .ok_or(MarginError::arithmetic("sum of converted net_pnl"))?;
+            terms.push((pnl.net_pnl, rate));
         }
-        Ok(round(total, scale, self.rounding))
+        sum_products_round(&terms, scale, self.rounding, "sum of net_pnl * rate")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    fn asset(code: &str) -> Asset {
+        Asset::new(code).expect("valid asset")
+    }
+
+    fn line(net_pnl: Decimal) -> AssetPnl {
+        AssetPnl {
+            net_pnl,
+            ..AssetPnl::default()
+        }
+    }
+
+    /// M104-3: the conversion is exact before its single rounding.
+    /// A = MAX, B = 0.1, USD = -MAX at rate 1 sum to 0.1, not 0.
+    #[test]
+    fn net_in_is_exact_before_rounding() {
+        let (a, b, usd) = (asset("A"), asset("B"), asset("USD"));
+        let valuation = Valuation {
+            positions: BTreeMap::new(),
+            by_asset: BTreeMap::from([
+                (a.clone(), line(Decimal::MAX)),
+                (b.clone(), line(dec!(0.1))),
+                (usd.clone(), line(Decimal::MIN)),
+            ]),
+            scales: BTreeMap::from([(a.clone(), 6), (b.clone(), 6), (usd.clone(), 6)]),
+            rounding: Rounding::HalfEven,
+        };
+        let rates = BTreeMap::from([(a, dec!(1)), (b, dec!(1))]);
+        assert_eq!(valuation.net_in(&usd, &rates), Ok(dec!(0.1)));
     }
 }

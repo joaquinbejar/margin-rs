@@ -69,7 +69,9 @@ pub use execution::{Booking, Execution, ExecutionCashflow, Fee, Side};
 pub use snapshot::{BalanceSnapshot, LedgerSnapshot, PositionSnapshot};
 pub use valuation::{AssetPnl, PositionValuation, Valuation};
 
-use crate::decimal::{self, Rounding, add, check_configured_scale, check_scale, mul, sub};
+use crate::decimal::{
+    self, Rounding, add, check_configured_scale, check_scale, mul, mul_div_round, sub,
+};
 use crate::error::{MarginError, Result};
 use crate::ids::{Asset, ExecutionId, InstrumentId, ReservationId, TransferId};
 use crate::instrument::Instrument;
@@ -467,9 +469,18 @@ impl Ledger {
 
         let rounding = self.config.rounding;
         let quote_scale = self.asset_scale_or_err(spot.quote())?;
-        let notional_exact = mul(execution.price, execution.quantity, "price * quantity")?;
-        let notional = decimal::round(notional_exact, quote_scale, rounding);
-        let rounding_residual = sub(notional, notional_exact, "notional - exact")?;
+        let notional = mul_div_round(
+            &[execution.price, execution.quantity],
+            &[],
+            quote_scale,
+            rounding,
+            "price * quantity",
+        )?;
+        // The exact product needs up to price_scale + quantity_scale digits;
+        // it is recorded when a Decimal can hold it.
+        let notional_exact = mul(execution.price, execution.quantity, "price * quantity").ok();
+        let rounding_residual =
+            notional_exact.and_then(|exact| sub(notional, exact, "notional - exact").ok());
 
         // Signed quantity and signed quote value (positive when buying).
         let (signed_quantity, signed_value) = match execution.side {
@@ -675,8 +686,14 @@ impl Ledger {
                     return Err(MarginError::invalid_input("mark", "must be positive"));
                 }
                 check_scale(mark, decimal::MAX_SCALE, "mark")?;
-                let value = mul(position.quantity, mark, "quantity * mark")?;
-                (Some(mark), decimal::round(value, quote_scale, rounding))
+                let value = mul_div_round(
+                    &[position.quantity, mark],
+                    &[],
+                    quote_scale,
+                    rounding,
+                    "quantity * mark",
+                )?;
+                (Some(mark), value)
             };
             let unrealized_pnl = sub(market_value, position.cost_basis, "market_value - cost")?;
             let line = by_asset.entry(quote.clone()).or_default();
@@ -887,9 +904,9 @@ fn apply_fill(
         let released = if traded == held {
             cost
         } else {
-            decimal::div_round(
-                mul(cost, traded, "cost * traded")?,
-                held,
+            mul_div_round(
+                &[cost, traded],
+                &[held],
                 quote_scale,
                 rounding,
                 "released cost",
@@ -898,7 +915,8 @@ fn apply_fill(
         let realized = sub(-signed_value, released, "realized pnl")?;
         (realized, sub(cost, released, "cost - released")?)
     } else {
-        let close_value = decimal::round(mul(price, held, "price * held")?, quote_scale, rounding);
+        let close_value =
+            mul_div_round(&[price, held], &[], quote_scale, rounding, "price * held")?;
         let close_value = if signed_value.is_sign_negative() {
             -close_value
         } else {
