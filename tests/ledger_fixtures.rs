@@ -935,3 +935,44 @@ fn real_execution_can_overdraw() {
     ledger.deposit(tid("d2"), usdc, dec!(50)).expect("deposit");
     assert!(ledger.reconcile().expect("reconciles").is_clean());
 }
+
+/// set_reservation is atomic: it resizes in one step, shrinking always
+/// works even on an overdrawn balance, and an uncovered increase changes
+/// nothing.
+#[test]
+fn set_reservation_is_atomic_even_when_overdrawn() {
+    let mut ledger = ledger();
+    let usdc = asset("USDC");
+    let hold = ReservationId::new("hold").expect("id");
+    ledger
+        .deposit(tid("d1"), usdc.clone(), dec!(100))
+        .expect("deposit");
+    ledger
+        .set_reservation(&hold, usdc.clone(), dec!(80))
+        .expect("hold");
+    // A real execution overdraws: total -20, reserved 80.
+    ledger
+        .book_execution_allowing_overdraft(&exec("e1", Side::Buy, dec!(120), dec!(1)), None)
+        .expect("booked");
+    let b = ledger.balance(&usdc).expect("balance");
+    assert_eq!((b.total, b.reserved), (dec!(-20), dec!(80)));
+    // Shrinking works.
+    ledger
+        .set_reservation(&hold, usdc.clone(), dec!(30))
+        .expect("shrink");
+    assert_eq!(ledger.reservation(&hold).map(|(_, a)| a), Some(dec!(30)));
+    // Growing is not covered: nothing changes.
+    let before = ledger.snapshot();
+    assert!(matches!(
+        ledger.set_reservation(&hold, usdc.clone(), dec!(40)),
+        Err(MarginError::InsufficientBalance { .. })
+    ));
+    assert_eq!(ledger.snapshot(), before);
+    // Zero removes it.
+    ledger
+        .set_reservation(&hold, usdc.clone(), dec!(0))
+        .expect("remove");
+    assert_eq!(ledger.reservation(&hold), None);
+    assert_eq!(ledger.balance(&usdc).expect("balance").reserved, dec!(0));
+    ledger.reconcile().expect("reconciles");
+}

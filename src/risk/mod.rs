@@ -380,15 +380,16 @@ impl RiskGate {
     /// (zero removes it). Used to make capital committed elsewhere, such as
     /// derivative margin
     /// ([`MarginReservationService`](crate::margin_reservations::MarginReservationService)),
-    /// unavailable to spot orders. Atomic: on error the previous hold is
-    /// kept.
+    /// unavailable to spot orders. Atomic ([`Ledger::set_reservation`]): on
+    /// error the previous hold is kept, and shrinking a hold always
+    /// succeeds, even on an overdrawn balance.
     ///
     /// # Errors
     ///
     /// [`MarginError::InvalidInput`] if `id` is also an order id of this
-    /// gate; [`MarginError::InsufficientBalance`] if the available balance,
-    /// counting the previous hold, does not cover `amount`; the ledger's
-    /// input errors.
+    /// gate; [`MarginError::InsufficientBalance`] if an increase is not
+    /// covered by the available balance plus the previous hold; the
+    /// ledger's input errors.
     pub fn set_hold(&mut self, id: &ReservationId, asset: Asset, amount: Decimal) -> Result<()> {
         if OrderId::new(id.as_str()).is_ok_and(|order| self.orders.contains_key(&order)) {
             return Err(MarginError::invalid_input(
@@ -396,23 +397,7 @@ impl RiskGate {
                 "the id belongs to an order",
             ));
         }
-        let previous = match self.ledger.reservation(id) {
-            Some(_) => Some(self.ledger.release(id)?),
-            None => None,
-        };
-        if amount.is_zero() {
-            return Ok(());
-        }
-        match self.ledger.reserve(id.clone(), asset, amount) {
-            Ok(_) => Ok(()),
-            Err(error) => {
-                if let Some((asset, amount)) = previous {
-                    // Restoring what was just released cannot fail.
-                    self.ledger.reserve(id.clone(), asset, amount)?;
-                }
-                Err(error)
-            }
-        }
+        self.ledger.set_reservation(id, asset, amount)
     }
 
     /// Amount of an external hold set with [`RiskGate::set_hold`].

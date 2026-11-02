@@ -510,6 +510,45 @@ mod with_gate {
         );
     }
 
+    /// C3: reserve_with_gate is atomic. If the hold cannot be set (here
+    /// its id collides with an order id of the gate), neither the service
+    /// nor the gate changes and the order id stays unused.
+    #[test]
+    fn failed_hold_changes_nothing() {
+        let mut gate = gate();
+        let unknown = OrderRequest::new(oid("hold"), iid("UNKNOWN"), Side::Buy, dec!(1), dec!(1));
+        assert!(gate.submit(&unknown, 0).is_rejected());
+        let mut service = service();
+        let colliding = ReservationId::new("hold").expect("id");
+        assert_eq!(
+            service.reserve_with_gate(
+                order("a", "XYZ-PERP", Side::Buy, dec!(3)),
+                &mut gate,
+                &colliding,
+                &marks()
+            ),
+            Err(MarginError::invalid_input(
+                "hold",
+                "the id belongs to an order"
+            ))
+        );
+        assert_eq!(service.remaining(&oid("a")), None);
+        assert_eq!(gate.hold(&colliding), dec!(0));
+        assert_eq!(total(&service), (dec!(0), dec!(0), dec!(0)));
+        // The id was not consumed.
+        assert!(matches!(
+            service
+                .reserve_with_gate(
+                    order("a", "XYZ-PERP", Side::Buy, dec!(3)),
+                    &mut gate,
+                    &hold(),
+                    &marks()
+                )
+                .expect("decision"),
+            MarginDecision::Reserved { .. }
+        ));
+    }
+
     /// The hold id cannot be an order id of the gate.
     #[test]
     fn hold_ids_do_not_collide_with_orders() {

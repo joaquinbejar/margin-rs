@@ -316,8 +316,24 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
         collateral: Option<Decimal>,
         marks: &BTreeMap<InstrumentId, Decimal>,
     ) -> Result<MarginDecision> {
-        let reject = |reason| Ok(MarginDecision::Rejected { reason });
-        if !self.seen_orders.insert(order.id.clone()) {
+        let (decision, candidate) = self.decide(&order, collateral, marks)?;
+        self.seen_orders.insert(order.id);
+        if let Some(orders) = candidate {
+            self.orders = orders;
+        }
+        Ok(decision)
+    }
+
+    /// The decision on `order` and, if accepted, the order book with it.
+    /// Changes nothing.
+    fn decide(
+        &self,
+        order: &MarginOrder,
+        collateral: Option<Decimal>,
+        marks: &BTreeMap<InstrumentId, Decimal>,
+    ) -> Result<(MarginDecision, Option<BTreeMap<OrderId, PendingOrder>>)> {
+        let reject = |reason| Ok((MarginDecision::Rejected { reason }, None));
+        if self.seen_orders.contains(&order.id) {
             return reject(MarginRejection::DuplicateOrderId);
         }
         if !self.instruments.contains_key(&order.instrument) {
@@ -362,11 +378,13 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
             });
         }
         let reserved = sub(after.total, before.total, "after - before")?;
-        self.orders = with_order;
-        Ok(MarginDecision::Reserved {
-            required: after.total,
-            reserved,
-        })
+        Ok((
+            MarginDecision::Reserved {
+                required: after.total,
+                reserved,
+            },
+            Some(with_order),
+        ))
     }
 
     /// Applies a fill of `contracts` to `order`, once per `execution`.
@@ -481,11 +499,18 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
             .map(|b| b.available)
             .unwrap_or_default();
         let collateral = add(available, gate.hold(hold), "available + hold")?;
-        let decision = self.reserve(order, Some(collateral), marks)?;
+        // Decide without changing anything, set the hold, and only then
+        // commit the order: on any error neither the service nor the gate
+        // changes, and the order id stays unused.
+        let (decision, candidate) = self.decide(&order, Some(collateral), marks)?;
         if let MarginDecision::Reserved { required, .. } = &decision {
             // A risk reducing order may be accepted while the requirement
             // exceeds the cash; the hold then takes all of it.
             gate.set_hold(hold, currency, (*required).min(collateral))?;
+        }
+        self.seen_orders.insert(order.id);
+        if let Some(orders) = candidate {
+            self.orders = orders;
         }
         Ok(decision)
     }
@@ -498,7 +523,8 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
     /// The errors of [`MarginReservationService::requirement`] and of
     /// [`RiskGate::set_hold`] (a requirement that grew beyond the available
     /// cash, for example after a mark move, is reported and the previous
-    /// hold kept).
+    /// hold kept). Atomic: on error neither the service nor the gate
+    /// changes and the order id stays unused.
     pub fn sync_hold(
         &self,
         gate: &mut RiskGate,

@@ -433,6 +433,75 @@ impl Ledger {
         self.release_inner(id)
     }
 
+    /// Sets reservation `id` to exactly `amount` of `asset` in one atomic
+    /// step, creating, resizing, moving or (with zero) removing it.
+    ///
+    /// Only an increase needs cover: the asset's total must stay at or
+    /// above its reservations. Shrinking or removing a reservation always
+    /// succeeds, even on an overdrawn balance. On error nothing changes.
+    ///
+    /// # Errors
+    ///
+    /// [`MarginError::UnknownAsset`], [`MarginError::InvalidInput`]
+    /// (negative amount), [`MarginError::PrecisionExceeded`],
+    /// [`MarginError::InsufficientBalance`] for an increase that is not
+    /// covered, or [`MarginError::Arithmetic`].
+    pub fn set_reservation(
+        &mut self,
+        id: &ReservationId,
+        asset: Asset,
+        amount: Decimal,
+    ) -> Result<()> {
+        let scale = self.asset_scale_or_err(&asset)?;
+        if amount < Decimal::ZERO {
+            return Err(MarginError::invalid_input("amount", "must not be negative"));
+        }
+        check_scale(amount, scale, "amount")?;
+        let previous = self.reservations.get(id).cloned();
+        // New reserved totals of the affected assets, computed first.
+        let mut updates: BTreeMap<Asset, Balance> = BTreeMap::new();
+        if let Some((old_asset, old_amount)) = &previous {
+            let balance = self.balance_of(old_asset)?;
+            updates.insert(
+                old_asset.clone(),
+                Balance {
+                    total: balance.total,
+                    reserved: sub(balance.reserved, *old_amount, "reserved - previous")?,
+                },
+            );
+        }
+        let current = match updates.get(&asset) {
+            Some(balance) => *balance,
+            None => self.balance_of(&asset)?,
+        };
+        let reserved = add(current.reserved, amount, "reserved + amount")?;
+        let before = self.balance_of(&asset)?;
+        if reserved > before.reserved && current.total < reserved {
+            return Err(MarginError::InsufficientBalance {
+                asset,
+                required: amount,
+                available: sub(current.total, current.reserved, "total - reserved")?,
+            });
+        }
+        updates.insert(
+            asset.clone(),
+            Balance {
+                total: current.total,
+                reserved,
+            },
+        );
+        // Commit.
+        for (asset, balance) in updates {
+            self.balances.insert(asset, balance);
+        }
+        if amount.is_zero() {
+            self.reservations.remove(id);
+        } else {
+            self.reservations.insert(id.clone(), (asset, amount));
+        }
+        Ok(())
+    }
+
     /// An open reservation's asset and amount.
     #[must_use]
     pub fn reservation(&self, id: &ReservationId) -> Option<(&Asset, Decimal)> {
