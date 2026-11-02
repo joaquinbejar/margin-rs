@@ -146,6 +146,39 @@ pub(crate) fn sum_terms_round(
     round_ratio(sum, denominator, scale, rounding).ok_or_else(error)
 }
 
+/// Exact sum of any number of values. Partial sums are kept in wide
+/// integers, so only the final sum must be representable, whatever the
+/// order of the values.
+pub(crate) fn sum(values: &[Decimal], operation: &'static str) -> Result<Decimal> {
+    let error = || MarginError::arithmetic(operation);
+    let common = values.iter().map(Decimal::scale).max().unwrap_or(0);
+    let mut total = Wide::ZERO;
+    for value in values {
+        let (wide, scale) = Wide::from_decimal(*value);
+        total = total
+            .checked_add(wide.scale_up(common - scale).ok_or_else(error)?)
+            .ok_or_else(error)?;
+    }
+    total.to_decimal(common).ok_or_else(error)
+}
+
+/// Exact comparison of `product(left)` with `product(right)`, without
+/// converting either product to a `Decimal` (they need not be
+/// representable).
+pub(crate) fn compare_products(
+    left: &[Decimal],
+    right: &[Decimal],
+    operation: &'static str,
+) -> Result<core::cmp::Ordering> {
+    let error = || MarginError::arithmetic(operation);
+    let (l, ls) = wide_product(left).ok_or_else(error)?;
+    let (r, rs) = wide_product(right).ok_or_else(error)?;
+    let common = ls.max(rs);
+    let l = l.scale_up(common - ls).ok_or_else(error)?;
+    let r = r.scale_up(common - rs).ok_or_else(error)?;
+    Ok(l.cmp_signed(&r))
+}
+
 /// Product of the mantissas and sum of the scales.
 fn wide_product(values: &[Decimal]) -> Option<(Wide, u32)> {
     let mut product = Wide::new(false, U768::from_u128(1));
@@ -531,6 +564,42 @@ mod tests {
             Err(MarginError::arithmetic("t"))
         );
         assert_eq!(product(&[], "t"), Ok(dec!(1)));
+    }
+
+    #[test]
+    fn exact_sums_and_product_comparisons() {
+        // MAX + 0.1 - MAX: the partial sum is not representable, the total is.
+        assert_eq!(
+            sum(&[Decimal::MAX, dec!(0.1), Decimal::MIN], "t"),
+            Ok(dec!(0.1))
+        );
+        assert_eq!(
+            sum(&[Decimal::MAX, dec!(1)], "t"),
+            Err(MarginError::arithmetic("t"))
+        );
+        use core::cmp::Ordering;
+        // 1e-16 * 1e-16 = 1e-32 is not a Decimal, but compares exactly.
+        let tiny = Decimal::new(1, 16);
+        assert_eq!(
+            compare_products(&[tiny, tiny], &[Decimal::ZERO], "t"),
+            Ok(Ordering::Greater)
+        );
+        assert_eq!(
+            compare_products(&[tiny, tiny], &[tiny, tiny], "t"),
+            Ok(Ordering::Equal)
+        );
+        assert_eq!(
+            compare_products(
+                &[Decimal::MAX, Decimal::MAX],
+                &[Decimal::MAX, Decimal::MAX, dec!(1.1)],
+                "t"
+            ),
+            Ok(Ordering::Less)
+        );
+        assert_eq!(
+            compare_products(&[dec!(-1), dec!(2)], &[dec!(1)], "t"),
+            Ok(Ordering::Less)
+        );
     }
 
     /// Wide results agree with i128 arithmetic where i128 suffices.

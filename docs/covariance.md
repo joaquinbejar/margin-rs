@@ -24,7 +24,7 @@ The covariance is per horizon, in each factor's units. Cross-covariances, for ex
 - exact symmetry;
 - exact positive semidefiniteness: non-negative diagonal and, for two factors, `c11 * c22 - c12^2 >= 0`, computed exactly.
 
-`from_correlation` builds `c_ij = rho_ij * sigma_i * sigma_j`. It checks that each `sigma >= 0`, that every `rho` is in `[-1, 1]`, and that the diagonal of `rho` is 1.
+`from_correlation` builds `c_ij = rho_ij * sigma_i * sigma_j` as one exact product, so only the covariance itself must be representable. It checks that each `sigma >= 0`, that every `rho` is in `[-1, 1]`, and that the diagonal of `rho` is 1.
 
 **Decision.** An invalid matrix is **rejected** with `InvalidCovariance`. It is never regularized: no eigenvalue clipping and no shrinkage. Estimation and repair are the caller's job.
 
@@ -32,7 +32,7 @@ The covariance is per horizon, in each factor's units. Cross-covariances, for ex
 
 ## Variance
 
-Exposures to the same factor are summed into one net vector `e`, so offsetting positions offset. The function then computes `e' C e` exactly and rounds it **up** once to `scale`. Because `C` is positive semidefinite, the exact value is never negative, so the result is never negative either. A negative value would be reported as an error, never returned.
+Exposures to the same factor net, so offsetting positions offset. The function computes `e' C e` exactly by expanding it over the exposures themselves, `sum over pairs (a, b) of e_a * e_b * C[f(a)][f(b)]`. The result is therefore independent of the order of the exposures, and partial sums never need to be representable. It rounds the result **up** once to `scale`. The reported net exposure per factor is an exact sum. Because `C` is positive semidefinite, the exact value is never negative, so the result is never negative either. A negative value would be reported as an error, never returned.
 
 Scenario revaluation is a separate interface (`scenarios`, M2-08).
 

@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rust_decimal::Decimal;
 
-use crate::decimal::{Rounding, add, mul, sub, sum_terms_round};
+use crate::decimal::{Rounding, compare_products, product, sum, sum_terms_round};
 use crate::error::{MarginError, Result};
 use crate::factors::{Factor, FactorExposure, FactorKind};
 use crate::ids::{Asset, FactorId};
@@ -90,12 +90,14 @@ impl ValidatedCovariance {
             }
         }
         if n == 2 {
-            let det = sub(
-                mul(matrix[0][0], matrix[1][1], "c11 * c22")?,
-                mul(matrix[0][1], matrix[1][0], "c12 * c21")?,
+            // det >= 0 <=> c11 * c22 >= c12 * c21, compared exactly: the
+            // products need not be representable as Decimals.
+            let order = compare_products(
+                &[matrix[0][0], matrix[1][1]],
+                &[matrix[0][1], matrix[1][0]],
                 "determinant",
             )?;
-            if det < Decimal::ZERO {
+            if order == core::cmp::Ordering::Less {
                 return invalid("the matrix must be positive semidefinite");
             }
         }
@@ -137,9 +139,10 @@ impl ValidatedCovariance {
         let mut matrix = vec![vec![Decimal::ZERO; n]; n];
         for i in 0..n {
             for j in 0..n {
-                matrix[i][j] = mul(
-                    mul(correlation[i][j], deviations[i], "rho * sigma_i")?,
-                    deviations[j],
+                // One exact product: only the covariance itself must be
+                // representable.
+                matrix[i][j] = product(
+                    &[correlation[i][j], deviations[i], deviations[j]],
                     "rho * sigma_i * sigma_j",
                 )?;
             }
@@ -202,7 +205,8 @@ pub fn portfolio_variance(
         .enumerate()
         .map(|(i, f)| (&f.id, (i, f.kind)))
         .collect();
-    let mut net = vec![Decimal::ZERO; covariance.factors.len()];
+    // Factor index of every exposure, after validation.
+    let mut slots = Vec::with_capacity(exposures.len());
     for exposure in exposures {
         if exposure.currency != currency {
             return Err(MarginError::CurrencyMismatch {
@@ -223,18 +227,33 @@ pub fn portfolio_variance(
                 found: exposure.kind.unit(),
             });
         }
-        net[i] = add(net[i], exposure.amount, "net exposure")?;
+        slots.push(i);
     }
 
-    let n = net.len();
-    let mut terms: Vec<[Decimal; 3]> = Vec::with_capacity(n * n);
-    for i in 0..n {
-        for j in 0..n {
-            terms.push([net[i], net[j], covariance.matrix[i][j]]);
+    // e' C e expanded over the exposures themselves:
+    // sum over pairs (a, b) of e_a * e_b * C[f(a)][f(b)], exact and
+    // independent of the order, so partial net exposures never need to be
+    // representable. Rounded up once.
+    let mut terms: Vec<[Decimal; 3]> = Vec::with_capacity(exposures.len() * exposures.len());
+    for (a, ea) in exposures.iter().enumerate() {
+        for (b, eb) in exposures.iter().enumerate() {
+            terms.push([ea.amount, eb.amount, covariance.matrix[slots[a]][slots[b]]]);
         }
     }
     let slices: Vec<&[Decimal]> = terms.iter().map(|t| t.as_slice()).collect();
     let variance = sum_terms_round(&slices, scale, Rounding::AwayFromZero, "e' C e")?;
+
+    // Net exposure per factor, summed exactly.
+    let mut net = Vec::with_capacity(covariance.factors.len());
+    for i in 0..covariance.factors.len() {
+        let amounts: Vec<Decimal> = exposures
+            .iter()
+            .zip(&slots)
+            .filter(|(_, slot)| **slot == i)
+            .map(|(e, _)| e.amount)
+            .collect();
+        net.push(sum(&amounts, "net exposure")?);
+    }
     if variance < Decimal::ZERO {
         // Unreachable for a validated matrix; reported rather than hidden.
         return Err(MarginError::InvalidCovariance {

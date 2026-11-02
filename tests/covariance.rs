@@ -271,3 +271,63 @@ fn exposure_validation() {
     );
     assert!(portfolio_variance(&[], &cov, 6).is_err());
 }
+
+/// M302-C1: positive semidefiniteness is decided exactly, even when the
+/// determinant is not a representable Decimal.
+#[test]
+fn psd_check_is_exact_at_any_scale() {
+    let tiny = Decimal::new(1, 16);
+    let m = |a: Decimal, b: Decimal, c: Decimal| {
+        ValidatedCovariance::new(vec![price("A"), price("B")], vec![vec![a, b], vec![b, c]])
+    };
+    // det = 1e-32 > 0, not a Decimal.
+    assert!(m(tiny, Decimal::ZERO, tiny).is_ok());
+    // Singular boundary: det = 0 exactly.
+    assert!(m(tiny, tiny, tiny).is_ok());
+    // Just past the boundary: c12 = 1.0000000001e-16.
+    assert!(matches!(
+        m(tiny, dec!(0.00000000000000010000000001), tiny),
+        Err(MarginError::InvalidCovariance { .. })
+    ));
+    // Large scale: c11 * c22 = 1e40 is far beyond Decimal::MAX.
+    let big = dec!(100000000000000000000);
+    assert!(m(big, big, big).is_ok());
+    assert!(matches!(
+        m(big, dec!(100000000000000000001), big),
+        Err(MarginError::InvalidCovariance { .. })
+    ));
+}
+
+/// M302-C1: from_correlation builds rho * sigma_i * sigma_j as one exact
+/// product. rho = 0.123456789012345 times sigma 1e-14 needs 29 digits, but
+/// times sigma 1e14 as well it is rho itself.
+#[test]
+fn correlation_products_are_exact() {
+    let rho = dec!(0.123456789012345);
+    let cov = ValidatedCovariance::from_correlation(
+        vec![price("A"), price("B")],
+        vec![Decimal::new(1, 14), dec!(100000000000000)],
+        vec![vec![dec!(1), rho], vec![rho, dec!(1)]],
+    )
+    .expect("valid");
+    assert_eq!(cov.get(0, 1), Some(rho));
+    assert_eq!(cov.get(0, 0), Some(Decimal::new(1, 28)));
+}
+
+/// M302-C2: netting is exact and order independent. MAX + 0.1 - MAX on one
+/// factor with variance 1 nets to 0.1, variance 0.01, in every order.
+#[test]
+fn netting_is_exact_in_any_order() {
+    let cov = ValidatedCovariance::new(vec![price("A")], vec![vec![dec!(1)]]).expect("valid");
+    let orders = [
+        [Decimal::MAX, dec!(0.1), Decimal::MIN],
+        [dec!(0.1), Decimal::MAX, Decimal::MIN],
+        [Decimal::MAX, Decimal::MIN, dec!(0.1)],
+    ];
+    for amounts in orders {
+        let exposures: Vec<FactorExposure> = amounts.iter().map(|a| delta("A", *a)).collect();
+        let result = portfolio_variance(&exposures, &cov, 6).expect("variance");
+        assert_eq!(result.net_exposures[&fid("A")], dec!(0.1));
+        assert_eq!(result.variance, dec!(0.01));
+    }
+}
