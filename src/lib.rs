@@ -31,6 +31,9 @@
 //!   semidefinite) covariance matrix.
 //! - [`collateral`]: available collateral of one account with explicit
 //!   per asset haircuts and a declared stale price policy.
+//! - [`margin_reservations`]: initial margin reserved for pending
+//!   derivative orders of one account, recomputed exactly from positions
+//!   and live orders.
 //! - [`MarginError`] and [`Result`]: the typed error boundary.
 //!
 //! ## Policies
@@ -76,6 +79,7 @@ pub mod ids;
 pub mod initial_margin;
 pub mod instrument;
 pub mod ledger;
+pub mod margin_reservations;
 pub mod risk;
 pub mod rules;
 pub mod scenarios;
