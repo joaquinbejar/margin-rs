@@ -74,25 +74,38 @@ The lifecycle changes the reservation as follows:
 | Event | Reservation |
 |---|---|
 | `submit` (approved) | created for the approved quantity |
-| `on_fill` on a live order | shrunk to the amount the remaining quantity needs, **in the same atomic step** that books the fill (`Ledger::book_execution_with_reservation`); removed when the order is filled. A fee above the bound is taken from the free balance |
+| `on_fill` on a live order | shrunk to the amount the remaining quantity needs (zero after an overfill), **in the same atomic step** that books the fill; removed when the order is filled. A fee above the bound is taken from the free balance |
 | repeated fill (same `ExecutionId` and content) | unchanged; the ledger returns `Duplicate`, so the adjustment happens exactly once |
 | `request_cancel` | **unchanged**; the order may still fill until the venue confirms |
 | `on_cancel_confirmed` | the rest is released; repeated or late confirmations release 0 |
 | `on_venue_rejected` | the rest is released (only before any fill) |
-| `on_fill` on a canceled order (late report) | none left: booked against the free balance (M105-2) |
+| `on_fill` on a canceled or filled order (late report) | none left: booked against the free balance (M105-2) |
 
-### Fill reports
+### Fill reports: a real execution is never lost
 
-`on_fill(order_id, &FillReport)` takes the execution and the order's cumulative filled quantity after it (FIX `CumQty`). The fill must match its order:
+`on_fill(order_id, &FillReport)` takes the execution and the order's cumulative filled quantity after it (FIX `CumQty`). It returns a `FillOutcome { booking, anomalies, shortfalls }`.
 
-- same instrument and side;
-- price no worse than the limit;
-- quantity no larger than what is left;
-- `cumulative_quantity = filled so far + quantity`.
+**Rejected, with nothing changed.** Only reports that cannot be causally true are rejected:
 
-That last rule orders one order's fills causally. A late report of a real fill is accepted, while an inconsistent or impossible one is rejected with `ExecutionMismatch` and changes nothing.
+- an unknown order;
+- an order the gate rejected (it was never sent);
+- another instrument or side;
+- `cumulative_quantity != filled so far + quantity`, which is a broken sequence for that order;
+- a reused execution id with different content;
+- inputs the ledger cannot represent: non-positive values, or values finer than the instrument scale.
 
-A fill reported after the cancel was confirmed has already happened at the venue. It is therefore booked against the free balance, up to the quantity that was canceled. If the free balance cannot cover it, the gate trips `AccountingBreach` and nothing changes.
+**Booked, always.** Everything else happened at the venue, so it is booked:
+
+| Case | What happens |
+|---|---|
+| Normal fill on a live order | Booked; the reservation shrinks to what the rest needs |
+| Fill after a confirmed cancel, or on a filled order | Booked against the free balance |
+| Overfill (more than the open quantity) | Booked; only the reserved part is released; `ExecutionAnomaly::Overfill`, and the gate halts with `HaltReason::ExecutionAnomaly { order, anomaly }` |
+| Fill on a filled order | Booked; `ExecutionAnomaly::FillAfterFilled`, and the gate halts |
+| Price worse than the limit | Booked; `ExecutionAnomaly::WorsePrice`, and the gate halts |
+| Debit larger than reservation plus free balance | Booked anyway with `Ledger::book_execution_allowing_overdraft`. The balance goes negative (a debt) and the shortfall is in `FillOutcome::shortfalls`, `Ledger::overdrafts()` and `Ledger::reconcile().overdrafts`. The gate halts with `HaltReason::AccountingBreach` |
+
+A repeated report (same execution id and content) returns a `Duplicate` booking and changes nothing.
 
 ## Circuit breaker and quote withdrawal
 
@@ -102,7 +115,8 @@ A fill reported after the cancel was confirmed has already happened at the venue
   - `Manual`: an operator.
   - `CircuitBreaker`: an external breaker. The market-maker-rs adapter calls `trip(CircuitBreaker)` when `CircuitBreaker::is_trading_allowed()` turns false.
   - `DataDisconnect`: the adapter calls it when its feed drops. Independently of that, stale marks reject orders through `max_data_age_ms`.
-  - `AccountingBreach`: set by the gate itself when a fill cannot be booked because the account would be overdrawn. Example: the venue fee exceeded `max_fee_rate` and there is no free balance. The fill returns `InsufficientBalance`, nothing changes, and trading halts until an operator reconciles.
+  - `AccountingBreach`: set by the gate itself when a real fill overdraws the account. Example: the venue fee exceeded `max_fee_rate` and there is no free balance. The fill is booked as a debt and trading halts until an operator funds and reconciles the account.
+  - `ExecutionAnomaly { order, anomaly }`: set by the gate itself when a real fill does not match its order (overfill, fill after filled, worse price). The fill is booked.
 
 ## Mapping from market-maker-rs (contract for the adapter)
 

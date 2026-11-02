@@ -54,7 +54,8 @@ fn main() -> margin_rs::Result<()> {
     ledger.book_execution(&buy)?; // duplicate: ignored
 
     assert_eq!(ledger.balance(&usdc).map(|b| b.total), Some(Decimal::new(7998, 1)));
-    ledger.reconcile()
+    assert!(ledger.reconcile()?.is_clean());
+    Ok(())
 }
 ```
 

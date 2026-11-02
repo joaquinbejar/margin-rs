@@ -82,7 +82,9 @@
 //! exactly those cancels (quote withdrawal). Their reservations stay until
 //! each cancel is confirmed, and fills that race the cancels are booked
 //! normally. [`RiskGate::resume`] lifts the halt. The gate trips itself with
-//! [`HaltReason::AccountingBreach`] if a fill cannot be booked.
+//! [`HaltReason::AccountingBreach`] when a real fill overdraws the account
+//! and with [`HaltReason::ExecutionAnomaly`] when a real fill does not match
+//! its order; in both cases the fill is booked, never lost.
 
 mod decision;
 
@@ -90,7 +92,9 @@ use std::collections::BTreeMap;
 
 use rust_decimal::Decimal;
 
-pub use decision::{FillReport, HaltReason, OrderPurpose, OrderRequest, RiskDecision, RiskReason};
+pub use decision::{
+    ExecutionAnomaly, FillReport, HaltReason, OrderPurpose, OrderRequest, RiskDecision, RiskReason,
+};
 
 use crate::decimal::{Rounding, add, check_scale, mul, mul_div_round, sub};
 use crate::error::{MarginError, Result};
@@ -303,6 +307,25 @@ impl OrderRecord {
     }
 }
 
+/// Result of [`RiskGate::on_fill`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FillOutcome {
+    /// The booking, new or duplicate.
+    pub booking: Booking,
+    /// What was wrong with the fill, if anything; the gate halted.
+    pub anomalies: Vec<ExecutionAnomaly>,
+    /// Assets the fill overdrew, with the shortfall; the gate halted.
+    pub shortfalls: BTreeMap<Asset, Decimal>,
+}
+
+impl FillOutcome {
+    /// True for a new fill that matched its order and was covered.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.booking.is_new() && self.anomalies.is_empty() && self.shortfalls.is_empty()
+    }
+}
+
 /// The pretrade risk gate. See the [module docs](self).
 #[derive(Debug, Clone)]
 pub struct RiskGate {
@@ -405,7 +428,7 @@ impl RiskGate {
     /// Current halt, if any.
     #[must_use]
     pub fn halted(&self) -> Option<HaltReason> {
-        self.halt
+        self.halt.clone()
     }
 
     /// An order known to the gate.
@@ -472,8 +495,10 @@ impl RiskGate {
 
     fn decide(&self, request: &OrderRequest, now_ms: u64) -> RiskDecision {
         let mut reasons = Vec::new();
-        if let Some(reason) = self.halt {
-            reasons.push(RiskReason::Halted { reason });
+        if let Some(reason) = &self.halt {
+            reasons.push(RiskReason::Halted {
+                reason: reason.clone(),
+            });
         }
         let Ok(spot) = self.spot(&request.instrument) else {
             reasons.push(RiskReason::UnknownInstrument);
@@ -905,50 +930,64 @@ impl RiskGate {
         }
     }
 
-    /// Books a fill of order `id`.
+    /// Books a real fill of order `id`. A real execution is never lost.
     ///
     /// The report carries the order's cumulative filled quantity after the
     /// fill (as FIX `CumQty`). It must equal the quantity filled so far plus
-    /// the fill, which orders the fills of one order causally and tells a
-    /// late report of a real fill from an impossible one.
+    /// the fill: that orders one order's fills causally. Only a report that
+    /// cannot be causally true is rejected; anything that did happen is
+    /// booked:
     ///
     /// - Live order: the fill is booked and the reservation shrunk to what
     ///   the remaining quantity needs, atomically. By the
     ///   [`ReservationTerms`] bound the reservation frees at least the
-    ///   debit; anything above (a fee over `max_fee_rate`) comes from the
+    ///   debit; anything above it (a fee over `max_fee_rate`) comes from the
     ///   free balance.
-    /// - Canceled order (a fill reported after the cancel was confirmed): it
-    ///   already happened at the venue, so it is booked against the free
-    ///   balance, up to the quantity that was canceled.
+    /// - Canceled or filled order (a late report): booked against the free
+    ///   balance.
+    /// - An overfill, a fill after the order was filled, or a price worse
+    ///   than the limit is booked too, with only the reserved part released,
+    ///   reported in [`FillOutcome::anomalies`], and the gate halts with
+    ///   [`HaltReason::ExecutionAnomaly`].
+    /// - If the free balance does not cover the debit, the fill is still
+    ///   booked: the ledger records the shortfall (an overdraft, see
+    ///   [`Ledger::overdrafts`]), it is reported in
+    ///   [`FillOutcome::shortfalls`], and the gate halts with
+    ///   [`HaltReason::AccountingBreach`].
     ///
     /// A repeated execution (same [`ExecutionId`](crate::ExecutionId) and
-    /// content) returns [`Booking::Duplicate`] and changes nothing.
+    /// content) returns a [`Booking::Duplicate`] outcome and changes
+    /// nothing.
     ///
     /// # Errors
     ///
-    /// Nothing changes on error.
+    /// Nothing changes on error. These are reports that cannot be true:
     ///
     /// - [`MarginError::UnknownOrder`]; [`MarginError::InvalidOrderState`]
-    ///   for an order that is filled or was rejected.
+    ///   for an order the gate rejected (it was never sent);
     /// - [`MarginError::ExecutionMismatch`] if the instrument or side differs
-    ///   from the order, the quantity exceeds what is left, the price is
-    ///   worse than the limit, or the cumulative quantity is inconsistent.
-    /// - Any ledger booking error. On [`MarginError::InsufficientBalance`]
-    ///   the gate also trips with [`HaltReason::AccountingBreach`].
-    pub fn on_fill(&mut self, id: &OrderId, report: &FillReport) -> Result<Booking> {
+    ///   from the order, or the cumulative quantity is not the filled
+    ///   quantity plus the fill;
+    /// - [`MarginError::ConflictingEntry`] for a reused execution id with
+    ///   different content, and the ledger's input errors (precision,
+    ///   positivity).
+    pub fn on_fill(&mut self, id: &OrderId, report: &FillReport) -> Result<FillOutcome> {
         let execution = &report.execution;
         if self.ledger.execution_cashflow(&execution.id).is_some() {
             // Duplicate (or conflicting) message: the ledger decides, and
             // neither the order nor its reservation changes.
-            return self.ledger.book_execution(execution);
+            return Ok(FillOutcome {
+                booking: self.ledger.book_execution(execution)?,
+                anomalies: Vec::new(),
+                shortfalls: BTreeMap::new(),
+            });
         }
         let order = self
             .orders
             .get(id)
             .cloned()
             .ok_or_else(|| MarginError::UnknownOrder { id: id.to_string() })?;
-        let late = order.state == OrderState::Canceled;
-        if !order.state.is_live() && !late {
+        if order.state == OrderState::Rejected {
             return Err(MarginError::InvalidOrderState {
                 id: id.to_string(),
                 state: order.state.name(),
@@ -965,16 +1004,6 @@ impl RiskGate {
         if execution.side != order.side {
             return Err(mismatch("side differs from the order"));
         }
-        if execution.quantity > order.remaining() {
-            return Err(mismatch("quantity exceeds the remaining quantity"));
-        }
-        let worse = match order.side {
-            Side::Buy => execution.price > order.price,
-            Side::Sell => execution.price < order.price,
-        };
-        if worse {
-            return Err(mismatch("price is worse than the limit"));
-        }
         let filled_after = add(order.filled, execution.quantity, "filled + fill")?;
         if report.cumulative_quantity != filled_after {
             return Err(mismatch(
@@ -982,36 +1011,61 @@ impl RiskGate {
             ));
         }
 
-        let remaining_after = sub(order.remaining(), execution.quantity, "remaining - fill")?;
-        let booked = if late {
-            self.ledger.book_execution(execution)
-        } else {
-            let terms = order
-                .terms
-                .as_ref()
-                .ok_or_else(|| mismatch("order has no reservation terms"))?;
-            let reserved_after = terms.amount(remaining_after)?;
-            self.ledger.book_execution_with_reservation(
-                execution,
-                &order.reservation_id()?,
-                reserved_after,
-            )
+        let remaining = order.remaining();
+        let mut anomalies = Vec::new();
+        if order.state == OrderState::Filled {
+            anomalies.push(ExecutionAnomaly::FillAfterFilled);
+        } else if execution.quantity > remaining {
+            anomalies.push(ExecutionAnomaly::Overfill {
+                remaining,
+                quantity: execution.quantity,
+            });
+        }
+        let worse = match order.side {
+            Side::Buy => execution.price > order.price,
+            Side::Sell => execution.price < order.price,
         };
-        let booking = match booked {
-            Ok(booking) => booking,
-            Err(error @ MarginError::InsufficientBalance { .. }) => {
-                self.halt.get_or_insert(HaltReason::AccountingBreach);
-                return Err(error);
-            }
-            Err(error) => return Err(error),
+        if worse {
+            anomalies.push(ExecutionAnomaly::WorsePrice {
+                limit: order.price,
+                price: execution.price,
+            });
+        }
+
+        // Only a live order still holds a reservation; shrink it to what the
+        // rest needs (nothing after an overfill).
+        let remaining_after =
+            sub(remaining, execution.quantity, "remaining - fill")?.max(Decimal::ZERO);
+        let reservation_id = order.reservation_id()?;
+        let reservation = match (&order.terms, order.state.is_live()) {
+            (Some(terms), true) => Some(terms.amount(remaining_after)?),
+            _ => None,
         };
+        let booked = self.ledger.book_execution_allowing_overdraft(
+            execution,
+            reservation.map(|amount| (&reservation_id, amount)),
+        )?;
+
+        if let Some(anomaly) = anomalies.first() {
+            self.halt.get_or_insert(HaltReason::ExecutionAnomaly {
+                order: id.clone(),
+                anomaly: anomaly.clone(),
+            });
+        }
+        if !booked.shortfalls.is_empty() {
+            self.halt.get_or_insert(HaltReason::AccountingBreach);
+        }
         if let Some(record) = self.orders.get_mut(id) {
             record.filled = filled_after;
-            if remaining_after.is_zero() {
+            if filled_after >= record.quantity {
                 record.state = OrderState::Filled;
             }
         }
-        Ok(booking)
+        Ok(FillOutcome {
+            booking: booked.booking,
+            anomalies,
+            shortfalls: booked.shortfalls,
+        })
     }
 
     // ----- circuit breaker ----------------------------------------------

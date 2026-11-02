@@ -894,3 +894,44 @@ fn booking_against_a_reservation_is_atomic() {
     assert_eq!(ledger.balance(&usdc).expect("balance").reserved, dec!(40));
     ledger.reconcile().expect("reconciles");
 }
+
+/// A real execution can be booked past the available balance: the
+/// shortfall is returned, kept in `overdrafts` and reported by `reconcile`,
+/// whose sums still agree. Ordinary booking still refuses it.
+#[test]
+fn real_execution_can_overdraw() {
+    let mut ledger = ledger();
+    let usdc = asset("USDC");
+    ledger
+        .deposit(tid("d1"), usdc.clone(), dec!(50))
+        .expect("deposit");
+    let e1 = exec("e1", Side::Buy, dec!(100), dec!(1));
+    assert!(matches!(
+        ledger.book_execution(&e1),
+        Err(MarginError::InsufficientBalance { .. })
+    ));
+    let booked = ledger
+        .book_execution_allowing_overdraft(&e1, None)
+        .expect("booked");
+    assert!(booked.booking.is_new());
+    assert_eq!(
+        booked.shortfalls,
+        BTreeMap::from([(usdc.clone(), dec!(50))])
+    );
+    assert_eq!(total(&ledger, "USDC"), dec!(-50));
+    assert_eq!(
+        ledger.overdrafts(),
+        BTreeMap::from([(usdc.clone(), dec!(50))])
+    );
+    let reconciliation = ledger.reconcile().expect("sums agree");
+    assert!(!reconciliation.is_clean());
+    // Repeating it is a duplicate with no new shortfall.
+    let again = ledger
+        .book_execution_allowing_overdraft(&e1, None)
+        .expect("duplicate");
+    assert!(!again.booking.is_new());
+    assert!(again.shortfalls.is_empty());
+    // A deposit clears the overdraft.
+    ledger.deposit(tid("d2"), usdc, dec!(50)).expect("deposit");
+    assert!(ledger.reconcile().expect("reconciles").is_clean());
+}

@@ -5,13 +5,14 @@
 
 use margin_rs::ledger::{Booking, Execution, Ledger, Side};
 use margin_rs::risk::{
-    FillReport, HaltReason, InstrumentLimits, OrderRequest, OrderState, RiskDecision, RiskGate,
-    RiskReason,
+    ExecutionAnomaly, FillReport, HaltReason, InstrumentLimits, OrderRequest, OrderState,
+    RiskDecision, RiskGate, RiskReason,
 };
 use margin_rs::{
     Asset, Decimal, ExecutionId, InstrumentId, MarginError, OrderId, SpotInstrument, TransferId,
 };
 use rust_decimal_macros::dec;
+use std::collections::BTreeMap;
 
 fn asset(code: &str) -> Asset {
     Asset::new(code).expect("valid asset")
@@ -173,7 +174,7 @@ fn requested_cancel_keeps_the_reservation_until_effective() {
             &report(fill("e1", Side::Buy, dec!(99), dec!(2)), dec!(2)),
         )
         .expect("fill");
-    assert!(booking.is_new());
+    assert!(booking.is_clean());
     assert_eq!(balance(&gate, "USDC"), (dec!(802), dec!(300), dec!(502)));
 
     assert_eq!(gate.on_cancel_confirmed(&oid("o1")), Ok(dec!(300)));
@@ -187,11 +188,11 @@ fn requested_cancel_keeps_the_reservation_until_effective() {
 
     let late = report(fill("e2", Side::Buy, dec!(99), dec!(1)), dec!(3));
     let booked = gate.on_fill(&oid("o1"), &late).expect("late fill");
-    assert!(booked.is_new());
+    assert!(booked.is_clean());
     assert_eq!(balance(&gate, "USDC"), (dec!(703), dec!(0), dec!(703)));
     assert_eq!(
-        gate.on_fill(&oid("o1"), &late),
-        Ok(Booking::Duplicate(booked.cashflow().clone()))
+        gate.on_fill(&oid("o1"), &late).map(|o| o.booking),
+        Ok(Booking::Duplicate(booked.booking.cashflow().clone()))
     );
     assert_eq!(gate.order(&oid("o1")).map(|o| o.filled), Some(dec!(3)));
     let mismatch = |reason| MarginError::ExecutionMismatch {
@@ -207,41 +208,44 @@ fn requested_cancel_keeps_the_reservation_until_effective() {
             "cumulative quantity is not the filled quantity plus the fill"
         ))
     );
-    assert_eq!(
-        gate.on_fill(
-            &oid("o1"),
-            &report(fill("e3", Side::Buy, dec!(99), dec!(3)), dec!(6))
-        ),
-        Err(mismatch("quantity exceeds the remaining quantity"))
-    );
     assert_eq!(balance(&gate, "USDC"), (dec!(703), dec!(0), dec!(703)));
     assert_eq!(gate.halted(), None);
     gate.ledger().reconcile().expect("reconciles");
 }
 
-/// A late fill the free balance cannot cover trips an accounting breach
-/// and changes nothing.
+/// A late fill the free balance cannot cover is still booked: the ledger
+/// shows the debt, and the gate trips an accounting breach.
+///
+/// 100 USDC, buy 1 at 100, cancel confirmed, 50 withdrawn. The late fill of
+/// 1 at 100 leaves the balance at -50 (shortfall 50).
 #[test]
-fn uncovered_late_fill_trips_an_accounting_breach() {
+fn uncovered_late_fill_is_booked_as_a_debt() {
     let mut gate = gate(dec!(100), dec!(0), InstrumentLimits::default());
     gate.submit(&buy("o1", dec!(100), dec!(1)), 0);
     gate.on_cancel_confirmed(&oid("o1")).expect("cancel");
     gate.withdraw(TransferId::new("w1").expect("id"), asset("USDC"), dec!(50))
         .expect("withdraw");
-    let before = gate.ledger().snapshot();
-    assert_eq!(
-        gate.on_fill(
+    let outcome = gate
+        .on_fill(
             &oid("o1"),
-            &report(fill("e1", Side::Buy, dec!(100), dec!(1)), dec!(1))
-        ),
-        Err(MarginError::InsufficientBalance {
-            asset: asset("USDC"),
-            required: dec!(100),
-            available: dec!(50),
-        })
+            &report(fill("e1", Side::Buy, dec!(100), dec!(1)), dec!(1)),
+        )
+        .expect("a real fill is never lost");
+    assert!(outcome.booking.is_new());
+    assert_eq!(
+        outcome.shortfalls,
+        BTreeMap::from([(asset("USDC"), dec!(50))])
     );
+    assert_eq!(balance(&gate, "USDC"), (dec!(-50), dec!(0), dec!(-50)));
+    assert_eq!(balance(&gate, "BTC"), (dec!(1), dec!(0), dec!(1)));
     assert_eq!(gate.halted(), Some(HaltReason::AccountingBreach));
-    assert_eq!(gate.ledger().snapshot(), before);
+    let reconciliation = gate.ledger().reconcile().expect("sums agree");
+    assert_eq!(
+        reconciliation.overdrafts,
+        BTreeMap::from([(asset("USDC"), dec!(50))])
+    );
+    // Nothing more can be spent while overdrawn.
+    assert!(gate.submit(&buy("o2", dec!(1), dec!(1)), 0).is_rejected());
 }
 
 /// Acceptance 2b: a partial fill adjusts the reservation exactly once.
@@ -275,8 +279,8 @@ fn partial_fill_adjusts_the_reservation_exactly_once() {
     );
     for _ in 0..3 {
         assert_eq!(
-            gate.on_fill(&oid("o1"), &e1),
-            Ok(Booking::Duplicate(first.cashflow().clone()))
+            gate.on_fill(&oid("o1"), &e1).map(|o| o.booking),
+            Ok(Booking::Duplicate(first.booking.cashflow().clone()))
         );
     }
     assert_eq!(
@@ -793,11 +797,14 @@ fn venue_reject_and_open_order_limit() {
     gate.ledger().reconcile().expect("reconciles");
 }
 
-/// A fill must match its order; a mismatch changes nothing.
+/// Reports that cannot be true are rejected and change nothing: another
+/// instrument or side, a broken cumulative sequence, an unknown order, or
+/// an order the gate rejected.
 #[test]
-fn fills_must_match_their_order() {
+fn impossible_reports_are_rejected() {
     let mut gate = gate(dec!(1000), dec!(0), InstrumentLimits::default());
     gate.submit(&buy("o1", dec!(100), dec!(2)), 0);
+    gate.submit(&buy("big", dec!(100), dec!(100)), 0);
     let before = gate.ledger().snapshot();
     let mismatch = |reason| MarginError::ExecutionMismatch {
         id: "o1".into(),
@@ -806,23 +813,20 @@ fn fills_must_match_their_order() {
     assert_eq!(
         gate.on_fill(
             &oid("o1"),
-            &report(fill("e1", Side::Buy, dec!(100.01), dec!(1)), dec!(1))
-        ),
-        Err(mismatch("price is worse than the limit"))
-    );
-    assert_eq!(
-        gate.on_fill(
-            &oid("o1"),
-            &report(fill("e1", Side::Buy, dec!(100), dec!(3)), dec!(3))
-        ),
-        Err(mismatch("quantity exceeds the remaining quantity"))
-    );
-    assert_eq!(
-        gate.on_fill(
-            &oid("o1"),
             &report(fill("e1", Side::Sell, dec!(100), dec!(1)), dec!(1))
         ),
         Err(mismatch("side differs from the order"))
+    );
+    let other = Execution::new(
+        ExecutionId::new("e1").expect("id"),
+        InstrumentId::new("ETH-USDC").expect("id"),
+        Side::Buy,
+        dec!(100),
+        dec!(1),
+    );
+    assert_eq!(
+        gate.on_fill(&oid("o1"), &report(other, dec!(1))),
+        Err(mismatch("instrument differs from the order"))
     );
     assert_eq!(
         gate.on_fill(
@@ -840,32 +844,152 @@ fn fills_must_match_their_order() {
         ),
         Err(MarginError::UnknownOrder { id: "nope".into() })
     );
-    assert_eq!(gate.ledger().snapshot(), before);
-    assert_eq!(gate.order(&oid("o1")).map(|o| o.filled), Some(dec!(0)));
-}
-
-/// A fill the reservations do not cover cannot be booked: the gate trips
-/// itself and nothing changes.
-///
-/// 100 USDC, buy 1 at 100 with no fee reserve: 100 reserved, 0 available.
-/// The venue charges a 1 USDC fee: the fill needs 101.
-#[test]
-fn uncovered_fill_trips_an_accounting_breach() {
-    let mut gate = gate(dec!(100), dec!(0), InstrumentLimits::default());
-    gate.submit(&buy("o1", dec!(100), dec!(1)), 0);
-    let before = gate.ledger().snapshot();
-    let e1 = fill("e1", Side::Buy, dec!(100), dec!(1)).with_fee(asset("USDC"), dec!(1));
     assert_eq!(
-        gate.on_fill(&oid("o1"), &report(e1, dec!(1))),
-        Err(MarginError::InsufficientBalance {
-            asset: asset("USDC"),
-            required: dec!(101),
-            available: dec!(100),
+        gate.on_fill(
+            &oid("big"),
+            &report(fill("e1", Side::Buy, dec!(100), dec!(1)), dec!(1))
+        ),
+        Err(MarginError::InvalidOrderState {
+            id: "big".into(),
+            state: "rejected",
+            operation: "fill",
         })
     );
-    assert_eq!(gate.halted(), Some(HaltReason::AccountingBreach));
     assert_eq!(gate.ledger().snapshot(), before);
     assert_eq!(gate.order(&oid("o1")).map(|o| o.filled), Some(dec!(0)));
+    assert_eq!(gate.halted(), None);
+}
+
+/// An overfill is booked, only the reserved part is released, and the gate
+/// halts with an execution anomaly.
+///
+/// 1000 USDC, buy 2 at 100 (reserved 200). The venue reports a fill of 3:
+/// cash 1000 - 300 = 700, reservation gone, 3 BTC held.
+#[test]
+fn overfill_is_booked_and_halts() {
+    let mut gate = gate(dec!(1000), dec!(0), InstrumentLimits::default());
+    gate.submit(&buy("o1", dec!(100), dec!(2)), 0);
+    let outcome = gate
+        .on_fill(
+            &oid("o1"),
+            &report(fill("e1", Side::Buy, dec!(100), dec!(3)), dec!(3)),
+        )
+        .expect("booked");
+    assert_eq!(
+        outcome.anomalies,
+        vec![ExecutionAnomaly::Overfill {
+            remaining: dec!(2),
+            quantity: dec!(3),
+        }]
+    );
+    assert!(outcome.shortfalls.is_empty());
+    assert_eq!(balance(&gate, "USDC"), (dec!(700), dec!(0), dec!(700)));
+    assert_eq!(balance(&gate, "BTC"), (dec!(3), dec!(0), dec!(3)));
+    assert_eq!(
+        gate.halted(),
+        Some(HaltReason::ExecutionAnomaly {
+            order: oid("o1"),
+            anomaly: ExecutionAnomaly::Overfill {
+                remaining: dec!(2),
+                quantity: dec!(3),
+            },
+        })
+    );
+    assert_eq!(
+        gate.order(&oid("o1")).map(|o| (o.filled, o.state)),
+        Some((dec!(3), OrderState::Filled))
+    );
+    assert!(gate.ledger().reconcile().expect("reconciles").is_clean());
+}
+
+/// A fill on an order that is already filled is booked against the free
+/// balance and halts; so is a fill at a price worse than the limit.
+#[test]
+fn fill_after_filled_and_worse_price_are_booked_and_halt() {
+    let mut gate = gate(dec!(1000), dec!(0), InstrumentLimits::default());
+    gate.submit(&buy("o1", dec!(100), dec!(1)), 0);
+    gate.on_fill(
+        &oid("o1"),
+        &report(fill("e1", Side::Buy, dec!(100), dec!(1)), dec!(1)),
+    )
+    .expect("fill");
+    let after = gate
+        .on_fill(
+            &oid("o1"),
+            &report(fill("e2", Side::Buy, dec!(100), dec!(1)), dec!(2)),
+        )
+        .expect("booked");
+    assert_eq!(after.anomalies, vec![ExecutionAnomaly::FillAfterFilled]);
+    assert_eq!(balance(&gate, "USDC"), (dec!(800), dec!(0), dec!(800)));
+    assert!(matches!(
+        gate.halted(),
+        Some(HaltReason::ExecutionAnomaly {
+            anomaly: ExecutionAnomaly::FillAfterFilled,
+            ..
+        })
+    ));
+
+    let mut gate = gate_fixture_worse_price();
+    let worse = gate
+        .on_fill(
+            &oid("o1"),
+            &report(fill("e1", Side::Buy, dec!(100.01), dec!(1)), dec!(1)),
+        )
+        .expect("booked");
+    assert_eq!(
+        worse.anomalies,
+        vec![ExecutionAnomaly::WorsePrice {
+            limit: dec!(100),
+            price: dec!(100.01),
+        }]
+    );
+    // Reserved 200 for 2 at 100; after the fill 100 stays reserved for the
+    // last unit, and the 100.01 debit leaves 1000 - 100.01 = 899.99.
+    assert_eq!(
+        balance(&gate, "USDC"),
+        (dec!(899.99), dec!(100), dec!(799.99))
+    );
+    assert!(matches!(
+        gate.halted(),
+        Some(HaltReason::ExecutionAnomaly {
+            anomaly: ExecutionAnomaly::WorsePrice { .. },
+            ..
+        })
+    ));
+    gate.ledger().reconcile().expect("reconciles");
+}
+
+fn gate_fixture_worse_price() -> RiskGate {
+    let mut gate = gate(dec!(1000), dec!(0), InstrumentLimits::default());
+    gate.submit(&buy("o1", dec!(100), dec!(2)), 0);
+    gate
+}
+
+/// A live fill the reservation and the free balance do not cover is booked
+/// as a debt and trips an accounting breach.
+///
+/// 100 USDC, buy 1 at 100 with no fee reserve: 100 reserved, 0 free. The
+/// venue charges a 1 USDC fee: the balance ends at -1.
+#[test]
+fn uncovered_fill_is_booked_as_a_debt() {
+    let mut gate = gate(dec!(100), dec!(0), InstrumentLimits::default());
+    gate.submit(&buy("o1", dec!(100), dec!(1)), 0);
+    let e1 = fill("e1", Side::Buy, dec!(100), dec!(1)).with_fee(asset("USDC"), dec!(1));
+    let outcome = gate
+        .on_fill(&oid("o1"), &report(e1.clone(), dec!(1)))
+        .expect("booked");
+    assert_eq!(
+        outcome.shortfalls,
+        BTreeMap::from([(asset("USDC"), dec!(1))])
+    );
+    assert_eq!(balance(&gate, "USDC"), (dec!(-1), dec!(0), dec!(-1)));
+    assert_eq!(gate.halted(), Some(HaltReason::AccountingBreach));
+    assert_eq!(gate.order(&oid("o1")).map(|o| o.filled), Some(dec!(1)));
+    // The duplicate changes nothing and reports no new shortfall.
+    let again = gate.on_fill(&oid("o1"), &report(e1, dec!(1))).expect("dup");
+    assert!(!again.booking.is_new());
+    assert!(again.shortfalls.is_empty());
+    assert_eq!(balance(&gate, "USDC"), (dec!(-1), dec!(0), dec!(-1)));
 }
 
 /// Property: with no free balance, no fragmentation of a buy at the limit
@@ -918,8 +1042,13 @@ fn no_fragmentation_exceeds_the_reservation() {
                     .round_dp_with_strategy(6, rust_decimal::RoundingStrategy::AwayFromZero);
                 execution = execution.with_fee(asset("USDC"), fee);
             }
-            gate.on_fill(&oid("o"), &report(execution, Decimal::new(done, 8)))
+            let outcome = gate
+                .on_fill(&oid("o"), &report(execution, Decimal::new(done, 8)))
                 .unwrap_or_else(|e| panic!("case {case}: price {price}, {lots} lots: {e}"));
+            assert!(
+                outcome.is_clean(),
+                "case {case}: price {price}, {lots} lots: {outcome:?}"
+            );
         }
         assert_eq!(gate.halted(), None);
         assert_eq!(balance(&gate, "USDC").1, dec!(0));

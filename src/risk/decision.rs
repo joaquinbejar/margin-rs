@@ -95,8 +95,31 @@ impl FillReport {
     }
 }
 
+/// Something wrong with a real execution. The execution is booked anyway
+/// (it happened); the anomaly halts trading.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExecutionAnomaly {
+    /// The fill is larger than the order's open quantity.
+    Overfill {
+        /// Open quantity before the fill.
+        remaining: Decimal,
+        /// Quantity filled.
+        quantity: Decimal,
+    },
+    /// The order was already completely filled.
+    FillAfterFilled,
+    /// The fill price is worse than the order's limit.
+    WorsePrice {
+        /// Limit price of the order.
+        limit: Decimal,
+        /// Execution price.
+        price: Decimal,
+    },
+}
+
 /// Why trading is halted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum HaltReason {
     /// Halted by an operator.
@@ -106,9 +129,17 @@ pub enum HaltReason {
     CircuitBreaker,
     /// Market data was lost.
     DataDisconnect,
-    /// A fill could not be booked: the account would be overdrawn. Set by
-    /// the gate itself.
+    /// A real fill overdrew the account: it was booked and the balance is
+    /// short. Set by the gate itself.
     AccountingBreach,
+    /// A real fill did not match its order (overfill, fill after filled,
+    /// price worse than the limit). Set by the gate itself.
+    ExecutionAnomaly {
+        /// Order the fill was reported for.
+        order: OrderId,
+        /// What was wrong; the first anomaly found.
+        anomaly: ExecutionAnomaly,
+    },
 }
 
 /// One reason behind a reduction or a rejection.
