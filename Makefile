@@ -32,7 +32,7 @@ doc:
 
 .PHONY: msrv
 msrv:
-	cargo +$(MSRV) check --all-targets --all-features
+	cargo +$(MSRV) check --locked --all-targets --all-features
 
 # Check-only gate: it never rewrites files. Run `make fmt` to format.
 .PHONY: pre-push
