@@ -19,7 +19,7 @@
 //! is no path that books or reserves around the gate:
 //!
 //! ```compile_fail,E0596
-//! # use margin_rs::ledger::{Execution, Ledger, Side};
+//! # use margin_rs::ledger::{Execution, Ledger, Action};
 //! # use margin_rs::risk::RiskGate;
 //! # use margin_rs::{ExecutionId, InstrumentId, Decimal};
 //! # fn bypass(gate: &mut RiskGate, execution: &Execution) {
@@ -31,7 +31,7 @@
 //! # Example
 //!
 //! ```
-//! use margin_rs::ledger::{Execution, Ledger, Side};
+//! use margin_rs::ledger::{Execution, Ledger, Action};
 //! use margin_rs::risk::{FillReport, InstrumentLimits, OrderRequest, RiskDecision, RiskGate};
 //! use margin_rs::{Asset, Decimal, ExecutionId, InstrumentId, OrderId, SpotInstrument, TransferId};
 //!
@@ -47,13 +47,13 @@
 //! gate.deposit(TransferId::new("d1")?, usdc.clone(), Decimal::from(1000))?;
 //! gate.set_limits(&pair, InstrumentLimits { max_position: Some(Decimal::from(5)), ..Default::default() })?;
 //!
-//! let order = OrderRequest::new(OrderId::new("q1")?, pair.clone(), Side::Buy, Decimal::from(100), Decimal::from(8))
+//! let order = OrderRequest::new(OrderId::new("q1")?, pair.clone(), Action::Buy, Decimal::from(100), Decimal::from(8))
 //!     .reducible();
 //! let decision = gate.submit(&order, 0);
 //! assert_eq!(decision.approved_quantity(), Some(Decimal::from(5)));
 //! assert_eq!(gate.ledger().balance(&usdc).map(|b| b.reserved), Some(Decimal::from(500)));
 //!
-//! let fill = Execution::new(ExecutionId::new("e1")?, pair, Side::Buy, Decimal::from(100), Decimal::from(5));
+//! let fill = Execution::new(ExecutionId::new("e1")?, pair, Action::Buy, Decimal::from(100), Decimal::from(5));
 //! gate.on_fill(&order.id, &FillReport::new(fill, Decimal::from(5)))?;
 //! assert_eq!(gate.ledger().balance(&usdc).map(|b| (b.total, b.reserved)), Some((Decimal::from(500), Decimal::ZERO)));
 //! # Ok(())
@@ -99,10 +99,11 @@ pub use decision::{
 };
 
 use crate::decimal::{Rounding, add, check_scale, mul, mul_div_round, neg, sub, sum, sum_products};
+use crate::direction::Dir;
 use crate::error::{MarginError, Result};
 use crate::ids::{Asset, InstrumentId, OrderId, ReservationId, TransferId};
 use crate::instrument::{Instrument, SpotInstrument};
-use crate::ledger::{Booking, Ledger, Side};
+use crate::ledger::{Action, Booking, Ledger};
 
 /// Hard limits for one instrument. `None` disables a limit.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -280,7 +281,7 @@ pub struct OrderRecord {
     /// Instrument.
     pub instrument: InstrumentId,
     /// Direction.
-    pub side: Side,
+    pub side: Action,
     /// Limit price.
     pub price: Decimal,
     /// Approved quantity (zero for an order rejected by the gate).
@@ -462,13 +463,13 @@ impl RiskGate {
         if mark <= Decimal::ZERO {
             return Err(MarginError::invalid_input("mark", "must be positive"));
         }
-        if let Some((_, last)) = self.marks.get(instrument) {
-            if timestamp_ms < *last {
-                return Err(MarginError::invalid_input(
-                    "timestamp_ms",
-                    "must not go backwards",
-                ));
-            }
+        if let Some((_, last)) = self.marks.get(instrument)
+            && timestamp_ms < *last
+        {
+            return Err(MarginError::invalid_input(
+                "timestamp_ms",
+                "must not go backwards",
+            ));
         }
         self.marks.insert(instrument.clone(), (mark, timestamp_ms));
         Ok(())
@@ -520,6 +521,10 @@ impl RiskGate {
     /// The decision is recorded under the order id, including rejections,
     /// so a repeated id is always rejected with
     /// [`RiskReason::DuplicateOrderId`] and never reserves twice.
+    ///
+    /// A side that is not `Buy` or `Sell` (for example `Action::Other`) is
+    /// an invalid order: [`RiskReason::InvalidOrder`] with
+    /// [`MarginError::UnsupportedAction`], and nothing is reserved.
     pub fn submit(&mut self, request: &OrderRequest, now_ms: u64) -> RiskDecision {
         if self.orders.contains_key(&request.id) {
             return RiskDecision::Rejected {
@@ -691,11 +696,11 @@ impl RiskGate {
         let mut allowed = request.quantity;
         let mut caps = Vec::new();
 
-        if let Some(limit) = limits.max_order_quantity {
-            if allowed > limit {
-                allowed = floor(limit)?;
-                caps.push(RiskReason::MaxOrderQuantity { limit });
-            }
+        if let Some(limit) = limits.max_order_quantity
+            && allowed > limit
+        {
+            allowed = floor(limit)?;
+            caps.push(RiskReason::MaxOrderQuantity { limit });
         }
 
         let position = self
@@ -708,12 +713,12 @@ impl RiskGate {
         // on its side reaches `bound` in absolute value.
         let headroom = |bound: Decimal| -> Result<Decimal> {
             // bound - worst case, in one exact step.
-            let room = match request.side {
-                Side::Buy => sum(
+            let room = match Dir::from_action(request.side, "request side")? {
+                Dir::Buy => sum(
                     &[bound, neg(position), neg(open_buys)],
                     "limit - worst case",
                 )?,
-                Side::Sell => sum(&[bound, neg(open_sells), position], "limit - worst case")?,
+                Dir::Sell => sum(&[bound, neg(open_sells), position], "limit - worst case")?,
             };
             floor(room)
         };
@@ -769,7 +774,7 @@ impl RiskGate {
         &self,
         spot: &SpotInstrument,
         limits: &InstrumentLimits,
-        side: Side,
+        side: Action,
         price: Decimal,
     ) -> Result<ReservationTerms> {
         let lot = Decimal::new(1, spot.quantity_scale());
@@ -780,14 +785,14 @@ impl RiskGate {
                     asset: asset.clone(),
                 })
         };
-        match side {
-            Side::Sell => Ok(ReservationTerms {
+        match Dir::from_action(side, "side")? {
+            Dir::Sell => Ok(ReservationTerms {
                 asset: spot.base().clone(),
                 scale: scale_of(spot.base())?,
                 lot,
                 per_lot: lot,
             }),
-            Side::Buy => {
+            Dir::Buy => {
                 let scale = scale_of(spot.quote())?;
                 let ulp = Decimal::new(1, scale);
                 let rate = limits.max_fee_rate;
@@ -869,9 +874,9 @@ impl RiskGate {
         let mut buys = Vec::new();
         let mut sells = Vec::new();
         for order in self.live_orders().filter(|o| &o.instrument == instrument) {
-            match order.side {
-                Side::Buy => buys.push(order.remaining()?),
-                Side::Sell => sells.push(order.remaining()?),
+            match Dir::from_action(order.side, "order side")? {
+                Dir::Buy => buys.push(order.remaining()?),
+                Dir::Sell => sells.push(order.remaining()?),
             }
         }
         Ok((sum(&buys, "open buys")?, sum(&sells, "open sells")?))
@@ -1046,6 +1051,8 @@ impl RiskGate {
     ///
     /// Nothing changes on error. These are reports that cannot be true:
     ///
+    /// - [`MarginError::UnsupportedAction`] for an execution side that is not
+    ///   `Buy` or `Sell`, refused first, before the duplicate check;
     /// - [`MarginError::UnknownOrder`]; [`MarginError::InvalidOrderState`]
     ///   for an order the gate rejected (it was never sent);
     /// - [`MarginError::ExecutionMismatch`] if the instrument or side differs
@@ -1056,6 +1063,9 @@ impl RiskGate {
     ///   positivity).
     pub fn on_fill(&mut self, id: &OrderId, report: &FillReport) -> Result<FillOutcome> {
         let execution = &report.execution;
+        // An action the crate cannot trade is refused before anything else:
+        // before the duplicate check, the order lookup and any halt.
+        Dir::from_action(execution.side, "execution side")?;
         if self.ledger.execution_cashflow(&execution.id).is_some() {
             // Duplicate (or conflicting) message: the ledger decides, and
             // neither the order nor its reservation changes.
@@ -1105,9 +1115,9 @@ impl RiskGate {
                 quantity: execution.quantity,
             });
         }
-        let worse = match order.side {
-            Side::Buy => execution.price > order.price,
-            Side::Sell => execution.price < order.price,
+        let worse = match Dir::from_action(order.side, "order side")? {
+            Dir::Buy => execution.price > order.price,
+            Dir::Sell => execution.price < order.price,
         };
         if worse {
             anomalies.push(ExecutionAnomaly::WorsePrice {
@@ -1200,6 +1210,7 @@ impl RiskGate {
 }
 
 fn validate_order(request: &OrderRequest, spot: &SpotInstrument) -> Result<()> {
+    Dir::from_action(request.side, "order side")?;
     if request.price <= Decimal::ZERO {
         return Err(MarginError::invalid_input("price", "must be positive"));
     }

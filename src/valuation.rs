@@ -336,13 +336,13 @@ pub(crate) fn validate(
             });
         }
     }
-    if let InvalidMarkPolicy::HaircutStale { haircut } = policy.invalid_marks {
-        if haircut < Decimal::ZERO || haircut > Decimal::ONE {
-            return Err(MarginError::invalid_input(
-                "haircut",
-                "must be between 0 and 1",
-            ));
-        }
+    if let InvalidMarkPolicy::HaircutStale { haircut } = policy.invalid_marks
+        && (haircut < Decimal::ZERO || haircut > Decimal::ONE)
+    {
+        return Err(MarginError::invalid_input(
+            "haircut",
+            "must be between 0 and 1",
+        ));
     }
     Ok(scale)
 }

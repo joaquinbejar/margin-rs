@@ -8,7 +8,7 @@
 )]
 
 use margin_rs::collateral::{BalanceBasis, CollateralPolicy, StalePolicy, value_collateral};
-use margin_rs::ledger::{Execution, Ledger, Side};
+use margin_rs::ledger::{Action, Execution, Ledger};
 use margin_rs::valuation::{Mark, MarkSet, MarkStatus, PriceSource};
 use margin_rs::{
     Asset, Decimal, ExecutionId, InstrumentId, MarginError, ReservationId, SpotInstrument,
@@ -228,7 +228,7 @@ fn debts_count_in_full() {
     let sale = Execution::new(
         ExecutionId::new("e1").expect("id"),
         InstrumentId::new("BTC-USDC").expect("id"),
-        Side::Sell,
+        Action::Sell,
         dec!(60000),
         dec!(1),
     );

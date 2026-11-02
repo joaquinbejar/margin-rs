@@ -2,7 +2,7 @@
 name = "margin-rs"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "Risk and margin engine: accounting, pretrade risk and margin for market making"
 license = "MIT"
@@ -28,6 +28,7 @@ name = "margin_rs"
 path = "src/lib.rs"
 
 [dependencies]
+financial_types = "0.3"
 thiserror = "2.0"
 rust_decimal = { version = "1.43", default-features = false, features = ["std"] }
 

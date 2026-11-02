@@ -10,7 +10,7 @@
     clippy::indexing_slicing
 )]
 
-use margin_rs::ledger::{Booking, Execution, Ledger, Side};
+use margin_rs::ledger::{Action, Booking, Execution, Ledger};
 use margin_rs::risk::{
     ExecutionAnomaly, FillReport, HaltReason, InstrumentLimits, OrderRequest, OrderState,
     RiskDecision, RiskGate, RiskReason,
@@ -69,14 +69,14 @@ fn gate_with_lot_scale(
 }
 
 fn buy(id: &str, price: Decimal, quantity: Decimal) -> OrderRequest {
-    OrderRequest::new(oid(id), pair(), Side::Buy, price, quantity)
+    OrderRequest::new(oid(id), pair(), Action::Buy, price, quantity)
 }
 
 fn sell(id: &str, price: Decimal, quantity: Decimal) -> OrderRequest {
-    OrderRequest::new(oid(id), pair(), Side::Sell, price, quantity)
+    OrderRequest::new(oid(id), pair(), Action::Sell, price, quantity)
 }
 
-fn fill(id: &str, side: Side, price: Decimal, quantity: Decimal) -> Execution {
+fn fill(id: &str, side: Action, price: Decimal, quantity: Decimal) -> Execution {
     Execution::new(
         ExecutionId::new(id).expect("id"),
         pair(),
@@ -179,7 +179,7 @@ fn requested_cancel_keeps_the_reservation_until_effective() {
     let booking = gate
         .on_fill(
             &oid("o1"),
-            &report(fill("e1", Side::Buy, dec!(99), dec!(2)), dec!(2)),
+            &report(fill("e1", Action::Buy, dec!(99), dec!(2)), dec!(2)),
         )
         .expect("fill");
     assert!(booking.is_clean());
@@ -194,7 +194,7 @@ fn requested_cancel_keeps_the_reservation_until_effective() {
     // A repeated confirmation changes nothing.
     assert_eq!(gate.on_cancel_confirmed(&oid("o1")), Ok(dec!(0)));
 
-    let late = report(fill("e2", Side::Buy, dec!(99), dec!(1)), dec!(3));
+    let late = report(fill("e2", Action::Buy, dec!(99), dec!(1)), dec!(3));
     let booked = gate.on_fill(&oid("o1"), &late).expect("late fill");
     assert!(booked.is_clean());
     assert_eq!(balance(&gate, "USDC"), (dec!(703), dec!(0), dec!(703)));
@@ -210,7 +210,7 @@ fn requested_cancel_keeps_the_reservation_until_effective() {
     assert_eq!(
         gate.on_fill(
             &oid("o1"),
-            &report(fill("e3", Side::Buy, dec!(99), dec!(1)), dec!(5))
+            &report(fill("e3", Action::Buy, dec!(99), dec!(1)), dec!(5))
         ),
         Err(mismatch(
             "cumulative quantity is not the filled quantity plus the fill"
@@ -236,7 +236,7 @@ fn uncovered_late_fill_is_booked_as_a_debt() {
     let outcome = gate
         .on_fill(
             &oid("o1"),
-            &report(fill("e1", Side::Buy, dec!(100), dec!(1)), dec!(1)),
+            &report(fill("e1", Action::Buy, dec!(100), dec!(1)), dec!(1)),
         )
         .expect("a real fill is never lost");
     assert!(outcome.booking.is_new());
@@ -277,7 +277,7 @@ fn partial_fill_adjusts_the_reservation_exactly_once() {
     );
 
     let e1 = report(
-        fill("e1", Side::Buy, dec!(100), dec!(1)).with_fee(asset("USDC"), dec!(0.1)),
+        fill("e1", Action::Buy, dec!(100), dec!(1)).with_fee(asset("USDC"), dec!(0.1)),
         dec!(1),
     );
     let first = gate.on_fill(&oid("o1"), &e1).expect("fill");
@@ -297,7 +297,7 @@ fn partial_fill_adjusts_the_reservation_exactly_once() {
     );
     assert_eq!(gate.order(&oid("o1")).map(|o| o.filled), Some(dec!(1)));
     let conflicting = report(
-        fill("e1", Side::Buy, dec!(100), dec!(2)).with_fee(asset("USDC"), dec!(0.1)),
+        fill("e1", Action::Buy, dec!(100), dec!(2)).with_fee(asset("USDC"), dec!(0.1)),
         dec!(2),
     );
     assert_eq!(
@@ -309,7 +309,7 @@ fn partial_fill_adjusts_the_reservation_exactly_once() {
     );
 
     let e2 = report(
-        fill("e2", Side::Buy, dec!(100), dec!(3)).with_fee(asset("USDC"), dec!(0.3)),
+        fill("e2", Action::Buy, dec!(100), dec!(3)).with_fee(asset("USDC"), dec!(0.3)),
         dec!(4),
     );
     gate.on_fill(&oid("o1"), &e2).expect("fill");
@@ -352,7 +352,12 @@ fn reservation_covers_single_lot_fills() {
         gate.on_fill(
             &oid("o1"),
             &report(
-                fill(&format!("e{i}"), Side::Buy, dec!(150.01), dec!(0.00000001)),
+                fill(
+                    &format!("e{i}"),
+                    Action::Buy,
+                    dec!(150.01),
+                    dec!(0.00000001),
+                ),
                 Decimal::new(i, 8),
             ),
         )
@@ -399,7 +404,7 @@ fn reservation_covers_mixed_fills_without_free_balance() {
         gate.on_fill(
             &oid("o1"),
             &report(
-                fill(&format!("e{i}"), Side::Buy, dec!(150.01), quantity),
+                fill(&format!("e{i}"), Action::Buy, dec!(150.01), quantity),
                 cumulative,
             ),
         )
@@ -450,7 +455,7 @@ fn reservation_terms_are_fixed_at_admission() {
 
     let with_fee = |id: &str, cumulative| {
         report(
-            fill(id, Side::Buy, dec!(100), dec!(0.5)).with_fee(asset("USDC"), dec!(5)),
+            fill(id, Action::Buy, dec!(100), dec!(0.5)).with_fee(asset("USDC"), dec!(5)),
             cumulative,
         )
     };
@@ -485,7 +490,7 @@ fn reservation_terms_are_fixed_at_admission() {
     assert_eq!(balance(&gate, "USDC"), (dec!(1000), dec!(210), dec!(790)));
     gate.on_fill(
         &oid("old"),
-        &report(fill("e1", Side::Buy, dec!(100), dec!(1)), dec!(1)),
+        &report(fill("e1", Action::Buy, dec!(100), dec!(1)), dec!(1)),
     )
     .expect("fill");
     assert_eq!(balance(&gate, "USDC"), (dec!(900), dec!(110), dec!(790)));
@@ -557,7 +562,7 @@ fn limits_apply_to_joint_exposure() {
     );
     gate.on_fill(
         &oid("b1"),
-        &report(fill("f1", Side::Buy, dec!(100), dec!(6)), dec!(6)),
+        &report(fill("f1", Action::Buy, dec!(100), dec!(6)), dec!(6)),
     )
     .expect("fill");
     assert_eq!(
@@ -743,7 +748,7 @@ fn data_disconnect_trips_and_withdraws_quotes() {
 
     gate.on_fill(
         &oid("o1"),
-        &report(fill("e1", Side::Buy, dec!(100), dec!(1)), dec!(1)),
+        &report(fill("e1", Action::Buy, dec!(100), dec!(1)), dec!(1)),
     )
     .expect("fill races the cancel");
     assert_eq!(gate.on_cancel_confirmed(&oid("o3")), Ok(dec!(155)));
@@ -783,7 +788,7 @@ fn venue_reject_and_open_order_limit() {
     gate.on_venue_accepted(&oid("o2")).expect("ack");
     gate.on_fill(
         &oid("o2"),
-        &report(fill("e1", Side::Buy, dec!(100), dec!(1)), dec!(1)),
+        &report(fill("e1", Action::Buy, dec!(100), dec!(1)), dec!(1)),
     )
     .expect("fill");
     assert_eq!(
@@ -821,14 +826,14 @@ fn impossible_reports_are_rejected() {
     assert_eq!(
         gate.on_fill(
             &oid("o1"),
-            &report(fill("e1", Side::Sell, dec!(100), dec!(1)), dec!(1))
+            &report(fill("e1", Action::Sell, dec!(100), dec!(1)), dec!(1))
         ),
         Err(mismatch("side differs from the order"))
     );
     let other = Execution::new(
         ExecutionId::new("e1").expect("id"),
         InstrumentId::new("ETH-USDC").expect("id"),
-        Side::Buy,
+        Action::Buy,
         dec!(100),
         dec!(1),
     );
@@ -839,7 +844,7 @@ fn impossible_reports_are_rejected() {
     assert_eq!(
         gate.on_fill(
             &oid("o1"),
-            &report(fill("e1", Side::Buy, dec!(100), dec!(1)), dec!(2))
+            &report(fill("e1", Action::Buy, dec!(100), dec!(1)), dec!(2))
         ),
         Err(mismatch(
             "cumulative quantity is not the filled quantity plus the fill"
@@ -848,14 +853,14 @@ fn impossible_reports_are_rejected() {
     assert_eq!(
         gate.on_fill(
             &oid("nope"),
-            &report(fill("e1", Side::Buy, dec!(100), dec!(1)), dec!(1))
+            &report(fill("e1", Action::Buy, dec!(100), dec!(1)), dec!(1))
         ),
         Err(MarginError::UnknownOrder { id: "nope".into() })
     );
     assert_eq!(
         gate.on_fill(
             &oid("big"),
-            &report(fill("e1", Side::Buy, dec!(100), dec!(1)), dec!(1))
+            &report(fill("e1", Action::Buy, dec!(100), dec!(1)), dec!(1))
         ),
         Err(MarginError::InvalidOrderState {
             id: "big".into(),
@@ -880,7 +885,7 @@ fn overfill_is_booked_and_halts() {
     let outcome = gate
         .on_fill(
             &oid("o1"),
-            &report(fill("e1", Side::Buy, dec!(100), dec!(3)), dec!(3)),
+            &report(fill("e1", Action::Buy, dec!(100), dec!(3)), dec!(3)),
         )
         .expect("booked");
     assert_eq!(
@@ -918,13 +923,13 @@ fn fill_after_filled_and_worse_price_are_booked_and_halt() {
     gate.submit(&buy("o1", dec!(100), dec!(1)), 0);
     gate.on_fill(
         &oid("o1"),
-        &report(fill("e1", Side::Buy, dec!(100), dec!(1)), dec!(1)),
+        &report(fill("e1", Action::Buy, dec!(100), dec!(1)), dec!(1)),
     )
     .expect("fill");
     let after = gate
         .on_fill(
             &oid("o1"),
-            &report(fill("e2", Side::Buy, dec!(100), dec!(1)), dec!(2)),
+            &report(fill("e2", Action::Buy, dec!(100), dec!(1)), dec!(2)),
         )
         .expect("booked");
     assert_eq!(after.anomalies, vec![ExecutionAnomaly::FillAfterFilled]);
@@ -941,7 +946,7 @@ fn fill_after_filled_and_worse_price_are_booked_and_halt() {
     let worse = gate
         .on_fill(
             &oid("o1"),
-            &report(fill("e1", Side::Buy, dec!(100.01), dec!(1)), dec!(1)),
+            &report(fill("e1", Action::Buy, dec!(100.01), dec!(1)), dec!(1)),
         )
         .expect("booked");
     assert_eq!(
@@ -982,7 +987,7 @@ fn gate_fixture_worse_price() -> RiskGate {
 fn uncovered_fill_is_booked_as_a_debt() {
     let mut gate = gate(dec!(100), dec!(0), InstrumentLimits::default());
     gate.submit(&buy("o1", dec!(100), dec!(1)), 0);
-    let e1 = fill("e1", Side::Buy, dec!(100), dec!(1)).with_fee(asset("USDC"), dec!(1));
+    let e1 = fill("e1", Action::Buy, dec!(100), dec!(1)).with_fee(asset("USDC"), dec!(1));
     let outcome = gate
         .on_fill(&oid("o1"), &report(e1.clone(), dec!(1)))
         .expect("booked");
@@ -1041,7 +1046,7 @@ fn no_fragmentation_exceeds_the_reservation() {
             done += k;
             n += 1;
             let quantity = Decimal::new(k, 8);
-            let mut execution = fill(&format!("e{n}"), Side::Buy, price, quantity);
+            let mut execution = fill(&format!("e{n}"), Action::Buy, price, quantity);
             if !rate.is_zero() {
                 // Fee at the bound on the booked notional, rounded up.
                 let notional = (price * quantity)
@@ -1076,7 +1081,7 @@ fn anomaly_and_overdraft_are_both_recorded() {
     let outcome = gate
         .on_fill(
             &oid("o1"),
-            &report(fill("e1", Side::Buy, dec!(100), dec!(2)), dec!(2)),
+            &report(fill("e1", Action::Buy, dec!(100), dec!(2)), dec!(2)),
         )
         .expect("booked");
     let overfill = ExecutionAnomaly::Overfill {
@@ -1137,7 +1142,7 @@ fn internal_halt_withdraws_the_other_live_orders() {
     let outcome = gate
         .on_fill(
             &oid("o1"),
-            &report(fill("e1", Side::Buy, dec!(100), dec!(3)), dec!(3)),
+            &report(fill("e1", Action::Buy, dec!(100), dec!(3)), dec!(3)),
         )
         .expect("booked");
     assert_ne!(
@@ -1171,7 +1176,7 @@ fn internal_halt_withdraws_the_other_live_orders() {
     let raced = gate
         .on_fill(
             &oid("o2"),
-            &report(fill("e2", Side::Buy, dec!(99), dec!(1)), dec!(1)),
+            &report(fill("e2", Action::Buy, dec!(99), dec!(1)), dec!(1)),
         )
         .expect("booked");
     assert!(raced.is_clean());
@@ -1182,7 +1187,7 @@ fn internal_halt_withdraws_the_other_live_orders() {
     let worse = gate
         .on_fill(
             &oid("o3"),
-            &report(fill("e3", Side::Sell, dec!(109), dec!(1)), dec!(1)),
+            &report(fill("e3", Action::Sell, dec!(109), dec!(1)), dec!(1)),
         )
         .expect("booked");
     assert_eq!(
@@ -1207,7 +1212,7 @@ fn internal_halt_withdraws_the_partly_filled_order() {
     let outcome = gate
         .on_fill(
             &oid("o1"),
-            &report(fill("e1", Side::Buy, dec!(100.01), dec!(1)), dec!(1)),
+            &report(fill("e1", Action::Buy, dec!(100.01), dec!(1)), dec!(1)),
         )
         .expect("booked");
     assert_eq!(outcome.withdraw, vec![oid("o1")]);
@@ -1236,7 +1241,7 @@ fn overdraft_halt_withdraws_and_duplicates_do_not() {
     let mut gate = gate(dec!(100), dec!(1), InstrumentLimits::default());
     gate.submit(&buy("o1", dec!(100), dec!(1)), 0);
     gate.submit(&sell("o2", dec!(200), dec!(1)), 0);
-    let e1 = fill("e1", Side::Buy, dec!(100), dec!(1)).with_fee(asset("USDC"), dec!(1));
+    let e1 = fill("e1", Action::Buy, dec!(100), dec!(1)).with_fee(asset("USDC"), dec!(1));
     let outcome = gate
         .on_fill(&oid("o1"), &report(e1.clone(), dec!(1)))
         .expect("booked");
@@ -1272,4 +1277,57 @@ fn test_remaining_unrepresentable_difference_is_arithmetic_error() {
     record.quantity = dec!(1);
     record.filled = dec!(2);
     assert_eq!(record.remaining(), Ok(dec!(0)));
+}
+
+/// `Action::Other` is refused by `submit` as an invalid order, with nothing
+/// reserved and the ledger unchanged.
+#[test]
+fn test_submit_other_action_is_rejected_without_reservation() {
+    let mut gate = gate(dec!(1000), dec!(0), InstrumentLimits::default());
+    let before = gate.ledger().snapshot();
+    let request = OrderRequest::new(oid("x"), pair(), Action::Other, dec!(100), dec!(1));
+    assert_eq!(
+        gate.submit(&request, 0),
+        RiskDecision::Rejected {
+            reasons: vec![RiskReason::InvalidOrder {
+                error: MarginError::UnsupportedAction {
+                    field: "order side",
+                    action: Action::Other,
+                },
+            }],
+        }
+    );
+    assert_eq!(gate.ledger().snapshot(), before);
+    assert_eq!(balance(&gate, "USDC"), (dec!(1000), dec!(0), dec!(1000)));
+}
+
+/// `on_fill` refuses an `Other` execution first: before the duplicate check
+/// and before the overfill check, with the gate and the ledger unchanged.
+#[test]
+fn test_on_fill_other_action_is_refused_before_duplicate_and_overfill() {
+    let mut gate = gate(dec!(1000), dec!(0), InstrumentLimits::default());
+    assert!(!gate.submit(&buy("o1", dec!(100), dec!(1)), 0).is_rejected());
+    let booked = fill("e1", Action::Buy, dec!(100), dec!(1));
+    gate.on_fill(&oid("o1"), &report(booked, dec!(1)))
+        .expect("fill");
+    let before = gate.ledger().snapshot();
+    let halted = gate.halted();
+    let unsupported = Err(MarginError::UnsupportedAction {
+        field: "execution side",
+        action: Action::Other,
+    });
+    // Same id as the booked fill: not a duplicate, refused.
+    let duplicate = fill("e1", Action::Other, dec!(100), dec!(1));
+    assert_eq!(
+        gate.on_fill(&oid("o1"), &report(duplicate, dec!(1))),
+        unsupported
+    );
+    // An overfill of the filled order: refused the same way, not flagged.
+    let overfill = fill("e2", Action::Other, dec!(100), dec!(5));
+    assert_eq!(
+        gate.on_fill(&oid("o1"), &report(overfill, dec!(6))),
+        unsupported
+    );
+    assert_eq!(gate.ledger().snapshot(), before);
+    assert_eq!(gate.halted(), halted);
 }

@@ -44,7 +44,7 @@
 //!
 //! ## Policies
 //!
-//! - Edition 2024, MSRV 1.85; CI checks both the latest stable and the MSRV.
+//! - Edition 2024, MSRV 1.88; CI checks both the latest stable and the MSRV.
 //! - Small default dependency set; the crate never depends on
 //!   market-maker-rs. Planned integration: market-maker-rs does not depend
 //!   on margin-rs yet.
@@ -83,6 +83,7 @@
 pub mod collateral;
 pub mod covariance;
 pub mod decimal;
+mod direction;
 pub mod error;
 pub mod factors;
 pub mod ids;
@@ -99,6 +100,7 @@ pub mod valuation;
 
 pub use decimal::Rounding;
 pub use error::{MarginError, Result};
+pub use financial_types::Action;
 pub use ids::{
     AccountId, Asset, ExecutionId, FactorId, InstrumentId, OrderId, ReservationId, TransferId,
     VenueId,

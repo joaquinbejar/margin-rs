@@ -8,6 +8,28 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** the order and execution direction is `financial_types::Action`
+  (0.3), shared with the other crates of the stack, re-exported as
+  `margin_rs::Action` and `margin_rs::ledger::Action`. It replaces
+  `ledger::Side` in `Execution`, `ExecutionCashflow`, `OrderRequest`,
+  `OrderRecord`, `MarginOrder`, `HypotheticalFill`, `ForcedReduction` and
+  `CloseoutIntent::Reduce`. `Action::Buy` and `Action::Sell` behave as
+  `Side::Buy` and `Side::Sell` did; the old `Side` had no `Display`, so no
+  text changes.
+- `Action` is `#[non_exhaustive]` and has `Other`. Every public entry turns
+  it into a private `{Buy, Sell}` direction first, with the crate's only
+  wildcard arm; anything else is the new
+  `MarginError::UnsupportedAction { field, action }`, before any change:
+  `Ledger::book_execution*` and `RiskGate::on_fill` (before the duplicate
+  check), `MarginReservationService::reserve` (before the order id is used)
+  and `scenarios::stress`. `RiskGate::submit` rejects it as
+  `RiskReason::InvalidOrder` with nothing reserved. Matches inside the
+  crate stay exhaustive.
+- **MSRV 1.88** (required by `financial_types` 0.3).
+- `financial_types::Side` (long or short), `OptionStyle` and
+  `UnderlyingAssetType` are not adopted: positions are signed, and margin-rs
+  has no option style or asset type enum to replace.
+
 - Lints: clippy pedantic is on, and `unwrap_used`, `expect_used`, `panic`,
   `unreachable`, `todo`, `unimplemented` and `indexing_slicing` are denied;
   `arithmetic_side_effects` warns, and `make lint` runs with `-D warnings`.

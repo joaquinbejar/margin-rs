@@ -30,11 +30,11 @@ jobs:
         run: make doc
 
   msrv:
-    name: MSRV 1.85
+    name: MSRV 1.88
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # `make msrv` runs `cargo +1.85.0`, which overrides rust-toolchain.toml.
-      - uses: dtolnay/rust-toolchain@1.85.0
+      # `make msrv` runs `cargo +1.88.0`, which overrides rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@1.88.0
       - name: Check
         run: make msrv

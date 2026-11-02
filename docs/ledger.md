@@ -105,7 +105,7 @@ The adapter maps types as follows:
 |---|---|
 | `ExecutionReport` with `is_fill()` | `Execution` |
 | `stamp.sequence` (unique within a run) | `ExecutionId`: `"{run}:{sequence}"`, or the bare `u64` via `From<u64>` when one ledger serves one run |
-| `side: execution::Side` | `ledger::Side` (same two values) |
+| `side: execution::Side` | `ledger::Action`, from `financial_types`: `Buy` and `Sell`; `Other` is refused with `UnsupportedAction` |
 | `price` | `price`, which must respect the instrument's price scale |
 | `last_quantity` | `quantity`, which must respect the quantity scale |
 | `fee` (`price * quantity * fee_rate`, unrounded) | `Fee { asset: quote, amount }`. The adapter rounds the amount to the fee asset scale with an explicit mode, because the ledger rejects finer amounts |

@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 
-use margin_rs::ledger::{Booking, Execution, Ledger, LedgerConfig, Side};
+use margin_rs::ledger::{Action, Booking, Execution, Ledger, LedgerConfig};
 use margin_rs::{
     Asset, Decimal, ExecutionId, InstrumentId, MarginError, ReservationId, Rounding,
     SpotInstrument, TransferId,
@@ -63,7 +63,7 @@ fn ledger() -> Ledger {
     ledger
 }
 
-fn exec(id: &str, side: Side, price: Decimal, quantity: Decimal) -> Execution {
+fn exec(id: &str, side: Action, price: Decimal, quantity: Decimal) -> Execution {
     Execution::new(eid(id), btc_usdc(), side, price, quantity)
 }
 
@@ -98,7 +98,7 @@ fn buy_then_partial_sell_matches_hand_calculation() {
         Ok(true)
     );
 
-    let buy = exec("e1", Side::Buy, dec!(100.00), dec!(2)).with_fee(usdc.clone(), dec!(0.2));
+    let buy = exec("e1", Action::Buy, dec!(100.00), dec!(2)).with_fee(usdc.clone(), dec!(0.2));
     let cf = book(&mut ledger, &buy);
     assert_eq!(cf.sequence, 0);
     assert_eq!(cf.notional, dec!(200));
@@ -109,7 +109,8 @@ fn buy_then_partial_sell_matches_hand_calculation() {
     );
     assert_eq!(cf.realized_pnl, dec!(0));
 
-    let sell = exec("e2", Side::Sell, dec!(110.00), dec!(0.5)).with_fee(usdc.clone(), dec!(0.055));
+    let sell =
+        exec("e2", Action::Sell, dec!(110.00), dec!(0.5)).with_fee(usdc.clone(), dec!(0.055));
     let cf = book(&mut ledger, &sell);
     assert_eq!(cf.sequence, 1);
     assert_eq!(cf.notional, dec!(55));
@@ -159,7 +160,7 @@ fn reprocessing_is_idempotent() {
     ledger
         .deposit(tid("d1"), usdc.clone(), dec!(1000))
         .expect("deposit");
-    let buy = exec("e1", Side::Buy, dec!(100), dec!(2)).with_fee(usdc.clone(), dec!(0.2));
+    let buy = exec("e1", Action::Buy, dec!(100), dec!(2)).with_fee(usdc.clone(), dec!(0.2));
     let first = book(&mut ledger, &buy);
     let after_first = ledger.snapshot();
 
@@ -177,7 +178,7 @@ fn reprocessing_is_idempotent() {
     assert_eq!(ledger.journal().len(), 1);
     assert_eq!(ledger.fees_paid(&usdc), dec!(0.2));
 
-    let conflicting = exec("e1", Side::Buy, dec!(100), dec!(3)).with_fee(usdc.clone(), dec!(0.2));
+    let conflicting = exec("e1", Action::Buy, dec!(100), dec!(3)).with_fee(usdc.clone(), dec!(0.2));
     assert_eq!(
         ledger.book_execution(&conflicting),
         Err(MarginError::ConflictingEntry {
@@ -217,11 +218,11 @@ fn fees_in_other_currencies_are_never_summed() {
         .expect("deposit");
     book(
         &mut ledger,
-        &exec("e1", Side::Buy, dec!(100), dec!(1)).with_fee(bnb.clone(), dec!(0.01)),
+        &exec("e1", Action::Buy, dec!(100), dec!(1)).with_fee(bnb.clone(), dec!(0.01)),
     );
     let cf = book(
         &mut ledger,
-        &exec("e2", Side::Buy, dec!(100), dec!(1)).with_fee(btc.clone(), dec!(0.001)),
+        &exec("e2", Action::Buy, dec!(100), dec!(1)).with_fee(btc.clone(), dec!(0.001)),
     );
     assert_eq!(
         cf.deltas,
@@ -275,7 +276,7 @@ fn fragmented_fills_round_per_fill_and_reconcile() {
     for (i, (quantity, notional)) in fills.iter().zip(expected).enumerate() {
         let cf = book(
             &mut ledger,
-            &exec(&format!("f{i}"), Side::Buy, dec!(100.01), *quantity),
+            &exec(&format!("f{i}"), Action::Buy, dec!(100.01), *quantity),
         );
         assert_eq!(cf.notional, notional);
         exact_sum += cf.notional_exact.expect("representable");
@@ -302,13 +303,13 @@ fn exact_round_trip_restores_balances() {
     let before = ledger.snapshot();
     let buy = book(
         &mut ledger,
-        &exec("b", Side::Buy, dec!(43210.99), dec!(1.23456789)),
+        &exec("b", Action::Buy, dec!(43210.99), dec!(1.23456789)),
     );
     assert_eq!(buy.notional_exact, Some(dec!(53346.9007491111)));
     assert_eq!(buy.notional, dec!(53346.900749));
     book(
         &mut ledger,
-        &exec("s", Side::Sell, dec!(43210.99), dec!(1.23456789)),
+        &exec("s", Action::Sell, dec!(43210.99), dec!(1.23456789)),
     );
 
     let after = ledger.snapshot();
@@ -335,13 +336,13 @@ fn partial_reductions_conserve_cost_exactly() {
     ledger
         .deposit(tid("d1"), asset("USDC"), dec!(100))
         .expect("deposit");
-    book(&mut ledger, &exec("b1", Side::Buy, dec!(50), dec!(1)));
-    book(&mut ledger, &exec("b2", Side::Buy, dec!(25), dec!(2)));
+    book(&mut ledger, &exec("b1", Action::Buy, dec!(50), dec!(1)));
+    book(&mut ledger, &exec("b2", Action::Buy, dec!(25), dec!(2)));
     let realized: Vec<Decimal> = (0..3)
         .map(|i| {
             book(
                 &mut ledger,
-                &exec(&format!("s{i}"), Side::Sell, dec!(40), dec!(1)),
+                &exec(&format!("s{i}"), Action::Sell, dec!(40), dec!(1)),
             )
             .realized_pnl
         })
@@ -374,8 +375,8 @@ fn crossing_zero_splits_the_fill() {
     ledger
         .deposit(tid("d2"), asset("BTC"), dec!(1))
         .expect("deposit");
-    book(&mut ledger, &exec("b1", Side::Buy, dec!(100), dec!(2)));
-    let cf = book(&mut ledger, &exec("s1", Side::Sell, dec!(110), dec!(3)));
+    book(&mut ledger, &exec("b1", Action::Buy, dec!(100), dec!(2)));
+    let cf = book(&mut ledger, &exec("s1", Action::Sell, dec!(110), dec!(3)));
     assert_eq!(cf.realized_pnl, dec!(20));
     assert_eq!(cf.position_after.quantity, dec!(-1));
     assert_eq!(cf.position_after.cost_basis, dec!(-110));
@@ -389,7 +390,7 @@ fn crossing_zero_splits_the_fill() {
     assert_eq!(valuation.positions[&btc_usdc()].market_value, dec!(-100));
     assert_eq!(valuation.positions[&btc_usdc()].unrealized_pnl, dec!(10));
 
-    let cf = book(&mut ledger, &exec("b2", Side::Buy, dec!(100), dec!(1)));
+    let cf = book(&mut ledger, &exec("b2", Action::Buy, dec!(100), dec!(1)));
     assert_eq!(cf.realized_pnl, dec!(10));
     assert!(cf.position_after.is_flat());
     assert_eq!(cf.position_after.cost_basis, dec!(0));
@@ -416,7 +417,7 @@ fn insufficient_balance_leaves_the_ledger_unchanged() {
     let before = ledger.snapshot();
 
     assert_eq!(
-        ledger.book_execution(&exec("e1", Side::Buy, dec!(100), dec!(2))),
+        ledger.book_execution(&exec("e1", Action::Buy, dec!(100), dec!(2))),
         Err(MarginError::InsufficientBalance {
             asset: usdc.clone(),
             required: dec!(200),
@@ -424,7 +425,7 @@ fn insufficient_balance_leaves_the_ledger_unchanged() {
         })
     );
     assert_eq!(
-        ledger.book_execution(&exec("e2", Side::Sell, dec!(100), dec!(1))),
+        ledger.book_execution(&exec("e2", Action::Sell, dec!(100), dec!(1))),
         Err(MarginError::InsufficientBalance {
             asset: asset("BTC"),
             required: dec!(1),
@@ -452,7 +453,7 @@ fn insufficient_balance_leaves_the_ledger_unchanged() {
         (dec!(100), dec!(60), dec!(40))
     );
     assert_eq!(
-        ledger.book_execution(&exec("e3", Side::Buy, dec!(100), dec!(0.5))),
+        ledger.book_execution(&exec("e3", Action::Buy, dec!(100), dec!(0.5))),
         Err(MarginError::InsufficientBalance {
             asset: usdc.clone(),
             required: dec!(50),
@@ -472,7 +473,7 @@ fn insufficient_balance_leaves_the_ledger_unchanged() {
         ledger.release(&hold),
         Err(MarginError::UnknownReservation { id: "r1".into() })
     );
-    book(&mut ledger, &exec("e3", Side::Buy, dec!(100), dec!(0.5)));
+    book(&mut ledger, &exec("e3", Action::Buy, dec!(100), dec!(0.5)));
     assert_eq!(total(&ledger, "USDC"), dec!(50));
     assert_eq!(ledger.withdraw(tid("w2"), usdc.clone(), dec!(50)), Ok(true));
     assert_eq!(total(&ledger, "USDC"), dec!(0));
@@ -491,7 +492,7 @@ fn precision_and_numeric_limits() {
     let before = ledger.snapshot();
 
     assert_eq!(
-        ledger.book_execution(&exec("p", Side::Buy, dec!(100.001), dec!(1))),
+        ledger.book_execution(&exec("p", Action::Buy, dec!(100.001), dec!(1))),
         Err(MarginError::PrecisionExceeded {
             field: "price",
             scale: 3,
@@ -499,7 +500,7 @@ fn precision_and_numeric_limits() {
         })
     );
     assert_eq!(
-        ledger.book_execution(&exec("q", Side::Buy, dec!(100), dec!(0.000000001))),
+        ledger.book_execution(&exec("q", Action::Buy, dec!(100), dec!(0.000000001))),
         Err(MarginError::PrecisionExceeded {
             field: "quantity",
             scale: 9,
@@ -508,7 +509,7 @@ fn precision_and_numeric_limits() {
     );
     assert_eq!(
         ledger.book_execution(
-            &exec("f", Side::Buy, dec!(100), dec!(1)).with_fee(usdc.clone(), dec!(0.0000001))
+            &exec("f", Action::Buy, dec!(100), dec!(1)).with_fee(usdc.clone(), dec!(0.0000001))
         ),
         Err(MarginError::PrecisionExceeded {
             field: "fee",
@@ -519,26 +520,26 @@ fn precision_and_numeric_limits() {
     // Trailing zeros are not extra precision.
     assert!(
         ledger
-            .book_execution(&exec("z", Side::Buy, dec!(100.0000), dec!(0.100000000)))
+            .book_execution(&exec("z", Action::Buy, dec!(100.0000), dec!(0.100000000)))
             .is_ok()
     );
     let before_errors = ledger.snapshot();
 
     assert_eq!(
-        ledger.book_execution(&exec("n0", Side::Buy, dec!(0), dec!(1))),
+        ledger.book_execution(&exec("n0", Action::Buy, dec!(0), dec!(1))),
         Err(MarginError::invalid_input("price", "must be positive"))
     );
     assert_eq!(
-        ledger.book_execution(&exec("n1", Side::Buy, dec!(100), dec!(-1))),
+        ledger.book_execution(&exec("n1", Action::Buy, dec!(100), dec!(-1))),
         Err(MarginError::invalid_input("quantity", "must be positive"))
     );
     assert_eq!(
-        ledger.book_execution(&exec("big", Side::Buy, Decimal::MAX, dec!(2))),
+        ledger.book_execution(&exec("big", Action::Buy, Decimal::MAX, dec!(2))),
         Err(MarginError::arithmetic("price * quantity"))
     );
     assert_eq!(
         ledger.book_execution(
-            &exec("bnb", Side::Buy, dec!(1), dec!(1)).with_fee(asset("XRP"), dec!(1))
+            &exec("bnb", Action::Buy, dec!(1), dec!(1)).with_fee(asset("XRP"), dec!(1))
         ),
         Err(MarginError::UnknownAsset {
             asset: asset("XRP")
@@ -549,7 +550,7 @@ fn precision_and_numeric_limits() {
         ledger.book_execution(&Execution::new(
             eid("u"),
             unknown.clone(),
-            Side::Buy,
+            Action::Buy,
             dec!(1),
             dec!(1)
         )),
@@ -581,7 +582,7 @@ fn maker_rebate_credits_the_fee_asset() {
         .expect("deposit");
     let cf = book(
         &mut ledger,
-        &exec("e1", Side::Buy, dec!(100), dec!(1)).with_fee(usdc.clone(), dec!(-0.01)),
+        &exec("e1", Action::Buy, dec!(100), dec!(1)).with_fee(usdc.clone(), dec!(-0.01)),
     );
     assert_eq!(cf.deltas[&usdc], dec!(-99.99));
     assert_eq!(total(&ledger, "USDC"), dec!(900.01));
@@ -607,7 +608,7 @@ fn pnl_is_reported_in_each_quote_asset() {
         .expect("deposit");
     book(
         &mut ledger,
-        &Execution::new(eid("e1"), eth_btc(), Side::Buy, dec!(0.05), dec!(10)),
+        &Execution::new(eid("e1"), eth_btc(), Action::Buy, dec!(0.05), dec!(10)),
     );
     assert_eq!(total(&ledger, "BTC"), dec!(9.5));
     assert_eq!(total(&ledger, "ETH"), dec!(10));
@@ -732,10 +733,10 @@ fn partial_close_releases_cost_rounded_once() {
     };
     book(
         &mut ledger,
-        &fill("b1", Side::Buy, tick, dec!(2000000000000000000)),
+        &fill("b1", Action::Buy, tick, dec!(2000000000000000000)),
     );
-    book(&mut ledger, &fill("b2", Side::Buy, dec!(1), dec!(1)));
-    let cf = book(&mut ledger, &fill("s1", Side::Sell, tick, dec!(1)));
+    book(&mut ledger, &fill("b2", Action::Buy, dec!(1), dec!(1)));
+    let cf = book(&mut ledger, &fill("s1", Action::Sell, tick, dec!(1)));
     assert_eq!(cf.realized_pnl, dec!(0));
     assert_eq!(cf.position_after.quantity, dec!(2000000000000000000));
     assert_eq!(cf.position_after.cost_basis, dec!(2.999999999999999999));
@@ -777,7 +778,7 @@ fn eighteen_digit_scales_open_reduce_and_value() {
         &Execution::new(
             eid("b"),
             pair.clone(),
-            Side::Buy,
+            Action::Buy,
             dec!(3000.12),
             dec!(1.123456789012345678),
         ),
@@ -790,7 +791,7 @@ fn eighteen_digit_scales_open_reduce_and_value() {
         &Execution::new(
             eid("s"),
             pair.clone(),
-            Side::Sell,
+            Action::Sell,
             dec!(3000.12),
             dec!(0.123456789012345678),
         ),
@@ -824,7 +825,7 @@ fn eighteen_digit_scales_open_reduce_and_value() {
         &Execution::new(
             eid("fb"),
             fine.clone(),
-            Side::Buy,
+            Action::Buy,
             dec!(3000.123456789012345678),
             dec!(1.123456789012345678),
         ),
@@ -853,7 +854,7 @@ fn booking_against_a_reservation_is_atomic() {
     ledger
         .reserve(hold.clone(), usdc.clone(), dec!(100))
         .expect("reserve");
-    let e1 = exec("e1", Side::Buy, dec!(60), dec!(1));
+    let e1 = exec("e1", Action::Buy, dec!(60), dec!(1));
     assert!(matches!(
         ledger.book_execution(&e1),
         Err(MarginError::InsufficientBalance { .. })
@@ -912,7 +913,7 @@ fn real_execution_can_overdraw() {
     ledger
         .deposit(tid("d1"), usdc.clone(), dec!(50))
         .expect("deposit");
-    let e1 = exec("e1", Side::Buy, dec!(100), dec!(1));
+    let e1 = exec("e1", Action::Buy, dec!(100), dec!(1));
     assert!(matches!(
         ledger.book_execution(&e1),
         Err(MarginError::InsufficientBalance { .. })
@@ -959,7 +960,7 @@ fn set_reservation_is_atomic_even_when_overdrawn() {
         .expect("hold");
     // A real execution overdraws: total -20, reserved 80.
     ledger
-        .book_execution_allowing_overdraft(&exec("e1", Side::Buy, dec!(120), dec!(1)), None)
+        .book_execution_allowing_overdraft(&exec("e1", Action::Buy, dec!(120), dec!(1)), None)
         .expect("booked");
     let b = ledger.balance(&usdc).expect("balance");
     assert_eq!((b.total, b.reserved), (dec!(-20), dec!(80)));
@@ -1012,5 +1013,34 @@ fn test_reserve_unrepresentable_available_is_arithmetic_error() {
         (Decimal::MAX, dec!(0), Decimal::MAX)
     );
     assert!(ledger.overdrafts().is_empty());
+    ledger.reconcile().expect("reconciles");
+}
+
+/// The ledger refuses an `Other` execution before any change, even when its
+/// id matches a booked execution.
+#[test]
+fn test_book_execution_other_action_is_unsupported() {
+    let mut ledger = ledger();
+    ledger
+        .deposit(tid("d1"), asset("USDC"), dec!(1000))
+        .expect("deposit");
+    book(&mut ledger, &exec("e1", Action::Buy, dec!(100), dec!(1)));
+    let before = ledger.snapshot();
+    let unsupported = Err(MarginError::UnsupportedAction {
+        field: "execution side",
+        action: Action::Other,
+    });
+    for id in ["e1", "e2"] {
+        let other = exec(id, Action::Other, dec!(100), dec!(1));
+        assert_eq!(ledger.book_execution(&other), unsupported);
+        assert!(matches!(
+            ledger.book_execution_allowing_overdraft(&other, None),
+            Err(MarginError::UnsupportedAction {
+                field: "execution side",
+                action: Action::Other
+            })
+        ));
+    }
+    assert_eq!(ledger.snapshot(), before);
     ledger.reconcile().expect("reconciles");
 }

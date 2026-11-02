@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 
 use margin_rs::initial_margin::ProductKind;
-use margin_rs::ledger::Side;
+use margin_rs::ledger::Action;
 use margin_rs::margin_reservations::{
     MarginDecision, MarginInstrument, MarginOrder, MarginRejection, MarginReservationService,
 };
@@ -64,7 +64,7 @@ fn marks() -> BTreeMap<InstrumentId, Decimal> {
     BTreeMap::from([(iid("XYZ-PERP"), dec!(2000)), (iid("ABC-PERP"), dec!(2000))])
 }
 
-fn order(id: &str, instrument: &str, side: Side, contracts: Decimal) -> MarginOrder {
+fn order(id: &str, instrument: &str, side: Action, contracts: Decimal) -> MarginOrder {
     MarginOrder {
         id: oid(id),
         instrument: iid(instrument),
@@ -90,7 +90,7 @@ fn two_orders_cannot_reserve_the_same_capital() {
     assert_eq!(
         service
             .reserve(
-                order("o1", "XYZ-PERP", Side::Buy, dec!(2)),
+                order("o1", "XYZ-PERP", Action::Buy, dec!(2)),
                 collateral,
                 &marks()
             )
@@ -103,7 +103,7 @@ fn two_orders_cannot_reserve_the_same_capital() {
     assert_eq!(
         service
             .reserve(
-                order("o2", "ABC-PERP", Side::Buy, dec!(2)),
+                order("o2", "ABC-PERP", Action::Buy, dec!(2)),
                 collateral,
                 &marks()
             )
@@ -120,7 +120,7 @@ fn two_orders_cannot_reserve_the_same_capital() {
     assert_eq!(
         service
             .reserve(
-                order("o3", "ABC-PERP", Side::Buy, dec!(1)),
+                order("o3", "ABC-PERP", Action::Buy, dec!(1)),
                 collateral,
                 &marks()
             )
@@ -145,7 +145,7 @@ fn partial_fill_and_cancel_leave_the_exact_requirement() {
     let collateral = Some(dec!(10000));
     service
         .reserve(
-            order("o1", "XYZ-PERP", Side::Buy, dec!(3)),
+            order("o1", "XYZ-PERP", Action::Buy, dec!(3)),
             collateral,
             &marks(),
         )
@@ -169,7 +169,7 @@ fn partial_fill_and_cancel_leave_the_exact_requirement() {
     let before = total(&service);
     let rejected = service
         .reserve(
-            order("big", "XYZ-PERP", Side::Buy, dec!(10)),
+            order("big", "XYZ-PERP", Action::Buy, dec!(10)),
             Some(dec!(3000)),
             &marks(),
         )
@@ -191,7 +191,7 @@ fn reducing_orders_and_no_offsets() {
     let collateral = Some(dec!(100000));
     service
         .reserve(
-            order("b", "XYZ-PERP", Side::Buy, dec!(3)),
+            order("b", "XYZ-PERP", Action::Buy, dec!(3)),
             collateral,
             &marks(),
         )
@@ -204,7 +204,7 @@ fn reducing_orders_and_no_offsets() {
     assert_eq!(
         service
             .reserve(
-                order("s1", "XYZ-PERP", Side::Sell, dec!(1)),
+                order("s1", "XYZ-PERP", Action::Sell, dec!(1)),
                 collateral,
                 &marks()
             )
@@ -217,7 +217,7 @@ fn reducing_orders_and_no_offsets() {
     assert_eq!(
         service
             .reserve(
-                order("s2", "XYZ-PERP", Side::Sell, dec!(5)),
+                order("s2", "XYZ-PERP", Action::Sell, dec!(5)),
                 collateral,
                 &marks()
             )
@@ -230,7 +230,7 @@ fn reducing_orders_and_no_offsets() {
     assert_eq!(
         service
             .reserve(
-                order("s3", "XYZ-PERP", Side::Sell, dec!(4)),
+                order("s3", "XYZ-PERP", Action::Sell, dec!(4)),
                 collateral,
                 &marks()
             )
@@ -244,7 +244,7 @@ fn reducing_orders_and_no_offsets() {
     assert_eq!(
         service
             .reserve(
-                order("a", "ABC-PERP", Side::Sell, dec!(3)),
+                order("a", "ABC-PERP", Action::Sell, dec!(3)),
                 collateral,
                 &marks()
             )
@@ -265,7 +265,7 @@ fn late_and_over_fills_reach_the_position() {
     let collateral = Some(dec!(100000));
     service
         .reserve(
-            order("o1", "XYZ-PERP", Side::Buy, dec!(2)),
+            order("o1", "XYZ-PERP", Action::Buy, dec!(2)),
             collateral,
             &marks(),
         )
@@ -277,7 +277,7 @@ fn late_and_over_fills_reach_the_position() {
 
     service
         .reserve(
-            order("o2", "XYZ-PERP", Side::Sell, dec!(1)),
+            order("o2", "XYZ-PERP", Action::Sell, dec!(1)),
             collateral,
             &marks(),
         )
@@ -310,7 +310,7 @@ fn rejection_reasons() {
     assert_eq!(
         decide(
             &mut service,
-            order("u", "SOL-PERP", Side::Buy, dec!(1)),
+            order("u", "SOL-PERP", Action::Buy, dec!(1)),
             collateral,
             &marks()
         ),
@@ -319,7 +319,7 @@ fn rejection_reasons() {
     assert_eq!(
         decide(
             &mut service,
-            order("z", "XYZ-PERP", Side::Buy, dec!(0)),
+            order("z", "XYZ-PERP", Action::Buy, dec!(0)),
             collateral,
             &marks()
         ),
@@ -328,7 +328,7 @@ fn rejection_reasons() {
     assert_eq!(
         decide(
             &mut service,
-            order("c", "XYZ-PERP", Side::Buy, dec!(1)),
+            order("c", "XYZ-PERP", Action::Buy, dec!(1)),
             None,
             &marks()
         ),
@@ -337,7 +337,7 @@ fn rejection_reasons() {
     assert_eq!(
         decide(
             &mut service,
-            order("m", "XYZ-PERP", Side::Buy, dec!(1)),
+            order("m", "XYZ-PERP", Action::Buy, dec!(1)),
             collateral,
             &BTreeMap::new()
         ),
@@ -349,7 +349,7 @@ fn rejection_reasons() {
     assert_eq!(
         decide(
             &mut service,
-            order("c", "XYZ-PERP", Side::Buy, dec!(1)),
+            order("c", "XYZ-PERP", Action::Buy, dec!(1)),
             collateral,
             &marks()
         ),
@@ -365,14 +365,14 @@ fn conflicting_fill_ids_are_rejected() {
     let mut service = service();
     service
         .reserve(
-            order("a", "XYZ-PERP", Side::Buy, dec!(3)),
+            order("a", "XYZ-PERP", Action::Buy, dec!(3)),
             Some(dec!(100000)),
             &marks(),
         )
         .expect("decision");
     service
         .reserve(
-            order("b", "XYZ-PERP", Side::Buy, dec!(3)),
+            order("b", "XYZ-PERP", Action::Buy, dec!(3)),
             Some(dec!(100000)),
             &marks(),
         )
@@ -424,7 +424,7 @@ mod with_gate {
     }
 
     fn spot_buy(id: &str, quantity: Decimal) -> OrderRequest {
-        OrderRequest::new(oid(id), iid("BTC-USDC"), Side::Buy, dec!(100), quantity)
+        OrderRequest::new(oid(id), iid("BTC-USDC"), Action::Buy, dec!(100), quantity)
     }
 
     fn hold() -> ReservationId {
@@ -440,7 +440,7 @@ mod with_gate {
         assert_eq!(
             service
                 .reserve_with_gate(
-                    order("m1", "XYZ-PERP", Side::Buy, dec!(3)),
+                    order("m1", "XYZ-PERP", Action::Buy, dec!(3)),
                     &mut gate,
                     &hold(),
                     &marks()
@@ -479,7 +479,7 @@ mod with_gate {
         assert_eq!(
             service
                 .reserve_with_gate(
-                    order("m1", "XYZ-PERP", Side::Buy, dec!(3)),
+                    order("m1", "XYZ-PERP", Action::Buy, dec!(3)),
                     &mut gate,
                     &hold(),
                     &marks()
@@ -498,7 +498,7 @@ mod with_gate {
         assert!(matches!(
             service
                 .reserve_with_gate(
-                    order("m2", "XYZ-PERP", Side::Buy, dec!(2)),
+                    order("m2", "XYZ-PERP", Action::Buy, dec!(2)),
                     &mut gate,
                     &hold(),
                     &marks()
@@ -523,13 +523,13 @@ mod with_gate {
     #[test]
     fn failed_hold_changes_nothing() {
         let mut gate = gate();
-        let unknown = OrderRequest::new(oid("hold"), iid("UNKNOWN"), Side::Buy, dec!(1), dec!(1));
+        let unknown = OrderRequest::new(oid("hold"), iid("UNKNOWN"), Action::Buy, dec!(1), dec!(1));
         assert!(gate.submit(&unknown, 0).is_rejected());
         let mut service = service();
         let colliding = ReservationId::new("hold").expect("id");
         assert_eq!(
             service.reserve_with_gate(
-                order("a", "XYZ-PERP", Side::Buy, dec!(3)),
+                order("a", "XYZ-PERP", Action::Buy, dec!(3)),
                 &mut gate,
                 &colliding,
                 &marks()
@@ -546,7 +546,7 @@ mod with_gate {
         assert!(matches!(
             service
                 .reserve_with_gate(
-                    order("a", "XYZ-PERP", Side::Buy, dec!(3)),
+                    order("a", "XYZ-PERP", Action::Buy, dec!(3)),
                     &mut gate,
                     &hold(),
                     &marks()
@@ -596,7 +596,7 @@ mod with_gate {
             let buy = margin_rs::ledger::Execution::new(
                 ExecutionId::new("x").expect("id"),
                 iid("BTC-USDC"),
-                Side::Buy,
+                Action::Buy,
                 debt,
                 dec!(1),
             );
@@ -609,7 +609,7 @@ mod with_gate {
             let mut service = service();
             service
                 .reserve(
-                    order("b", "XYZ-PERP", Side::Buy, dec!(10)),
+                    order("b", "XYZ-PERP", Action::Buy, dec!(10)),
                     Some(dec!(100000)),
                     &marks(),
                 )
@@ -621,7 +621,7 @@ mod with_gate {
             assert!(matches!(
                 service
                     .reserve_with_gate(
-                        order("s", "XYZ-PERP", Side::Sell, dec!(5)),
+                        order("s", "XYZ-PERP", Action::Sell, dec!(5)),
                         &mut gate,
                         &hold(),
                         &marks()
@@ -633,7 +633,7 @@ mod with_gate {
             assert!(matches!(
                 service
                     .reserve_with_gate(
-                        order("b2", "XYZ-PERP", Side::Buy, dec!(1)),
+                        order("b2", "XYZ-PERP", Action::Buy, dec!(1)),
                         &mut gate,
                         &hold(),
                         &marks()
@@ -681,7 +681,7 @@ fn reducing_orders_are_accepted_when_under_margined() {
     let mut service = service();
     service
         .reserve(
-            order("b", "XYZ-PERP", Side::Buy, dec!(10)),
+            order("b", "XYZ-PERP", Action::Buy, dec!(10)),
             Some(dec!(100000)),
             &marks(),
         )
@@ -693,7 +693,7 @@ fn reducing_orders_are_accepted_when_under_margined() {
     assert_eq!(
         service
             .reserve(
-                order("s1", "XYZ-PERP", Side::Sell, dec!(5)),
+                order("s1", "XYZ-PERP", Action::Sell, dec!(5)),
                 collateral,
                 &marks()
             )
@@ -706,7 +706,7 @@ fn reducing_orders_are_accepted_when_under_margined() {
     assert_eq!(
         service
             .reserve(
-                order("s2", "XYZ-PERP", Side::Sell, dec!(25)),
+                order("s2", "XYZ-PERP", Action::Sell, dec!(25)),
                 collateral,
                 &marks()
             )
@@ -725,7 +725,7 @@ fn long_ten_under_margined() -> MarginReservationService<TieredLinearIm> {
     let mut service = service();
     service
         .reserve(
-            order("b", "XYZ-PERP", Side::Buy, dec!(10)),
+            order("b", "XYZ-PERP", Action::Buy, dec!(10)),
             Some(dec!(100000)),
             &marks(),
         )
@@ -742,7 +742,7 @@ fn flips_are_not_risk_reducing() {
     assert_eq!(
         service
             .reserve(
-                order("s", "XYZ-PERP", Side::Sell, dec!(20)),
+                order("s", "XYZ-PERP", Action::Sell, dec!(20)),
                 Some(dec!(10000)),
                 &marks()
             )
@@ -759,7 +759,7 @@ fn flips_are_not_risk_reducing() {
     assert!(matches!(
         service
             .reserve(
-                order("b2", "XYZ-PERP", Side::Buy, dec!(1)),
+                order("b2", "XYZ-PERP", Action::Buy, dec!(1)),
                 Some(dec!(10000)),
                 &marks()
             )
@@ -775,7 +775,7 @@ fn reducing_orders_count_against_each_other() {
     assert!(matches!(
         service
             .reserve(
-                order("s1", "XYZ-PERP", Side::Sell, dec!(6)),
+                order("s1", "XYZ-PERP", Action::Sell, dec!(6)),
                 collateral,
                 &marks()
             )
@@ -785,7 +785,7 @@ fn reducing_orders_count_against_each_other() {
     assert!(matches!(
         service
             .reserve(
-                order("s2", "XYZ-PERP", Side::Sell, dec!(6)),
+                order("s2", "XYZ-PERP", Action::Sell, dec!(6)),
                 collateral,
                 &marks()
             )
@@ -798,11 +798,39 @@ fn reducing_orders_count_against_each_other() {
     assert!(matches!(
         service
             .reserve(
-                order("s3", "XYZ-PERP", Side::Sell, dec!(4)),
+                order("s3", "XYZ-PERP", Action::Sell, dec!(4)),
                 collateral,
                 &marks()
             )
             .expect("decision"),
         MarginDecision::Reserved { .. }
     ));
+}
+
+/// `reserve` refuses an `Other` order before its id is used.
+#[test]
+fn test_reserve_other_action_is_unsupported_and_id_stays_free() {
+    let mut service = service();
+    let unsupported = Err(MarginError::UnsupportedAction {
+        field: "order side",
+        action: Action::Other,
+    });
+    assert_eq!(
+        service.reserve(
+            order("o1", "XYZ-PERP", Action::Other, dec!(1)),
+            Some(dec!(1000000)),
+            &marks()
+        ),
+        unsupported
+    );
+    // The id was not consumed: the same id is accepted as a buy.
+    assert!(
+        service
+            .reserve(
+                order("o1", "XYZ-PERP", Action::Buy, dec!(1)),
+                Some(dec!(1000000)),
+                &marks()
+            )
+            .is_ok()
+    );
 }
