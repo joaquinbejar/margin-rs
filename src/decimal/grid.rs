@@ -115,7 +115,10 @@ impl ContractGrid {
     }
 
     /// `floor(numerator / (product(denominators) * step))`, clamped to the
-    /// grid; index 0 for a non positive numerator.
+    /// grid, where `numerator` is the exact sum of the products of
+    /// `numerator_terms`; index 0 for a non positive numerator. The
+    /// numerator stays in wide integers: it need not fit a `Decimal`, in
+    /// magnitude or in scale, as long as the index does.
     ///
     /// # Errors
     ///
@@ -123,17 +126,28 @@ impl ContractGrid {
     /// the wide integers.
     pub(crate) fn floor_index_of(
         &self,
-        numerator: Decimal,
+        numerator_terms: &[&[Decimal]],
         denominators: &[Decimal],
     ) -> Result<GridIndex> {
-        if numerator <= Decimal::ZERO {
+        let error = || MarginError::arithmetic("grid index");
+        let mut products = Vec::with_capacity(numerator_terms.len());
+        for term in numerator_terms {
+            products.push(wide_product(term).ok_or_else(error)?);
+        }
+        let numerator_scale = products.iter().map(|(_, s)| *s).max().unwrap_or(0);
+        let mut numerator = Wide::ZERO;
+        for (product, scale) in products {
+            let aligned = product.align(scale, numerator_scale).ok_or_else(error)?;
+            numerator = numerator.checked_add(aligned).ok_or_else(error)?;
+        }
+        if numerator.negative || numerator.magnitude.is_zero() {
             return Ok(GridIndex::ZERO);
         }
-        let error = || MarginError::arithmetic("grid index");
         let (denominator, denominator_scale) = wide_product(denominators).ok_or_else(error)?;
         // value / step = (mn / 10^sn) / ((md / 10^sd) * (ms / 10^ss))
         //              = mn * 10^(sd + ss) / (md * ms * 10^sn).
-        let top = magnitude(numerator)
+        let top = numerator
+            .magnitude
             .checked_mul(
                 U768::pow10(
                     denominator_scale
@@ -146,7 +160,7 @@ impl ContractGrid {
         let bottom = denominator
             .magnitude
             .checked_mul(self.step)
-            .and_then(|d| d.checked_mul(U768::pow10(numerator.scale())?))
+            .and_then(|d| d.checked_mul(U768::pow10(numerator_scale)?))
             .ok_or_else(error)?;
         let (quotient, _) = top.div_rem(bottom).ok_or_else(error)?;
         Ok(GridIndex(quotient.min(self.last)))
@@ -225,14 +239,44 @@ mod tests {
     fn floor_index_of_a_ratio() {
         let grid = ContractGrid::new(dec!(0.5), dec!(10)).expect("grid");
         // 7.3 / (1 * 0.5) = 14.6 -> 14.
-        let index = grid.floor_index_of(dec!(7.3), &[dec!(1)]).expect("index");
+        let index = grid
+            .floor_index_of(&[&[dec!(7.3)]], &[dec!(1)])
+            .expect("index");
         assert_eq!(grid.contracts(index).expect("count"), dec!(7));
         // Beyond the cap: clamped to the last index.
-        let index = grid.floor_index_of(dec!(100), &[dec!(1)]).expect("index");
+        let index = grid
+            .floor_index_of(&[&[dec!(100)]], &[dec!(1)])
+            .expect("index");
         assert_eq!(index, grid.last());
         assert_eq!(
-            grid.floor_index_of(dec!(-1), &[dec!(1)]).expect("index"),
+            grid.floor_index_of(&[&[dec!(-1)]], &[dec!(1)])
+                .expect("index"),
             GridIndex::ZERO
         );
+    }
+
+    /// The numerator is a sum of products that need not fit a Decimal:
+    /// `MAX * MAX - MAX` over `MAX` is `MAX - 1`, and a scale of 32
+    /// (`1e-16 * 1e-16`) over a scale of 32 is fine.
+    #[test]
+    fn floor_index_of_a_wide_numerator() {
+        let grid = ContractGrid::new(dec!(1), Decimal::MAX).expect("grid");
+        let index = grid
+            .floor_index_of(
+                &[&[Decimal::MAX, Decimal::MAX], &[-Decimal::MAX]],
+                &[Decimal::MAX],
+            )
+            .expect("index");
+        assert_eq!(
+            grid.contracts(index).expect("count"),
+            Decimal::MAX - Decimal::ONE
+        );
+        let tiny = Decimal::new(1, 16);
+        let grid = ContractGrid::new(dec!(1), dec!(10)).expect("grid");
+        // (3 * 1e-16 * 1e-16) / 1e-32 = 3.
+        let index = grid
+            .floor_index_of(&[&[dec!(3), tiny, tiny]], &[tiny, tiny])
+            .expect("index");
+        assert_eq!(grid.contracts(index).expect("count"), dec!(3));
     }
 }

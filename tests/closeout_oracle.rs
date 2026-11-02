@@ -312,11 +312,21 @@ struct Family {
     currency: Asset,
 }
 
+/// What a family exercised.
+#[derive(Debug, Default)]
+struct Coverage {
+    cases: u32,
+    /// Plans that took part of a level (neither nothing nor all of it).
+    partial: u32,
+    /// Plans that took a whole level without meeting the target and went
+    /// on to the next level of the same instrument.
+    passed_level: u32,
+}
+
 /// Every combination of a family, with cash swept across the target; the
-/// plan must equal the oracle on every one. Returns the number of cases
-/// and how many took part of a level (neither nothing nor all of it).
-fn run<M: PiecewiseLinearMargin>(rule: &M, family: &Family) -> (u32, u32) {
-    let (mut cases, mut partial) = (0, 0);
+/// plan must equal the oracle on every one.
+fn run<M: PiecewiseLinearMargin>(rule: &M, family: &Family) -> Coverage {
+    let mut coverage = Coverage::default();
     for two_positions in [false, true] {
         for (contracts, size) in family.main {
             for book in 0..2 {
@@ -330,7 +340,7 @@ fn run<M: PiecewiseLinearMargin>(rule: &M, family: &Family) -> (u32, u32) {
                                     fee_rate,
                                     contract_step: step,
                                 };
-                                if check_case(
+                                let (partial, passed) = check_case(
                                     rule,
                                     family,
                                     two_positions,
@@ -338,10 +348,10 @@ fn run<M: PiecewiseLinearMargin>(rule: &M, family: &Family) -> (u32, u32) {
                                     book,
                                     &policy,
                                     cash,
-                                ) {
-                                    partial += 1;
-                                }
-                                cases += 1;
+                                );
+                                coverage.cases += 1;
+                                coverage.partial += u32::from(partial);
+                                coverage.passed_level += u32::from(passed);
                             }
                         }
                     }
@@ -349,7 +359,7 @@ fn run<M: PiecewiseLinearMargin>(rule: &M, family: &Family) -> (u32, u32) {
             }
         }
     }
-    (cases, partial)
+    coverage
 }
 
 /// Linear: entry 100.13 against a mark of 95.37 (a long loses, a short
@@ -387,9 +397,10 @@ fn the_linear_search_matches_exhaustive_enumeration() {
         currency: asset(),
     };
     for tiers in [1, 2] {
-        let (cases, partial) = run(&rule(tiers), &family);
-        assert_eq!(cases, 1600);
-        assert!(partial > 100, "only {partial} partial levels");
+        let coverage = run(&rule(tiers), &family);
+        assert_eq!(coverage.cases, 1600);
+        assert!(coverage.partial > 100, "{coverage:?}");
+        assert!(coverage.passed_level > 0, "{coverage:?}");
     }
 }
 
@@ -432,14 +443,16 @@ fn the_inverse_search_matches_exhaustive_enumeration() {
         currency: btc(),
     };
     for tiers in [1, 2] {
-        let (cases, partial) = run(&inverse_rule(tiers), &family);
-        assert_eq!(cases, 1600);
-        assert!(partial > 100, "only {partial} partial levels");
+        let coverage = run(&inverse_rule(tiers), &family);
+        assert_eq!(coverage.cases, 1600);
+        assert!(coverage.partial > 100, "{coverage:?}");
+        assert!(coverage.passed_level > 0, "{coverage:?}");
     }
 }
 
-/// Plans one case and compares it with the oracle. True when the plan took
-/// part of a level.
+/// Plans one case and compares it with the oracle. Returns whether the
+/// plan took part of a level, and whether it took a whole level and went
+/// on to the next one.
 fn check_case<M: PiecewiseLinearMargin>(
     rule: &M,
     family: &Family,
@@ -448,7 +461,7 @@ fn check_case<M: PiecewiseLinearMargin>(
     book: usize,
     policy: &LiquidationPolicy,
     cash: Decimal,
-) -> bool {
+) -> (bool, bool) {
     let long = contracts > dec!(0);
     let rounding = State {
         scale: family.scale,
@@ -504,8 +517,102 @@ fn check_case<M: PiecewiseLinearMargin>(
         "cash {cash}, {contracts} x {size:?}, book {book}, two {two_positions}, {policy:?}"
     );
     assert_eq!(plan.after.cash, expected_cash);
-    plan.reductions.iter().any(|r| {
+    // Small grids are always searched to the end.
+    assert!(plan.minimal);
+    let partial = plan.reductions.iter().any(|r| {
         let cap = liquidity[&r.instrument][r.level].contracts;
         r.contracts < cap && !r.contracts_after.is_zero()
-    })
+    });
+    let passed = plan
+        .reductions
+        .windows(2)
+        .any(|pair| pair[0].instrument == pair[1].instrument && pair[1].level > pair[0].level);
+    (partial, passed)
+}
+
+/// Coarse quanta: cash in whole units (scale 0) or tenths (scale 1), where
+/// rounding opens windows the unrounded figures do not have. Entry 1.13
+/// against a mark of 0.97, a second position short from 0.93, a tier floor
+/// at 5, cash from -10 to 14.
+fn coarse_family(scale: u32, currency: Asset, sizes: [ContractSize; 2]) -> Family {
+    let levels_of = |entries: &[(Decimal, Decimal)]| levels(entries);
+    let [first, second] = sizes;
+    Family {
+        main: [(dec!(13), first), (dec!(-11), second)],
+        entry: dec!(1.13),
+        mark: dec!(0.97),
+        second: (first, dec!(0.93), dec!(0.97)),
+        bids: [
+            levels_of(&[(dec!(0.95), dec!(3)), (dec!(0.91), dec!(100))]),
+            levels_of(&[
+                (dec!(0.95), dec!(2.5)),
+                (dec!(0.91), dec!(4)),
+                (dec!(0.89), dec!(7)),
+            ]),
+        ],
+        asks: [
+            levels_of(&[(dec!(0.99), dec!(3)), (dec!(1.03), dec!(100))]),
+            levels_of(&[
+                (dec!(0.99), dec!(2.5)),
+                (dec!(1.03), dec!(4)),
+                (dec!(1.09), dec!(9)),
+            ]),
+        ],
+        second_asks: levels_of(&[(dec!(0.99), dec!(2)), (dec!(1.03), dec!(10))]),
+        cash: (dec!(-10), dec!(1)),
+        scale,
+        currency,
+    }
+}
+
+#[test]
+fn the_linear_search_matches_enumeration_with_coarse_quanta() {
+    for scale in [0, 1] {
+        let family = coarse_family(
+            scale,
+            asset(),
+            [
+                ContractSize::Multiplier(dec!(1)),
+                ContractSize::Multiplier(dec!(3.7)),
+            ],
+        );
+        for tiers in [1, 2] {
+            let rule = TieredLinearIm::new(
+                RuleId::new("coarse", 1),
+                asset(),
+                scale,
+                table(tiers, dec!(5)),
+            )
+            .unwrap();
+            let coverage = run(&rule, &family);
+            assert_eq!(coverage.cases, 1600);
+            assert!(coverage.partial > 50, "{coverage:?}");
+        }
+    }
+}
+
+#[test]
+fn the_inverse_search_matches_enumeration_with_coarse_quanta() {
+    for scale in [0, 1] {
+        let family = coarse_family(
+            scale,
+            btc(),
+            [
+                ContractSize::ContractValue(dec!(1)),
+                ContractSize::ContractValue(dec!(3.7)),
+            ],
+        );
+        for tiers in [1, 2] {
+            let rule = TieredInverseIm::new(
+                RuleId::new("coarse-inverse", 1),
+                btc(),
+                scale,
+                table(tiers, dec!(5)),
+            )
+            .unwrap();
+            let coverage = run(&rule, &family);
+            assert_eq!(coverage.cases, 1600);
+            assert!(coverage.partial > 50, "{coverage:?}");
+        }
+    }
 }

@@ -25,9 +25,17 @@ follows [Semantic Versioning](https://semver.org/).
   (which now implements `PiecewiseLinearMargin`): fill value
   `rhe(n * CV / p)` in the base, realized `released - fill value`, fee
   `trunc(fee_rate * n * CV / p)`. `LiquidationAccount::from_ledger` reads
-  inverse positions and the booked plan leaves exactly `plan.after`. The
-  closeout search is checked against an exhaustive oracle on 6400 linear
-  and inverse cases (`tests/closeout_oracle.rs`).
+  inverse positions and the booked plan leaves exactly `plan.after`.
+- **Certified closeout search**: the smallest count of each level is
+  found as booked, even where rounding with a coarse cash quantum opens
+  windows the unrounded figures do not have. Exact bounds in wide integers
+  (`J` contains every valid count, `J'` only valid ones) limit an exact
+  walk; the walk shares a budget of `SEARCH_BUDGET` (4096) evaluations per
+  plan. Beyond it the plan takes the first certified count and reports
+  `LiquidationPlan::minimal == false`, or fails with
+  `MarginError::CloseoutSearchLimit` when no count is certified.
+  Breakpoint numerators stay in wide integers. Checked against an
+  exhaustive oracle on 19 200 cases (`tests/closeout_oracle.rs`).
 
 - **Margin for inverse futures and perpetuals** (#26, part B):
   `ProductKind::InverseFuture` / `ProductKind::InversePerpetual` and the
@@ -136,6 +144,10 @@ follows [Semantic Versioning](https://semver.org/).
 - **Breaking:** `InstrumentLimits` has a new field, `fee_asset`: struct
   literals that name every field must add it (`..Default::default()` is
   unaffected) (#37).
+- **Breaking:** `PiecewiseLinearMargin::notional_breakpoints` is replaced
+  by `margin_tiers`, the tiers that give the unrounded margin exactly.
+  `LiquidationPlan` has the new field `minimal`, and `plan_liquidation` can
+  fail with the new `MarginError::CloseoutSearchLimit`.
 - **Breaking:** `ExposurePosition::multiplier` and
   `MarginInstrument::multiplier` are replaced by `size: ContractSize`,
   validated against the product. `PositionRequirement::notional` and

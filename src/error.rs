@@ -255,6 +255,21 @@ pub enum MarginError {
         as_of_ms: u64,
     },
 
+    /// The closeout planner could not resolve the smallest count of a level
+    /// exactly within its work budget, and no count of that level is
+    /// certified to meet the target. Nothing is planned.
+    #[error(
+        "closeout of {instrument} on level {level} needs more than {limit} exact evaluations to resolve"
+    )]
+    CloseoutSearchLimit {
+        /// Instrument being reduced.
+        instrument: InstrumentId,
+        /// Index of the liquidity level.
+        level: usize,
+        /// The work budget per plan, in exact evaluations.
+        limit: u32,
+    },
+
     /// A fill was reported to a margin reservation service that reads its
     /// positions from a ledger before the execution was booked there.
     #[error("execution {id} is not booked in the ledger")]

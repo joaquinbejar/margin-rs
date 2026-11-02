@@ -305,6 +305,31 @@ pub(crate) fn quadratic_form_round(
     Ok((result, nets))
 }
 
+/// The exact sum of the products of `terms`, as a wide integer count of
+/// `10^-scale` units, with that scale. `None` on an overflow of the wide
+/// integers.
+pub(crate) fn sum_products_exact(terms: &[&[Decimal]]) -> Option<(Wide, u32)> {
+    let mut products = Vec::with_capacity(terms.len());
+    for term in terms {
+        products.push(wide_product(term)?);
+    }
+    let common = products.iter().map(|(_, s)| *s).max().unwrap_or(0);
+    let mut total = Wide::ZERO;
+    for (product, scale) in products {
+        total = total.checked_add(product.align(scale, common)?)?;
+    }
+    Some((total, common))
+}
+
+/// Exact comparison of two wide integers given at their scales. `None` on
+/// an overflow of the wide integers.
+pub(crate) fn compare_exact(left: (Wide, u32), right: (Wide, u32)) -> Option<core::cmp::Ordering> {
+    let common = left.1.max(right.1);
+    let l = left.0.align(left.1, common)?;
+    let r = right.0.align(right.1, common)?;
+    Some(l.cmp_signed(&r))
+}
+
 /// Exact comparison of `product(left)` with `product(right)`, without
 /// converting either product to a `Decimal` (they need not be
 /// representable).

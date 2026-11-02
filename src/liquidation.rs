@@ -101,41 +101,69 @@
 //! but within a level the price is fixed, so the fill value `n * CV / p`,
 //! the fee and the remaining notional `(|Qc| - n) * CV / mark` are all
 //! linear in `n`.
-//! So `g(n) = min(cash(n), excess(n))` is concave and the counts that meet
-//! the target (`g(n) >= 0`) form an interval `[a, b]`, which need not
-//! reach the end of the level: closing more can push cash below zero.
+//! Unrounded, the counts that meet the target therefore form one interval.
+//! The booked figures are rounded (half-even fill value and released
+//! basis, a truncated fee, a margin rounded up), so with a coarse cash
+//! quantum rounding can open windows of counts that meet the target where
+//! the unrounded figures do not, and close others. The plan finds the
+//! smallest count that meets the target **as booked**, with a certified
+//! search:
 //!
-//! The plan finds it exactly, up to the rounding of single cash quanta:
+//! 1. With `q` the cash quantum, the booked cash differs from the
+//!    unrounded one by less than `2 q` (fill value and released basis half
+//!    a quantum each, fee under one) and the booked excess by less than
+//!    `3 q` (fill value and the remaining position's value half a quantum
+//!    each, fee and margin under one; the released basis cancels). Only
+//!    the position being reduced changes; the others enter with their
+//!    booked figures.
+//! 2. The unrounded cash and excess are evaluated exactly, in wide
+//!    integers, from the contract terms and the rule's tiers
+//!    ([`PiecewiseLinearMargin::margin_tiers`]), never from the rounded
+//!    margin. So `J = {cash >= -2q and excess >= -3q}` contains every count
+//!    that meets the target and `J' = {cash >= 2q and excess >= 3q}` only
+//!    counts that do. Both are intervals of the grid (the cash is linear,
+//!    the excess concave); their ends are found by exact bisection, and the
+//!    excess peaks at an end of the level or next to a tier floor.
+//! 3. The plan walks `J` in increasing order, from its start to the start
+//!    of `J'`, evaluating each count exactly as it would be booked, and
+//!    takes the first that meets the target: the smallest on the level.
+//!    If `J` is empty no count meets the target, and the plan takes the
+//!    whole level. A count that would leave a position a `Decimal` cannot
+//!    hold cannot be booked and is skipped.
 //!
-//! 1. it evaluates `g` exactly at the candidates where a concave piecewise
-//!    linear function can peak: the ends of the level, the grid points
-//!    around each margin breakpoint, and the grid points where
-//!    `excess - cash` changes sign inside each linear segment (found by
-//!    bisection on its sign);
-//! 2. if no candidate meets the target, no count on the level does, and
-//!    the plan takes the whole level;
-//! 3. otherwise it bisects between 0 (which does not meet the target) and
-//!    the smallest candidate that does, and takes `a`: a count that meets
-//!    the target and whose predecessor on the grid does not.
+//! The walk is short when the quantum is fine against what one step
+//! changes (a few counts for real cash quanta). It shares one budget per
+//! plan, [`SEARCH_BUDGET`] exact evaluations. When the budget runs out:
 //!
-//! Rounding makes these functions step by single quanta (half-even fill
-//! values and released basis, a truncated fee), so concavity holds only up
-//! to those steps. The search is checked against an exhaustive oracle that
-//! tries every count (`tests/closeout_oracle.rs`: linear and inverse, one
-//! to three levels, one and two tiers, with and without fees, long and
-//! short, cash swept across the target), and agrees with it on every case.
+//! - if `J'` is not empty the plan takes its first count, which meets the
+//!   target, and reports [`LiquidationPlan::minimal`] `== false`. The count
+//!   before it is not certified: unrounded, its cash is below `2q` or its
+//!   excess below `3q`. This bounds the money, not the contracts: with a
+//!   step that changes almost nothing, the certified count can be many
+//!   contracts above the smallest one;
+//! - if `J'` is empty no count of the level is certified, and the plan
+//!   fails with [`MarginError::CloseoutSearchLimit`]; nothing is planned.
+//!
+//! If the exact evaluation itself does not fit the wide integers, `J` is
+//! the whole level and no count is certified in advance. The search is
+//! checked against an exhaustive oracle that tries every count
+//! (`tests/closeout_oracle.rs`: linear and inverse, cash at 0, 1, 2 and 8
+//! decimals, one to three levels, one and two tiers, with and without fees,
+//! long and short, cash swept across the target).
 //!
 //! Counts live on the grid of [`LiquidationPolicy::contract_step`],
 //! indexed in wide integers, so no product of a step count or bisection
 //! midpoint can overflow.
 
+use core::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use rust_decimal::Decimal;
 
 use crate::decimal::grid::{ContractGrid, GridIndex};
 use crate::decimal::{
-    MAX_SCALE, Rounding, add, check_scale, mul_div_round, neg, sub, sum, sum_products,
+    MAX_SCALE, Rounding, Wide, add, check_scale, compare_exact, mul_div_round, neg, sub, sum,
+    sum_products_exact,
 };
 use crate::direction::Dir;
 use crate::error::{MarginError, Result};
@@ -490,6 +518,12 @@ pub struct LiquidationPlan {
     pub deficit: Decimal,
     /// `max(0, -cash)` after the plan: the debt the account still owes.
     pub debt: Decimal,
+    /// True when every forced fill closes the smallest count of its level
+    /// that meets the target. False when the search ran out of its budget
+    /// ([`SEARCH_BUDGET`]) on a level and took the first count certified to
+    /// meet the target instead (see the
+    /// [search](self#search-within-a-level)).
+    pub minimal: bool,
 }
 
 impl LiquidationPlan {
@@ -575,6 +609,13 @@ struct Planner<'a, M> {
     policy: &'a LiquidationPolicy,
     account: &'a LiquidationAccount,
     scale: u32,
+    /// Exact evaluations left for the whole plan.
+    budget: Cell<u32>,
+    /// The budget it started with, reported in the error.
+    limit: u32,
+    /// False once a level's count was certified valid but not proven the
+    /// smallest.
+    minimal: Cell<bool>,
 }
 
 impl<M: PiecewiseLinearMargin> Planner<'_, M> {
@@ -643,32 +684,11 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
         }
     }
 
-    fn target_margin(&self, summary: &AccountSummary) -> Decimal {
-        match self.policy.target {
-            CloseoutTarget::Maintenance => summary.maintenance,
-            CloseoutTarget::Initial => summary.initial,
-            CloseoutTarget::Flat => Decimal::ZERO,
-        }
-    }
-
-    /// `excess - cash = collateral - margin - cash`, exact.
-    fn gap(&self, summary: &AccountSummary) -> Result<Decimal> {
-        sum(
-            &[
-                summary.collateral,
-                neg(self.target_margin(summary)),
-                neg(summary.cash),
-            ],
-            "excess - cash",
-        )
-    }
-
     /// The fill of position `index` on one level. See the
     /// [search](self#search-within-a-level).
     fn close_on_level(
         &self,
         state: &State,
-        current: &AccountSummary,
         index: usize,
         level: usize,
         offer: &LiquidityLevel,
@@ -682,100 +702,120 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
             let summary = self.summary(&next)?;
             Ok((next, reduction, summary))
         };
-        let summary_at = |k: GridIndex| -> Result<AccountSummary> {
-            if k == GridIndex::ZERO {
-                Ok(current.clone())
-            } else {
-                Ok(at(k)?.2)
-            }
-        };
         let last = grid.last();
         if self.policy.target == CloseoutTarget::Flat {
             return at(last);
         }
-
-        // Segment ends: no fill, the grid points around each breakpoint
-        // (where the notional crosses a floor: n = |Qc| - floor / (M * mark)
-        // for a linear position, n = |Qc| - floor * mark / CV for an inverse
-        // one), and the whole level.
-        let mut ends = vec![GridIndex::ZERO, last];
-        for floor in self.model.notional_breakpoints(exposure) {
-            let (numerator, denominators) = match exposure.size {
-                ContractSize::Multiplier(m) => (
-                    sum_products(
-                        &[&[size, m, exposure.mark], &[neg(floor)]],
-                        "|Qc| * M * mark - floor",
-                    )?,
-                    vec![m, exposure.mark],
-                ),
-                ContractSize::ContractValue(cv) => (
-                    sum_products(
-                        &[&[size, cv], &[neg(floor), exposure.mark]],
-                        "|Qc| * CV - floor * mark",
-                    )?,
-                    vec![cv],
-                ),
-            };
-            let k = grid.floor_index_of(numerator, &denominators)?;
-            ends.push(k);
-            if let Some(next) = grid.next(k) {
-                ends.push(next);
-            }
-        }
-        ends.sort();
-        ends.dedup();
-
-        // Where excess - cash changes sign inside a segment, min(cash,
-        // excess) can peak: bisect to the two grid points around it.
-        let mut candidates = ends.clone();
-        for pair in ends.windows(2) {
-            let &[mut low, mut high] = pair else {
-                continue;
-            };
-            let low_sign = self.gap(&summary_at(low)?)? >= Decimal::ZERO;
-            let high_sign = self.gap(&summary_at(high)?)? >= Decimal::ZERO;
-            if low_sign == high_sign {
-                continue;
-            }
-            while !ContractGrid::adjacent(low, high) {
-                let middle = ContractGrid::midpoint(low, high);
-                if (self.gap(&summary_at(middle)?)? >= Decimal::ZERO) == low_sign {
-                    low = middle;
-                } else {
-                    high = middle;
-                }
-            }
-            candidates.push(low);
-            candidates.push(high);
-        }
-        candidates.retain(|k| *k != GridIndex::ZERO);
-        candidates.sort();
-        candidates.dedup();
-
-        let mut found = None;
-        for k in candidates {
-            let attempt = at(k)?;
-            if self.met(&attempt.2) {
-                found = Some((k, attempt));
-                break;
-            }
-        }
-        let Some((mut high, mut chosen)) = found else {
+        let first = grid.next(GridIndex::ZERO).unwrap_or(last);
+        let continuous = self.continuous(state, index, offer.price)?;
+        // J contains every count that meets the target, J' only counts that
+        // do; without a certificate (an overflow of the wide integers), J
+        // is the whole level.
+        let (possible, certain) = match continuous.certify(&grid, first, last, self.scale) {
+            Some((possible, certain)) => (possible.span(), certain.span()),
+            None => (Some((first, last)), None),
+        };
+        let Some((start, end)) = possible else {
+            // No count on the level meets the target.
             return at(last);
         };
-        // 0 does not meet the target (the caller checked), `high` does.
-        let mut low = GridIndex::ZERO;
-        while !ContractGrid::adjacent(low, high) {
-            let middle = ContractGrid::midpoint(low, high);
-            let attempt = at(middle)?;
-            if self.met(&attempt.2) {
-                high = middle;
-                chosen = attempt;
-            } else {
-                low = middle;
+        let stop = certain.map_or(end, |(certain_start, _)| certain_start.min(end));
+        let mut k = start;
+        loop {
+            let left = self.budget.get();
+            if left == 0 {
+                return match certain {
+                    Some(span) => {
+                        self.minimal.set(false);
+                        first_bookable(&grid, span, &at)
+                    }
+                    None => Err(MarginError::CloseoutSearchLimit {
+                        instrument: exposure.instrument.clone(),
+                        level,
+                        limit: self.limit,
+                    }),
+                };
+            }
+            self.budget.set(left.saturating_sub(1));
+            // A count that leaves an unrepresentable position cannot be
+            // booked: it does not meet the target.
+            if let Some(attempt) = bookable(at(k))?
+                && self.met(&attempt.2)
+            {
+                return Ok(attempt);
+            }
+            if k >= stop {
+                break;
+            }
+            match grid.next(k) {
+                Some(next) => k = next,
+                None => break,
             }
         }
-        Ok(chosen)
+        if certain.is_some() {
+            // The first count of J' meets the target by construction.
+            return Err(MarginError::arithmetic("certified closeout count"));
+        }
+        at(last)
+    }
+
+    /// The unrounded cash and excess of the account after closing part of
+    /// position `index` at `price`, the other positions unchanged.
+    fn continuous(&self, state: &State, index: usize, price: Decimal) -> Result<Continuous> {
+        let open = state.open(index)?;
+        let requirement = self.requirement(state)?;
+        let mut others = Vec::new();
+        for (position, line) in state.positions.iter().enumerate() {
+            if position == index || line.exposure.contracts.is_zero() {
+                continue;
+            }
+            let value = market_value(
+                line.exposure.contracts,
+                line.exposure.size,
+                line.exposure.mark,
+                self.scale,
+            )?;
+            others.push(unrealized_pnl(line.exposure.size, value, line.basis)?);
+        }
+        for line in &requirement.positions {
+            if line.instrument == open.exposure.instrument {
+                continue;
+            }
+            others.push(neg(match self.policy.target {
+                CloseoutTarget::Initial => line.initial,
+                CloseoutTarget::Maintenance | CloseoutTarget::Flat => line.maintenance,
+            }));
+        }
+        let tiers = self
+            .model
+            .margin_tiers(&open.exposure)
+            .iter()
+            .map(|tier| {
+                (
+                    tier.floor,
+                    match self.policy.target {
+                        CloseoutTarget::Initial => tier.initial_rate,
+                        CloseoutTarget::Maintenance | CloseoutTarget::Flat => tier.maintenance_rate,
+                    },
+                )
+            })
+            .collect();
+        Ok(Continuous {
+            size: open.exposure.size,
+            sign: if open.exposure.contracts > Decimal::ZERO {
+                Decimal::ONE
+            } else {
+                Decimal::NEGATIVE_ONE
+            },
+            held: open.exposure.contracts.abs(),
+            basis: open.basis,
+            mark: open.exposure.mark,
+            price,
+            fee_rate: self.policy.fee_rate,
+            cash: state.cash,
+            others,
+            tiers,
+        })
     }
 
     /// Closes `contracts` of position `index` at `price`.
@@ -954,21 +994,35 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
 ///   [`requirement`](crate::initial_margin::InitialMarginModel::requirement)
 ///   on the view.
 /// - [`MarginError::Arithmetic`] if an amount cannot be represented.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the staged closeout reads as one sequence: validate, cancel, reduce level by level, report the residual"
-)]
 pub fn plan_liquidation<M: PiecewiseLinearMargin>(
     model: &M,
     account: &LiquidationAccount,
     liquidity: &BTreeMap<InstrumentId, Vec<LiquidityLevel>>,
     policy: &LiquidationPolicy,
 ) -> Result<LiquidationPlan> {
+    plan_with_budget(model, account, liquidity, policy, SEARCH_BUDGET)
+}
+
+/// [`plan_liquidation`] with an explicit search budget.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the staged closeout reads as one sequence: validate, cancel, reduce level by level, report the residual"
+)]
+fn plan_with_budget<M: PiecewiseLinearMargin>(
+    model: &M,
+    account: &LiquidationAccount,
+    liquidity: &BTreeMap<InstrumentId, Vec<LiquidityLevel>>,
+    policy: &LiquidationPolicy,
+    budget: u32,
+) -> Result<LiquidationPlan> {
     let planner = Planner {
         model,
         policy,
         account,
         scale: model.cash_scale(),
+        budget: Cell::new(budget),
+        limit: budget,
+        minimal: Cell::new(true),
     };
     planner.validate(liquidity)?;
     let initial_requirement = model.requirement(&account.view)?;
@@ -1012,6 +1066,7 @@ pub fn plan_liquidation<M: PiecewiseLinearMargin>(
             unfilled,
             outcome,
             deficit: deficit.max(Decimal::ZERO),
+            minimal: planner.minimal.get(),
         })
     };
     if planner.met(&before) {
@@ -1052,7 +1107,7 @@ pub fn plan_liquidation<M: PiecewiseLinearMargin>(
                 break;
             }
             let (next, reduction, summary) =
-                planner.close_on_level(&state, &current, index, level, available)?;
+                planner.close_on_level(&state, index, level, available)?;
             state = next;
             reductions.push(reduction);
             current = summary;
@@ -1080,4 +1135,543 @@ pub fn plan_liquidation<M: PiecewiseLinearMargin>(
         unfilled,
         outcome,
     )
+}
+
+/// The work budget of [`plan_liquidation`]: the exact evaluations of
+/// candidate counts it may make in total, over every level and position of
+/// one call (see the [search](self#search-within-a-level)).
+///
+/// One exact evaluation books a candidate count and values the account:
+/// about 11 microseconds in an optimized build with values near
+/// `Decimal::MAX`, so the whole budget costs a few tens of milliseconds.
+/// With real cash quanta a level needs a handful of evaluations; the
+/// budget only binds when the quantum is coarse against what one step
+/// changes.
+pub const SEARCH_BUDGET: u32 = 4096;
+
+/// A grid interval `[start, end]`, both ends included.
+type Span = (GridIndex, GridIndex);
+
+/// The counts of a level that satisfy a condition: none, or an interval.
+#[derive(Debug, Clone, Copy)]
+enum Counts {
+    Empty,
+    Range(Span),
+}
+
+impl Counts {
+    fn span(self) -> Option<Span> {
+        match self {
+            Self::Empty => None,
+            Self::Range(span) => Some(span),
+        }
+    }
+}
+
+/// The unrounded cash and excess (collateral minus the target margin) of
+/// the account after closing `n` contracts of one position at one price,
+/// the other positions unchanged. With the cash quantum `q`, the booked
+/// figures differ from these by less than `2 q` (cash: the fill value and
+/// the released basis round half-even, the fee truncates) and `3 q`
+/// (excess: the fill value, the fee, the remaining position's value and
+/// its margin, rounded up; the released basis cancels). The other
+/// positions enter with their booked figures.
+///
+/// Each figure is evaluated exactly, multiplied by a positive constant
+/// denominator `D`: `|Q|` (linear cash), 1 (linear excess), `|Q| * p`
+/// (inverse cash) and `p * mark` (inverse excess).
+struct Continuous {
+    size: ContractSize,
+    /// +1 to reduce a long, -1 to reduce a short.
+    sign: Decimal,
+    held: Decimal,
+    basis: Decimal,
+    mark: Decimal,
+    price: Decimal,
+    fee_rate: Decimal,
+    cash: Decimal,
+    /// The other positions: their unrealized PnL and minus their margins.
+    others: Vec<Decimal>,
+    /// The position's tiers: floor and the target's rate.
+    tiers: Vec<(Decimal, Decimal)>,
+}
+
+impl Continuous {
+    /// `(cash(n) - threshold) * D`, as product terms, for a count `n`.
+    fn cash_terms(&self, count: Decimal, threshold: Decimal) -> Vec<Vec<Decimal>> {
+        let (held, basis, price, fee, sign) =
+            (self.held, self.basis, self.price, self.fee_rate, self.sign);
+        match self.size {
+            // cash + s n p M - f n p M - n B / |Q|, times |Q| (s the side sign,
+            // n the count, p the price, f the fee rate).
+            ContractSize::Multiplier(multiplier) => vec![
+                vec![self.cash, held],
+                vec![neg(threshold), held],
+                vec![sign, count, held, price, multiplier],
+                vec![neg(fee), count, held, price, multiplier],
+                vec![neg(count), basis],
+            ],
+            // cash + n B / |Q| - s n CV / p - f n CV / p, times |Q| p.
+            ContractSize::ContractValue(cv) => vec![
+                vec![self.cash, held, price],
+                vec![neg(threshold), held, price],
+                vec![count, basis, price],
+                vec![neg(sign), count, cv, held],
+                vec![neg(fee), count, cv, held],
+            ],
+        }
+    }
+
+    /// `(excess(n) - threshold) * D`, as product terms; `None` on an
+    /// overflow of the wide integers. The contracts left, `|Q| - n`, are
+    /// never formed: they need not be representable.
+    fn excess_terms(&self, count: Decimal, threshold: Decimal) -> Option<Vec<Vec<Decimal>>> {
+        let (held, basis, price, fee, sign, mark) = (
+            self.held,
+            self.basis,
+            self.price,
+            self.fee_rate,
+            self.sign,
+            self.mark,
+        );
+        // The constant factor D, and the remaining notional per contract as
+        // num / den: N = (|Q| - n) num / den.
+        let (scale_by, unit, unit_den): (Vec<Decimal>, Vec<Decimal>, Vec<Decimal>) = match self.size
+        {
+            ContractSize::Multiplier(multiplier) => (vec![], vec![multiplier, mark], vec![]),
+            ContractSize::ContractValue(cv) => (vec![price, mark], vec![cv], vec![mark]),
+        };
+        let times = |head: &[Decimal]| -> Vec<Decimal> {
+            let mut term = head.to_vec();
+            term.extend_from_slice(&scale_by);
+            term
+        };
+        let with = |head: &[Decimal], tail: &[Decimal]| -> Vec<Decimal> {
+            let mut term = head.to_vec();
+            term.extend_from_slice(tail);
+            term
+        };
+        let mut terms = vec![times(&[self.cash]), times(&[neg(threshold)])];
+        for other in &self.others {
+            terms.push(times(&[*other]));
+        }
+        match self.size {
+            // cash + s n p M - f n p M + s (|Q| - n) M mark - B.
+            ContractSize::Multiplier(multiplier) => {
+                terms.push(vec![neg(basis)]);
+                terms.push(vec![sign, count, price, multiplier]);
+                terms.push(vec![neg(fee), count, price, multiplier]);
+                terms.push(vec![sign, held, multiplier, mark]);
+                terms.push(vec![neg(sign), count, multiplier, mark]);
+            }
+            // (cash + B - s n CV / p - f n CV / p - s (|Q| - n) CV / mark) times
+            // p mark.
+            ContractSize::ContractValue(cv) => {
+                terms.push(times(&[basis]));
+                terms.push(vec![neg(sign), count, cv, mark]);
+                terms.push(vec![neg(fee), count, cv, mark]);
+                terms.push(vec![neg(sign), held, cv, price]);
+                terms.push(vec![sign, count, cv, price]);
+            }
+        }
+        // Minus the margin: full tiers below the top one, then the top
+        // slice N - floor_k. A tier is reached when N > floor, compared
+        // exactly: |Q| num - n num - floor den > 0.
+        let mut reached = 0_usize;
+        for (floor, _) in &self.tiers {
+            let crossing = [
+                with(&[held], &unit),
+                with(&[neg(count)], &unit),
+                with(&[neg(*floor)], &unit_den),
+            ];
+            let crossing: Vec<&[Decimal]> = crossing.iter().map(Vec::as_slice).collect();
+            let (above, _) = sum_products_exact(&crossing)?;
+            if above.negative || above.magnitude.is_zero() {
+                break;
+            }
+            reached = reached.saturating_add(1);
+        }
+        // rate N D = rate (|Q| - n) num (D / den); D / den is p for an inverse
+        // contract and 1 for a linear one.
+        let per_contract = match self.size {
+            ContractSize::Multiplier(_) => unit.clone(),
+            ContractSize::ContractValue(_) => with(&unit, &[price]),
+        };
+        for (i, (floor, rate)) in self.tiers.iter().enumerate().take(reached) {
+            terms.push(times(&[*rate, *floor]));
+            if i.saturating_add(1) < reached {
+                let (next_floor, _) = self.tiers.get(i.saturating_add(1))?;
+                terms.push(times(&[neg(*rate), *next_floor]));
+            } else {
+                terms.push(with(&[neg(*rate), held], &per_contract));
+                terms.push(with(&[*rate, count], &per_contract));
+            }
+        }
+        Some(terms)
+    }
+
+    /// True when `cash(n) >= threshold`; `None` on an overflow.
+    fn cash_at_least(&self, n: Decimal, threshold: Decimal) -> Option<bool> {
+        let terms = self.cash_terms(n, threshold);
+        let terms: Vec<&[Decimal]> = terms.iter().map(Vec::as_slice).collect();
+        let (total, _) = sum_products_exact(&terms)?;
+        Some(!total.negative || total.magnitude.is_zero())
+    }
+
+    /// `(excess(n) - threshold) * D` exactly, with its scale.
+    fn excess_value(&self, n: Decimal, threshold: Decimal) -> Option<(Wide, u32)> {
+        let terms = self.excess_terms(n, threshold)?;
+        let terms: Vec<&[Decimal]> = terms.iter().map(Vec::as_slice).collect();
+        sum_products_exact(&terms)
+    }
+
+    fn excess_at_least(&self, n: Decimal, threshold: Decimal) -> Option<bool> {
+        let (total, _) = self.excess_value(n, threshold)?;
+        Some(!total.negative || total.magnitude.is_zero())
+    }
+
+    /// The counts of the level that may meet the target (J: cash >= -2q
+    /// and excess >= -3q) and the counts certain to (J': cash >= 2q and
+    /// excess >= 3q), each an interval of the grid or empty. `None` on an
+    /// overflow of the wide integers.
+    fn certify(
+        &self,
+        grid: &ContractGrid,
+        first: GridIndex,
+        last: GridIndex,
+        scale: u32,
+    ) -> Option<(Counts, Counts)> {
+        let (two, three) = (Decimal::new(2, scale), Decimal::new(3, scale));
+        let possible = self.span(grid, (first, last), neg(two), neg(three))?;
+        let certain = self.span(grid, (first, last), two, three)?;
+        Some((possible, certain))
+    }
+
+    /// The counts in `range` with `cash >= cash_threshold` and `excess >=
+    /// excess_threshold`: an interval, since the cash is linear and the
+    /// excess concave in the count.
+    fn span(
+        &self,
+        grid: &ContractGrid,
+        (first, last): Span,
+        cash_threshold: Decimal,
+        excess_threshold: Decimal,
+    ) -> Option<Counts> {
+        let n = |k: GridIndex| grid.contracts(k).ok();
+        // Cash, linear: monotone in the count.
+        let cash = |k: GridIndex| self.cash_at_least(n(k)?, cash_threshold);
+        let cash_span = match (cash(first)?, cash(last)?) {
+            (true, true) => Some((first, last)),
+            (false, false) => None,
+            (true, false) => Some((first, last_true(first, last, &cash)?)),
+            (false, true) => Some((first_true(first, last, &cash)?, last)),
+        };
+        let Some(cash_span) = cash_span else {
+            return Some(Counts::Empty);
+        };
+        // Excess, concave: its maximum on the grid is at an end or next to a
+        // tier floor; the superlevel set is an interval around it.
+        let mut candidates = vec![first, last];
+        for (floor, _) in self.tiers.iter().skip(1) {
+            let (terms, denominators) = match self.size {
+                ContractSize::Multiplier(m) => (
+                    vec![vec![self.held, m, self.mark], vec![neg(*floor)]],
+                    vec![m, self.mark],
+                ),
+                ContractSize::ContractValue(cv) => (
+                    vec![vec![self.held, cv], vec![neg(*floor), self.mark]],
+                    vec![cv],
+                ),
+            };
+            let terms: Vec<&[Decimal]> = terms.iter().map(Vec::as_slice).collect();
+            let k = grid.floor_index_of(&terms, &denominators).ok()?;
+            for candidate in [Some(k), grid.next(k)].into_iter().flatten() {
+                if candidate >= first && candidate <= last {
+                    candidates.push(candidate);
+                }
+            }
+        }
+        let mut best = first;
+        let mut best_value = self.excess_value(n(first)?, excess_threshold)?;
+        for candidate in candidates {
+            let value = self.excess_value(n(candidate)?, excess_threshold)?;
+            if compare_exact(value, best_value)? == core::cmp::Ordering::Greater {
+                best = candidate;
+                best_value = value;
+            }
+        }
+        if best_value.0.negative && !best_value.0.magnitude.is_zero() {
+            return Some(Counts::Empty);
+        }
+        let excess = |k: GridIndex| self.excess_at_least(n(k)?, excess_threshold);
+        let excess_start = if excess(first)? {
+            first
+        } else {
+            first_true(first, best, &excess)?
+        };
+        let excess_end = if excess(last)? {
+            last
+        } else {
+            last_true(best, last, &excess)?
+        };
+        let start = excess_start.max(cash_span.0);
+        let end = excess_end.min(cash_span.1);
+        Some(if start <= end {
+            Counts::Range((start, end))
+        } else {
+            Counts::Empty
+        })
+    }
+}
+
+/// The first index in `[low, high]` where `holds` is true, given that it is
+/// false at `low` and true at `high` and switches once.
+fn first_true(
+    mut low: GridIndex,
+    mut high: GridIndex,
+    holds: &dyn Fn(GridIndex) -> Option<bool>,
+) -> Option<GridIndex> {
+    while !ContractGrid::adjacent(low, high) {
+        let middle = ContractGrid::midpoint(low, high);
+        if holds(middle)? {
+            high = middle;
+        } else {
+            low = middle;
+        }
+    }
+    Some(high)
+}
+
+/// The last index in `[low, high]` where `holds` is true, given that it is
+/// true at `low` and false at `high` and switches once.
+fn last_true(
+    mut low: GridIndex,
+    mut high: GridIndex,
+    holds: &dyn Fn(GridIndex) -> Option<bool>,
+) -> Option<GridIndex> {
+    while !ContractGrid::adjacent(low, high) {
+        let middle = ContractGrid::midpoint(low, high);
+        if holds(middle)? {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    Some(low)
+}
+
+/// The evaluation of a count, or `None` when the count leaves a position
+/// that cannot be represented (it cannot be booked either).
+fn bookable<T>(evaluation: Result<T>) -> Result<Option<T>> {
+    match evaluation {
+        Ok(value) => Ok(Some(value)),
+        Err(MarginError::Arithmetic {
+            operation: "Qc - n" | "Qc + n",
+        }) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// The first count of a certified span whose position can be booked: every
+/// count of the span meets the target once it is representable.
+fn first_bookable<T>(
+    grid: &ContractGrid,
+    (start, end): Span,
+    at: &dyn Fn(GridIndex) -> Result<T>,
+) -> Result<T> {
+    let mut k = start;
+    loop {
+        if let Some(value) = bookable(at(k))? {
+            return Ok(value);
+        }
+        match grid.next(k) {
+            Some(next) if next <= end => k = next,
+            _ => return Err(MarginError::arithmetic("Qc - n")),
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod tests {
+    use super::*;
+    use crate::initial_margin::ProductKind;
+    use crate::rules::{MarginTier, TieredLinearIm};
+    use rust_decimal_macros::dec;
+
+    fn iid(id: &str) -> InstrumentId {
+        InstrumentId::new(id).unwrap()
+    }
+
+    /// One tier, initial 10 %, cash in whole units (a coarse quantum).
+    fn coarse_rule() -> TieredLinearIm {
+        TieredLinearIm::new(
+            RuleId::new("coarse", 1),
+            Asset::new("USD").unwrap(),
+            0,
+            vec![MarginTier {
+                floor: dec!(0),
+                initial_rate: dec!(0.10),
+                maintenance_rate: dec!(0.05),
+            }],
+        )
+        .unwrap()
+    }
+
+    /// Long `contracts` (M = 1) with `basis`, marked at 0.97, and `cash`.
+    fn account(contracts: Decimal, basis: Decimal, cash: Decimal) -> LiquidationAccount {
+        LiquidationAccount {
+            view: ExposureView {
+                account: AccountId::new("acct").unwrap(),
+                venue: VenueId::new("venue").unwrap(),
+                positions: vec![ExposurePosition {
+                    instrument: iid("A"),
+                    product: ProductKind::LinearPerpetual,
+                    settlement: Asset::new("USD").unwrap(),
+                    contracts,
+                    size: ContractSize::Multiplier(dec!(1)),
+                    mark: dec!(0.97),
+                }],
+            },
+            basis: BTreeMap::from([(iid("A"), basis)]),
+            cash,
+            resting_orders: vec![],
+        }
+    }
+
+    fn bid(price: Decimal) -> BTreeMap<InstrumentId, Vec<LiquidityLevel>> {
+        BTreeMap::from([(
+            iid("A"),
+            vec![LiquidityLevel {
+                price,
+                contracts: dec!(100),
+            }],
+        )])
+    }
+
+    fn initial() -> LiquidationPolicy {
+        LiquidationPolicy {
+            target: CloseoutTarget::Initial,
+            fee_rate: dec!(0),
+            contract_step: dec!(1),
+        }
+    }
+
+    /// The unrounded cash and excess of `account` after closing `n` of
+    /// its position at `price`, as signs against `2q` and `3q`: whether
+    /// the count is certified to meet the target.
+    fn certified(account: &LiquidationAccount, price: Decimal, n: Decimal) -> bool {
+        let model = coarse_rule();
+        let policy = initial();
+        let planner = Planner {
+            model: &model,
+            policy: &policy,
+            account,
+            scale: 0,
+            budget: Cell::new(0),
+            limit: 0,
+            minimal: Cell::new(true),
+        };
+        let state = State {
+            cash: account.cash,
+            positions: vec![Open {
+                exposure: account.view.positions[0].clone(),
+                basis: account.basis[&iid("A")],
+            }],
+        };
+        let continuous = planner.continuous(&state, 0, price).unwrap();
+        continuous.cash_at_least(n, dec!(2)).unwrap()
+            && continuous.excess_at_least(n, dec!(3)).unwrap()
+    }
+
+    /// The same 40 long with a step of 0.002215: the smallest count is
+    /// found with exactly 4096 evaluations, the whole budget; with 4095 the
+    /// plan falls back. With a step of 0.0022146 it needs 4097, so
+    /// `plan_liquidation` falls back to the first certified count, which
+    /// meets the target; the count one step before it is not certified:
+    /// unrounded, its cash is below 2q or its excess below 3q (a bound in
+    /// money, not in contracts).
+    #[test]
+    fn the_budget_boundary_is_exact() {
+        let account = account(dec!(40), dec!(45), dec!(9));
+        let with = |step| LiquidationPolicy {
+            contract_step: step,
+            ..initial()
+        };
+        let model = coarse_rule();
+        let exact =
+            plan_liquidation(&model, &account, &bid(dec!(0.99)), &with(dec!(0.002215))).unwrap();
+        assert_eq!(SEARCH_BUDGET, 4096);
+        assert!(exact.minimal);
+        let short = plan_with_budget(
+            &model,
+            &account,
+            &bid(dec!(0.99)),
+            &with(dec!(0.002215)),
+            4095,
+        )
+        .unwrap();
+        assert!(!short.minimal);
+
+        let step = dec!(0.0022146);
+        let fallback = plan_liquidation(&model, &account, &bid(dec!(0.99)), &with(step)).unwrap();
+        assert!(!fallback.minimal);
+        assert_eq!(fallback.outcome, CloseoutOutcome::TargetMet);
+        assert!(fallback.after.cash >= dec!(0));
+        assert!(fallback.after.collateral >= fallback.after.initial);
+        let taken = fallback.reductions[0].contracts;
+        assert!(certified(&account, dec!(0.99), taken));
+        assert!(!certified(&account, dec!(0.99), taken - step));
+        let enough =
+            plan_with_budget(&model, &account, &bid(dec!(0.99)), &with(step), 4097).unwrap();
+        assert!(enough.minimal);
+        assert!(enough.reductions[0].contracts < taken);
+    }
+
+    /// 40 long, basis 45, cash 9, sold at 0.99, whole units. The counts
+    /// that may meet the target start at 1 and the first certified one is
+    /// 35; the smallest that meets it is 10, found with 10 evaluations.
+    /// With 9 the budget runs out and the plan takes 35, which meets the
+    /// target, with `minimal == false`.
+    #[test]
+    fn the_budget_falls_back_to_the_first_certified_count() {
+        let account = account(dec!(40), dec!(45), dec!(9));
+        let full =
+            plan_with_budget(&coarse_rule(), &account, &bid(dec!(0.99)), &initial(), 10).unwrap();
+        assert!(full.minimal);
+        assert_eq!(full.reductions[0].contracts, dec!(10));
+        let short =
+            plan_with_budget(&coarse_rule(), &account, &bid(dec!(0.99)), &initial(), 9).unwrap();
+        assert!(!short.minimal);
+        assert_eq!(short.reductions[0].contracts, dec!(35));
+        assert_eq!(short.outcome, CloseoutOutcome::TargetMet);
+        assert!(short.after.cash >= dec!(0));
+        assert!(short.after.collateral >= short.after.initial);
+    }
+
+    /// 13 long, basis 15, cash 3, sold at 0.91, whole units: only rounding
+    /// lets 3, 4 and 5 contracts meet the target (no count is certified).
+    /// Three evaluations find 3; with two the budget runs out and, with no
+    /// certified count, the plan is refused.
+    #[test]
+    fn without_a_certified_count_the_budget_is_an_error() {
+        let account = account(dec!(13), dec!(15), dec!(3));
+        let found =
+            plan_with_budget(&coarse_rule(), &account, &bid(dec!(0.91)), &initial(), 3).unwrap();
+        assert!(found.minimal);
+        assert_eq!(found.reductions[0].contracts, dec!(3));
+        assert_eq!(
+            plan_with_budget(&coarse_rule(), &account, &bid(dec!(0.91)), &initial(), 2),
+            Err(MarginError::CloseoutSearchLimit {
+                instrument: iid("A"),
+                level: 0,
+                limit: 2,
+            })
+        );
+    }
 }
