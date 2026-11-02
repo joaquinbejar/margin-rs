@@ -1,0 +1,44 @@
+[package]
+name = "margin-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Joaquin Bejar <jb@taunais.com>"]
+description = "Risk and margin engine: accounting, pretrade risk and margin for market making"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/joaquinbejar/margin-rs"
+homepage = "https://github.com/joaquinbejar/margin-rs"
+keywords = ["finance", "margin", "risk", "trading"]
+categories = ["finance"]
+# Not published: releases need their own scope (MAR-00 release_policy).
+publish = false
+include = [
+    "src/**/*",
+    "tests/**/*.rs",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+    "Makefile",
+    "rust-toolchain.toml",
+]
+
+[lib]
+name = "margin_rs"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = "2.0"
+
+[dev-dependencies]
+
+[features]
+default = []
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+
+[lints.clippy]
+# Money, prices and quantities use exact decimal arithmetic; no binary floats.
+float_arithmetic = "deny"
