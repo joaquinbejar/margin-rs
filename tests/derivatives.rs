@@ -50,7 +50,8 @@ fn terms(
 /// - Q-PERP: perpetual in USD, multiplier 1, price scale 3, whole contracts;
 /// - BTC-DEC: future in USD expiring at 1000, multiplier 1, price and
 ///   contract scale 2;
-/// - BIG-PERP: perpetual in BIG, multiplier 1, scales 0.
+/// - BIG-PERP: perpetual in BIG, multiplier 1, scales 0;
+/// - BIG-FUT: future in BIG expiring at 1000, multiplier 1, scales 0.
 fn ledger() -> Ledger {
     let mut ledger = Ledger::new(LedgerConfig {
         // Derivatives ignore it: they are always half-even.
@@ -84,6 +85,12 @@ fn ledger() -> Ledger {
             0,
             0,
         )))
+        .unwrap();
+    ledger
+        .register_instrument(LinearFuture::new(
+            terms("BIG-FUT", "BIG", dec!(1), 0, 0),
+            1000,
+        ))
         .unwrap();
     ledger
 }
@@ -474,10 +481,12 @@ fn a_future_settles_once_at_expiry() {
     let booked = book(&mut ledger, &late);
     let flow = booked.cashflow();
     assert_eq!(flow.realized_pnl, dec!(1.5));
-    assert_eq!(
-        flow.derivative.as_ref().unwrap().closed_at_settlement,
-        Some(dec!(52.5))
-    );
+    let fill = flow.derivative.as_ref().unwrap();
+    assert_eq!(fill.closed_at_settlement, Some(dec!(52.5)));
+    // The fill at 51 and its close at the settlement price 52.50.
+    assert_eq!(fill.virtual_notional, Some(dec!(51)));
+    assert_eq!(fill.closing_notional, Some(dec!(52.5)));
+    assert_eq!(fill.released_basis, dec!(0));
     assert_eq!(flow.deltas[&asset("USD")], dec!(1.45));
     let position = ledger.position(&future).unwrap();
     assert_eq!((position.quantity, position.cost_basis), (dec!(0), dec!(0)));
@@ -710,4 +719,45 @@ fn a_future_fill_needs_a_time_before_the_expiry() {
     ));
     assert_eq!(ledger.snapshot(), settled);
     ledger.reconcile().unwrap();
+}
+
+#[test]
+fn a_late_fill_at_decimal_max_keeps_its_close_wide() {
+    // BIG-FUT settled flat at MAX; a late buy of 2 at MAX executed at 999:
+    // the provisional basis 2 * MAX never fits, but the realized PnL
+    // rhe(MAX * 2) - rhe(MAX * 2) = 0 does. The mirror sell, too.
+    let max = Decimal::MAX;
+    for side in [Action::Buy, Action::Sell] {
+        let mut ledger = ledger();
+        ledger
+            .settle_expiry(&ExpirySettlement {
+                id: eid("s1"),
+                instrument: iid("BIG-FUT"),
+                price: max,
+                as_of_ms: 1000,
+            })
+            .unwrap();
+        let late =
+            Execution::new(eid("e1"), iid("BIG-FUT"), side, max, dec!(2)).with_executed_at(999);
+        let booked = book(&mut ledger, &late);
+        let flow = booked.cashflow();
+        assert_eq!(flow.realized_pnl, dec!(0));
+        let fill = flow.derivative.as_ref().unwrap();
+        assert_eq!(fill.virtual_notional, None);
+        assert_eq!(fill.closing_notional, None);
+        assert_eq!(fill.released_basis, dec!(0));
+        assert_eq!(fill.closed_at_settlement, Some(max));
+        let position = ledger.position(&iid("BIG-FUT")).unwrap();
+        assert_eq!(
+            (
+                position.quantity,
+                position.cost_basis,
+                position.realized_pnl
+            ),
+            (dec!(0), dec!(0), dec!(0))
+        );
+        assert_eq!(ledger.balance(&asset("BIG")).unwrap().total, dec!(0));
+        assert!(!book(&mut ledger, &late).is_new());
+        ledger.reconcile().unwrap();
+    }
 }

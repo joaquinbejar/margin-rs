@@ -51,7 +51,9 @@ pub struct DerivativeFill {
     pub released_basis: Decimal,
     /// Set for a late fill on a future already settled at expiry: the
     /// settlement price at which the fill was closed at once. The position
-    /// stays flat and the realized PnL is the fill against that price.
+    /// stays flat and the realized PnL is the fill against that price:
+    /// `closing_notional` is then `rhe(settlement price * n * M)` and
+    /// `released_basis` is zero (the provisional basis is never stored).
     pub closed_at_settlement: Option<Decimal>,
 }
 
@@ -265,6 +267,66 @@ pub(crate) fn apply_derivative_fill(
             closing_notional: closing.to_decimal(scale),
             released_basis: basis,
             closed_at_settlement: None,
+        },
+    })
+}
+
+/// A late fill of `contracts` at `price` on a flat, settled future, closed
+/// at once at `settlement_price`: realized `= rhe(P * n * M) - rhe(p * n *
+/// M)` for a buy and the opposite for a sell, computed in wide integers so
+/// that only the realized PnL must fit a `Decimal`. The position stays flat.
+///
+/// # Errors
+///
+/// [`MarginError::InvalidInput`](crate::error::MarginError::InvalidInput)
+/// if the position is not flat (a settled future always is), or an
+/// arithmetic error if the realized PnL does not fit.
+pub(crate) fn close_late_fill(
+    position: Position,
+    dir: Dir,
+    price: Decimal,
+    contracts: Decimal,
+    multiplier: Decimal,
+    (settlement_price, scale): (Decimal, u32),
+) -> Result<FillEffect> {
+    if !position.quantity.is_zero() {
+        return Err(crate::error::MarginError::invalid_input(
+            "position",
+            "a settled future has no open position",
+        ));
+    }
+    let traded = mul_div_round_wide(
+        &[price, contracts, multiplier],
+        &[],
+        scale,
+        DERIVATIVE_ROUNDING,
+        "price * contracts * multiplier",
+    )?;
+    let settled = mul_div_round_wide(
+        &[settlement_price, contracts, multiplier],
+        &[],
+        scale,
+        DERIVATIVE_ROUNDING,
+        "settlement price * contracts * multiplier",
+    )?;
+    let realized_w = match dir {
+        Dir::Buy => add_wide(settled, traded.negated(), "realized pnl")?,
+        Dir::Sell => add_wide(traded, settled.negated(), "realized pnl")?,
+    };
+    let realized = wide_to_decimal(realized_w, scale, "realized pnl")?;
+    Ok(FillEffect {
+        position: Position {
+            quantity: position.quantity,
+            cost_basis: position.cost_basis,
+            realized_pnl: add(position.realized_pnl, realized, "realized pnl")?,
+        },
+        realized,
+        fill: DerivativeFill {
+            multiplier,
+            virtual_notional: traded.to_decimal(scale),
+            closing_notional: settled.to_decimal(scale),
+            released_basis: Decimal::ZERO,
+            closed_at_settlement: Some(settlement_price),
         },
     })
 }

@@ -993,32 +993,24 @@ impl Ledger {
             .get(&execution.instrument)
             .copied()
             .unwrap_or_default();
-        let mut effect = derivative::apply_derivative_fill(
-            position,
-            dir,
-            execution.price,
-            execution.quantity,
-            terms.multiplier(),
-            scale,
-        )?;
-        if let Some(price) = settlement_price {
-            let opposite = match dir {
-                Dir::Buy => Dir::Sell,
-                Dir::Sell => Dir::Buy,
-            };
-            let close = derivative::apply_derivative_fill(
-                effect.position,
-                opposite,
-                price,
+        let effect = match settlement_price {
+            None => derivative::apply_derivative_fill(
+                position,
+                dir,
+                execution.price,
                 execution.quantity,
                 terms.multiplier(),
                 scale,
-            )?;
-            effect.realized = add(effect.realized, close.realized, "realized pnl")?;
-            effect.position = close.position;
-            effect.fill.released_basis = close.fill.released_basis;
-            effect.fill.closed_at_settlement = Some(price);
-        }
+            )?,
+            Some(price) => derivative::close_late_fill(
+                position,
+                dir,
+                execution.price,
+                execution.quantity,
+                terms.multiplier(),
+                (price, scale),
+            )?,
+        };
 
         // Only the realized PnL and the fee move cash.
         let mut changes: BTreeMap<Asset, Vec<Decimal>> = BTreeMap::new();
