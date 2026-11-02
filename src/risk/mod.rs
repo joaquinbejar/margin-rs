@@ -375,6 +375,39 @@ impl RiskGate {
         self.ledger.withdraw(id, asset, amount)
     }
 
+    /// Sets an external hold: a named ledger reservation of exactly
+    /// `amount` of `asset`, replacing any previous amount under `id`
+    /// (zero removes it). Used to make capital committed elsewhere, such as
+    /// derivative margin
+    /// ([`MarginReservationService`](crate::margin_reservations::MarginReservationService)),
+    /// unavailable to spot orders. Atomic ([`Ledger::set_reservation`]): on
+    /// error the previous hold is kept, and shrinking a hold always
+    /// succeeds, even on an overdrawn balance.
+    ///
+    /// # Errors
+    ///
+    /// [`MarginError::InvalidInput`] if `id` is also an order id of this
+    /// gate; [`MarginError::InsufficientBalance`] if an increase is not
+    /// covered by the available balance plus the previous hold; the
+    /// ledger's input errors.
+    pub fn set_hold(&mut self, id: &ReservationId, asset: Asset, amount: Decimal) -> Result<()> {
+        if OrderId::new(id.as_str()).is_ok_and(|order| self.orders.contains_key(&order)) {
+            return Err(MarginError::invalid_input(
+                "hold",
+                "the id belongs to an order",
+            ));
+        }
+        self.ledger.set_reservation(id, asset, amount)
+    }
+
+    /// Amount of an external hold set with [`RiskGate::set_hold`].
+    #[must_use]
+    pub fn hold(&self, id: &ReservationId) -> Decimal {
+        self.ledger
+            .reservation(id)
+            .map_or(Decimal::ZERO, |(_, amount)| amount)
+    }
+
     /// Sets the limits of a registered instrument.
     ///
     /// # Errors
