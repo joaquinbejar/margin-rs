@@ -74,7 +74,7 @@ An open derivative position is valued at its **instrument mark**, `MarkSet::inst
 
 Inverse futures and perpetuals are valued but not stressed yet: an open inverse position, a shock on one or a hypothetical fill on one is `UnsupportedInstrument`, never skipped.
 
-Each stressed price, `price * (1 + shock) * (1 ± spread)`, is one exact product converted once, so only the stressed price must be representable. The instrument marks are final before the asset factors are chosen, and the derivative values that choose them are the ones the stressed valuation reports, so the order has no cycle.
+Each stressed price, `price * (1 + shock) * (1 ± spread)`, is one exact value, `price * side + price * shock * side` summed in wide integers and converted once, so only the stressed price must be representable: not `1 + shock` (a shock of `Decimal::MAX` with a spread of 0.5 gives `2^95`) nor a partial product. The instrument marks are final before the asset factors are chosen, and the derivative values that choose them are the ones the stressed valuation reports, so the order has no cycle.
 
 All parameters are validated before anything is computed:
 

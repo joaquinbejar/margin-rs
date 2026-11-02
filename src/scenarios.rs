@@ -46,7 +46,9 @@
 //! [`MarginError::UnsupportedInstrument`].
 //!
 //! Every stressed price, `price * (1 + shock) * (1 +- spread)`, is one exact
-//! product converted once: only the stressed price must be representable.
+//! value, `price * side + price * shock * side`, converted once: only the
+//! stressed price must be representable, not `1 + shock` nor a partial
+//! product.
 //! Shocks are applied exactly and must be greater than -1. The stressed
 //! instrument marks are final before the asset factors are chosen, so the
 //! order has no cycle: the derivative values that choose them are the ones
@@ -77,7 +79,9 @@ use rust_decimal::Decimal;
 
 use core::cmp::Ordering;
 
-use crate::decimal::{Rounding, add, check_scale, mul_div_round, neg, product, sub, sum, sum_sign};
+use crate::decimal::{
+    Rounding, add, check_scale, mul_div_round, neg, product, sub, sum, sum_products, sum_sign,
+};
 use crate::direction::Dir;
 use crate::error::{MarginError, Result};
 use crate::ids::{Asset, InstrumentId};
@@ -272,18 +276,17 @@ pub fn stress(
         let Some(contracts) = open.get(id) else {
             continue;
         };
-        let mut factors = vec![mark.price];
-        if let Some(shock) = scenario.instrument_shocks.get(id) {
-            factors.push(add(Decimal::ONE, *shock, "1 + shock")?);
-        }
-        if !spread.is_zero() {
-            factors.push(if contracts.is_sign_positive() {
-                sell
-            } else {
-                buy_back
-            });
-        }
-        mark.price = product(&factors, "stressed instrument mark")?;
+        let side = (!spread.is_zero()).then_some(if contracts.is_sign_positive() {
+            sell
+        } else {
+            buy_back
+        });
+        mark.price = stressed_price(
+            mark.price,
+            scenario.instrument_shocks.get(id).copied(),
+            side,
+            "stressed instrument mark",
+        )?;
     }
 
     let spread_sign_conflicts = stress_asset_prices(
@@ -405,10 +408,7 @@ fn stress_asset_prices(
     };
     let mut spread_sign_conflicts = Vec::new();
     for (asset, mark) in &mut stressed_marks.prices {
-        let mut factors = vec![mark.price];
-        if let Some(shock) = scenario.shocks.get(asset) {
-            factors.push(add(Decimal::ONE, *shock, "1 + shock")?);
-        }
+        let mut side = None;
         if !spread.is_zero() {
             let cash = stressed_snapshot
                 .balances
@@ -431,15 +431,41 @@ fn stress_asset_prices(
             if counted_sign.is_some_and(|sign| sign != full_sign) {
                 spread_sign_conflicts.push(asset.clone());
             }
-            match counted_sign.unwrap_or(full_sign) {
-                Ordering::Greater => factors.push(sell),
-                Ordering::Less => factors.push(buy_back),
-                Ordering::Equal => {}
-            }
+            side = match counted_sign.unwrap_or(full_sign) {
+                Ordering::Greater => Some(sell),
+                Ordering::Less => Some(buy_back),
+                Ordering::Equal => None,
+            };
         }
-        mark.price = product(&factors, "stressed price")?;
+        mark.price = stressed_price(
+            mark.price,
+            scenario.shocks.get(asset).copied(),
+            side,
+            "stressed price",
+        )?;
     }
     Ok(spread_sign_conflicts)
+}
+
+/// `price * (1 + shock) * side` as one exact value converted once:
+/// `price * side + price * shock * side`, so neither `1 + shock` nor a
+/// partial product needs to be representable.
+fn stressed_price(
+    price: Decimal,
+    shock: Option<Decimal>,
+    side: Option<Decimal>,
+    operation: &'static str,
+) -> Result<Decimal> {
+    let mut unshocked = vec![price];
+    unshocked.extend(side);
+    match shock {
+        None => product(&unshocked, operation),
+        Some(shock) => {
+            let mut shocked = unshocked.clone();
+            shocked.push(shock);
+            sum_products(&[&unshocked, &shocked], operation)
+        }
+    }
 }
 
 /// Inverse futures and perpetuals are not stressed yet.

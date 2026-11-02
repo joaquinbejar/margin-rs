@@ -689,3 +689,69 @@ fn test_stress_inverse_positions_shocks_and_fills_are_unsupported() {
     );
     assert!(unsupported(&ledger, Scenario::new("open")));
 }
+
+/// `1 + Decimal::MAX` = 2^96 does not fit, but `mark * (1 + MAX) * side`
+/// does: 2^95 at 1 with a 0.5 bid side, 3 * 2^94 at 0.5 with a 1.5 ask
+/// side.
+const TWO_POW_95: Decimal = dec!(39614081257132168796771975168);
+const THREE_TWO_POW_94: Decimal = dec!(59421121885698253195157962752);
+
+#[test]
+fn test_stress_instrument_shock_beyond_the_decimal_range_is_one_exact_value() {
+    // Long 1 PERP-S at 1 (basis 1) marked at 1: closed at the bid side,
+    // (1 + MAX) * 0.5 = 2^95, upnl 2^95 - 1.
+    let mut ledger = ledger();
+    trade(
+        &mut ledger,
+        "e1",
+        "PERP-S",
+        Action::Buy,
+        (dec!(1), dec!(1)),
+        None,
+    );
+    let marks = marks().with_instrument(iid("PERP-S"), mark(dec!(1), 9_500));
+    let scenario = Scenario::new("max")
+        .instrument_shock(iid("PERP-S"), Decimal::MAX)
+        .spread(dec!(0.5));
+    let r = run(&ledger, &marks, &scenario);
+    let long = &r.stressed.derivatives[&iid("PERP-S")];
+    assert_eq!(long.mark.price, TWO_POW_95);
+    assert_eq!(long.unrealized_pnl, TWO_POW_95 - dec!(1));
+    assert_eq!(r.equity_change, Some(TWO_POW_95 - dec!(1)));
+}
+
+#[test]
+fn test_stress_asset_shock_beyond_the_decimal_range_is_one_exact_value() {
+    // 1 USDT held at a price of 1, shock MAX, spread 0.5: sold at 2^95.
+    let mut ledger = ledger();
+    deposit(&mut ledger, "d1", "USDT", dec!(1));
+    let scenario = Scenario::new("max")
+        .shock(asset("USDT"), Decimal::MAX)
+        .spread(dec!(0.5));
+    let r = run(&ledger, &marks(), &scenario);
+    assert_eq!(
+        r.stressed.assets[&asset("USDT")].mark.unwrap().price,
+        TWO_POW_95
+    );
+    assert_eq!(r.stressed.equity, Some(TWO_POW_95));
+}
+
+#[test]
+fn test_stress_debt_shock_beyond_the_decimal_range_is_one_exact_value() {
+    // A hypothetical spot sell of 1 BTC at 1 USD leaves a 1 BTC debt and
+    // 1 USD. BTC at 0.5, shock MAX, spread 0.5: the debt is bought back at
+    // 0.5 * (1 + MAX) * 1.5 = 3 * 2^94; equity 1 - 3 * 2^94.
+    let ledger = ledger();
+    let marks = marks().with(asset("BTC"), mark(dec!(0.5), 9_900));
+    let scenario = Scenario::new("max")
+        .fill(fill("BTC-USD", Action::Sell, dec!(1), dec!(1)))
+        .shock(asset("BTC"), Decimal::MAX)
+        .spread(dec!(0.5));
+    let r = run(&ledger, &marks, &scenario);
+    assert_eq!(r.stressed.assets[&asset("BTC")].total, dec!(-1));
+    assert_eq!(
+        r.stressed.assets[&asset("BTC")].mark.unwrap().price,
+        THREE_TWO_POW_94
+    );
+    assert_eq!(r.stressed.equity, Some(dec!(1) - THREE_TWO_POW_94));
+}
