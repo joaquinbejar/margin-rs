@@ -59,8 +59,8 @@ impl ValidatedCovariance {
     /// [`MarginError::InvalidCovariance`] if there are no factors or more
     /// than two, factor identifiers repeat, the matrix is not square with
     /// one row per factor, it is not exactly symmetric, or it is not
-    /// positive semidefinite. [`MarginError::Arithmetic`] if the
-    /// determinant cannot be computed exactly.
+    /// positive semidefinite, or if its determinant cannot be evaluated.
+    /// Validation never fails with another error.
     pub fn new(factors: Vec<Factor>, matrix: Vec<Vec<Decimal>>) -> Result<Self> {
         let invalid = |reason| Err(MarginError::InvalidCovariance { reason });
         let n = factors.len();
@@ -96,7 +96,10 @@ impl ValidatedCovariance {
                 &[matrix[0][0], matrix[1][1]],
                 &[matrix[0][1], matrix[1][0]],
                 "determinant",
-            )?;
+            )
+            .map_err(|_| MarginError::InvalidCovariance {
+                reason: "the determinant cannot be evaluated",
+            })?;
             if order == core::cmp::Ordering::Less {
                 return invalid("the matrix must be positive semidefinite");
             }
@@ -111,7 +114,8 @@ impl ValidatedCovariance {
     ///
     /// [`MarginError::InvalidCovariance`] if a deviation is negative, a
     /// correlation is outside `[-1, 1]`, the diagonal of the correlation
-    /// matrix is not 1, or the result fails [`ValidatedCovariance::new`].
+    /// matrix is not 1, a covariance cannot be represented, or the result
+    /// fails [`ValidatedCovariance::new`].
     pub fn from_correlation(
         factors: Vec<Factor>,
         deviations: Vec<Decimal>,
@@ -144,7 +148,10 @@ impl ValidatedCovariance {
                 matrix[i][j] = product(
                     &[correlation[i][j], deviations[i], deviations[j]],
                     "rho * sigma_i * sigma_j",
-                )?;
+                )
+                .map_err(|_| MarginError::InvalidCovariance {
+                    reason: "a covariance rho * sigma_i * sigma_j cannot be represented",
+                })?;
             }
         }
         Self::new(factors, matrix)

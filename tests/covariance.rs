@@ -331,3 +331,19 @@ fn netting_is_exact_in_any_order() {
         assert_eq!(result.variance, dec!(0.01));
     }
 }
+
+/// n2: arithmetic failures while building or validating a matrix are
+/// reported as InvalidCovariance. sigma 1e15 squared is 1e30 > MAX.
+#[test]
+fn unrepresentable_covariance_is_invalid() {
+    assert_eq!(
+        ValidatedCovariance::from_correlation(
+            vec![price("A")],
+            vec![dec!(1000000000000000)],
+            vec![vec![dec!(1)]],
+        ),
+        Err(MarginError::InvalidCovariance {
+            reason: "a covariance rho * sigma_i * sigma_j cannot be represented",
+        })
+    );
+}
