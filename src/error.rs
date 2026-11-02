@@ -137,6 +137,21 @@ pub enum MarginError {
         reason: &'static str,
     },
 
+    /// A fill of a future executed at or after its expiry: causally
+    /// impossible, so it is refused with no effect. A fill executed before
+    /// the expiry is always booked, even after the settlement.
+    #[error(
+        "execution on {instrument} at {executed_at_ms} ms is not before its expiry at {expiry_ms} ms"
+    )]
+    ExecutedAfterExpiry {
+        /// Future instrument.
+        instrument: InstrumentId,
+        /// When the fill was executed.
+        executed_at_ms: u64,
+        /// The future's expiry.
+        expiry_ms: u64,
+    },
+
     /// The margin rule does not cover this instrument.
     #[error("rule {rule} does not support {instrument}: {reason}")]
     UnsupportedInstrument {

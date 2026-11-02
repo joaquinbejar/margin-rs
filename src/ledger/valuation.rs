@@ -17,7 +17,9 @@ pub struct PositionValuation {
     pub quantity: Decimal,
     /// Mark price used, or `None` for a flat position (no mark needed).
     pub mark: Option<Decimal>,
-    /// `round(quantity * mark)`; zero when flat.
+    /// `round(quantity * mark)` for spot, `rhe(quantity * multiplier *
+    /// mark)` for a linear future or perpetual (always half-even); zero when
+    /// flat.
     pub market_value: Decimal,
     /// Signed cost attributed to the open quantity.
     pub cost_basis: Decimal,
@@ -47,7 +49,9 @@ pub struct AssetPnl {
 /// # Valuation policy
 ///
 /// - An open position is valued at a caller supplied mark price:
-///   `market_value = round(quantity * mark)` to the quote asset scale, and
+///   `market_value = round(quantity * mark)` to the quote asset scale (for a
+///   linear future or perpetual, `rhe(contracts * multiplier * mark)` to the
+///   settlement asset scale, half-even whatever the configured rounding), and
 ///   `unrealized_pnl = market_value - cost_basis`. For a short both terms are
 ///   negative, so a falling mark yields a positive unrealized PnL.
 /// - Realized PnL is gross of fees. Fees are reported separately, per asset.

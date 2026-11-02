@@ -345,9 +345,11 @@ fn total_is_exact_whatever_the_order() {
             positions: BTreeMap::new(),
             fees_paid: BTreeMap::new(),
             settled_pnl: BTreeMap::new(),
+            funding: BTreeMap::new(),
             reservations: BTreeMap::new(),
             executions_booked: 0,
             settlements_booked: 0,
+            settled_instruments: Vec::new(),
         }
     };
     let names = ["AAA", "BBB", "CCC"];

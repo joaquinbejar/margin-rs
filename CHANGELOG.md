@@ -6,7 +6,63 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Linear futures and perpetuals in the ledger** (#23, part A):
+  `LinearTerms`, `LinearFuture`, `LinearPerpetual` and the
+  `Instrument::LinearFuture` / `Instrument::LinearPerpetual` variants. A
+  position is signed contracts with a signed basis in the settlement asset;
+  only realized PnL and fees move cash. Every figure is rounded half-even to
+  the settlement asset scale (`LedgerConfig::rounding` applies to spot only),
+  and the virtual notionals stay in wide integers, so only stored results
+  must fit a `Decimal`. See `docs/ledger.md`.
+- `Ledger::book_funding` (`FundingPayment`, `FundingCashflow`, positive is
+  received) and `Ledger::settle_expiry` (`ExpirySettlement`,
+  `ExpiryCashflow`), mandatory and idempotent in the id space shared with
+  executions and settlements; `PostingBooking`, `Ledger::funding`,
+  `Ledger::funding_journal`, `Ledger::expiry_journal` and
+  `Ledger::is_settled`. A real fill executed before a future's expiry but
+  delivered after its settlement is still booked, never rejected: it is
+  closed at once at the settlement price and flagged in
+  `DerivativeFill::closed_at_settlement`. A fill executed at or after the
+  expiry is causally impossible: `MarginError::ExecutedAfterExpiry`.
+- `ExecutionCashflow::derivative` (`DerivativeFill`: multiplier, virtual
+  and closing notionals, released basis, settlement price of a late fill),
+  `PositionKind`, and
+  `Instrument::{kind, multiplier, linear_terms}`.
+- `reconcile()` checks funding per asset and, per derivative, the contracts
+  and the virtual identity `sum of signed virtual notionals = realized_pnl -
+  basis` in wide integers.
+
 ### Changed
+
+- **Breaking:** `Execution` has the new field `executed_at_ms` (and
+  `Execution::with_executed_at`); it is part of the execution, so a repeat
+  must carry the same time. It is optional for spot and required for a
+  linear future or perpetual; a future's fills must be executed strictly
+  before its expiry.
+- **Breaking:** an execution of a linear future or perpetual is mandatory:
+  `book_execution` and `book_execution_with_reservation` refuse it with
+  `InvalidInput` and no effect, and `book_execution_allowing_overdraft`
+  books it (never rejected for balance) and returns the shortfall.
+- **Breaking:** `ExecutionCashflow` has the new field `derivative`. For a
+  derivative, `notional` is zero (no principal is exchanged) and
+  `notional_exact` and `rounding_residual` are `None`: its cash is in
+  `deltas` and its virtual notional in `derivative.virtual_notional`
+  (`None` only when out of a `Decimal`'s range). A consumer that adds
+  notionals as volume must read the virtual notional for derivatives.
+- **Breaking:** `PositionSnapshot` has the new fields `kind` and
+  `multiplier` (1 for spot), and `average_price()` is `cost_basis /
+  (quantity * multiplier)`: the price per unit of the underlying for a
+  derivative. `LedgerSnapshot` has the new fields `funding` and
+  `settled_instruments`. Code that builds these structs must set them.
+- `valuation::value` and the stress scenarios refuse an open derivative
+  position with `UnsupportedInstrument` (its unrealized PnL needs
+  instrument marks, part B); flat ones, their realized PnL and funding are
+  valued. The risk gate refuses derivatives with `UnsupportedInstrument` in
+  `set_limits`, `on_market_data` and `submit` (as `RiskReason::InvalidOrder`).
+- `book_settlement` is kept for derivatives that are not registered in the
+  ledger (legacy; documented, not deprecated in code).
 
 - **Breaking:** the order and execution direction is `financial_types::Action`
   (0.3), shared with the other crates of the stack, re-exported as

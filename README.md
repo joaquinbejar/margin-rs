@@ -42,13 +42,16 @@ rounding, and no partial sum that can overflow while the result does not.
 - **Single ledger** per account: balances per asset split into reserved and
   available, positions with signed average cost and realized PnL, fees per
   asset (rebates as negative fees).
+- **Linear futures and perpetuals in the ledger**: signed contracts with a
+  basis, realized PnL in cash on reductions, mark to market, funding and
+  expiry settlement, always with half-even rounding.
 - **Idempotent booking** by execution and transfer id; reusing an id for
   different content is an error. Every operation is atomic.
 - **Cashflow per execution** and a full **reconciliation** of the state from
   the journal.
-- **Mandatory postings** that are never lost: a real execution or a
-  derivative settlement that overdraws the account is booked and the
-  shortfall is reported.
+- **Mandatory postings** that are never lost: a real execution, a funding
+  payment, an expiry or a derivative settlement that overdraws the account
+  is booked and the shortfall is reported.
 
 ### Pretrade risk
 - **Risk gate** that owns the ledger: reservations for every order, sized so
@@ -90,7 +93,7 @@ rounding, and no partial sum that can overflow while the result does not.
 
 | Module | Purpose |
 |---|---|
-| `ledger` | `Ledger`: balances, positions, fees, idempotent booking, cashflows, snapshots, reconciliation, valuation by asset, derivative settlements. |
+| `ledger` | `Ledger`: balances, spot and derivative positions, fees, idempotent booking, funding, expiry, cashflows, snapshots, reconciliation, valuation by asset, legacy derivative settlements. |
 | `risk` | `RiskGate`: pretrade gate, reservations, hard limits, typed decisions, circuit breaker and quote withdrawal. |
 | `valuation` | Account mark to market in one reporting asset over a `LedgerSnapshot`, PnL attribution, collateral equity. |
 | `scenarios` | Spot inventory stress. |
