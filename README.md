@@ -5,8 +5,8 @@ Risk and margin engine for the Xynthex market making lab; usable standalone.
 ## Status
 
 M1-04: the single accounting ledger for one account. M1-05: the pretrade
-risk gate that every order passes through. Margin models are not
-implemented yet.
+risk gate that every order passes through. M3-03B: the first versioned
+initial margin rule.
 
 | Export | Purpose |
 |---|---|
@@ -16,8 +16,9 @@ implemented yet.
 | `risk::InstrumentLimits`, `OrderRequest`, `RiskReason`, `HaltReason` | Limits, requests and typed reasons. |
 | `valuation::value` | Account mark to market in one reporting asset over a `LedgerSnapshot`: price source and freshness flags, collateral equity that invalid marks cannot raise, PnL with fees counted once. |
 | `scenarios::stress` | Spot inventory stress: hypothetical fills (hedges), price gaps, liquidation spread. |
+| `initial_margin::InitialMarginModel`, `rules::TieredLinearIm` | Versioned margin rules; `xynthex-linear-im/1` for linear USDC futures and perpetuals, with the rule id and a per position breakdown in every requirement. |
 | `SpotInstrument`, `Instrument` | Instrument definitions (spot only). |
-| `Asset`, `ExecutionId`, `InstrumentId`, `OrderId`, `TransferId`, `ReservationId` | Validated identifiers. |
+| `Asset`, `AccountId`, `VenueId`, `ExecutionId`, `InstrumentId`, `OrderId`, `TransferId`, `ReservationId` | Validated identifiers. |
 | `Rounding` | Rounding mode for the notional and the released cost. |
 | `MarginError`, `Result<T>` | Typed error boundary (`#[non_exhaustive]`). |
 | `Decimal` | Re-export of `rust_decimal::Decimal`. |
@@ -25,7 +26,8 @@ implemented yet.
 The full contract, the rounding and valuation policies and the mapping from
 market-maker-rs are in [docs/ledger.md](docs/ledger.md); the gate's rules
 and its market-maker-rs mapping are in [docs/risk-gate.md](docs/risk-gate.md);
-valuation and stress are in [docs/valuation.md](docs/valuation.md).
+valuation and stress are in [docs/valuation.md](docs/valuation.md); margin
+rules are in [docs/initial-margin.md](docs/initial-margin.md).
 
 ## Usage
 

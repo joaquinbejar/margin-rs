@@ -72,10 +72,16 @@ pub(crate) fn sub(a: Decimal, b: Decimal, operation: &'static str) -> Result<Dec
 /// than 28 fractional digits after removing trailing zeros, or a mantissa
 /// wider than 96 bits).
 pub(crate) fn mul(a: Decimal, b: Decimal, operation: &'static str) -> Result<Decimal> {
-    let (wa, sa) = Wide::from_decimal(a);
-    let (wb, sb) = Wide::from_decimal(b);
-    wa.checked_mul(wb)
-        .and_then(|product| product.to_decimal(sa + sb))
+    product(&[a, b], operation)
+}
+
+/// Exact product of any number of factors. Only the complete product must
+/// be representable: intermediate products are kept in wide integers, so a
+/// partial product that overflows or needs more than 28 fractional digits
+/// does not fail on its own.
+pub(crate) fn product(values: &[Decimal], operation: &'static str) -> Result<Decimal> {
+    wide_product(values)
+        .and_then(|(product, scale)| product.to_decimal(scale))
         .ok_or(MarginError::arithmetic(operation))
 }
 
@@ -505,6 +511,26 @@ mod tests {
             sum_products_round(&[(Decimal::MAX, dec!(2))], 0, Rounding::HalfEven, "t"),
             Err(MarginError::arithmetic("t"))
         );
+    }
+
+    /// Only the complete product has to be representable.
+    #[test]
+    fn product_of_three_factors_is_exact() {
+        // MAX * 2 overflows, but MAX * 2 * 0.1 = MAX / 5 does not.
+        assert_eq!(
+            product(&[Decimal::MAX, dec!(2), dec!(0.1)], "t"),
+            Ok(dec!(15845632502852867518708790067))
+        );
+        // 0.1 * 1e-28 needs 29 digits; times 10 it is 1e-28.
+        assert_eq!(
+            product(&[dec!(0.1), Decimal::new(1, 28), dec!(10)], "t"),
+            Ok(Decimal::new(1, 28))
+        );
+        assert_eq!(
+            product(&[Decimal::MAX, dec!(2), dec!(1)], "t"),
+            Err(MarginError::arithmetic("t"))
+        );
+        assert_eq!(product(&[], "t"), Ok(dec!(1)));
     }
 
     /// Wide results agree with i128 arithmetic where i128 suffices.

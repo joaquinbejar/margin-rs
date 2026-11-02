@@ -137,6 +137,28 @@ pub enum MarginError {
         reason: &'static str,
     },
 
+    /// The margin rule does not cover this instrument.
+    #[error("rule {rule} does not support {instrument}: {reason}")]
+    UnsupportedInstrument {
+        /// Rule identifier and version, for example `xynthex-linear-im/1`.
+        rule: String,
+        /// Instrument identifier.
+        instrument: InstrumentId,
+        /// Why it is not covered.
+        reason: &'static str,
+    },
+
+    /// An amount is in a different asset than required.
+    #[error("{field} is in {found}, expected {expected}")]
+    CurrencyMismatch {
+        /// Name of the input.
+        field: &'static str,
+        /// Asset required.
+        expected: Asset,
+        /// Asset given.
+        found: Asset,
+    },
+
     /// An open position has no mark price.
     #[error("missing mark price for {instrument}")]
     MissingMark {
