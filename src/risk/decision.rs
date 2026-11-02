@@ -4,7 +4,7 @@ use rust_decimal::Decimal;
 
 use crate::error::MarginError;
 use crate::ids::{Asset, InstrumentId, OrderId};
-use crate::ledger::Side;
+use crate::ledger::{Execution, Side};
 
 /// Why an order is sent. Informational: every purpose goes through the same
 /// checks.
@@ -74,6 +74,27 @@ impl OrderRequest {
     }
 }
 
+/// A fill as reported by the venue for one order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FillReport {
+    /// The execution.
+    pub execution: Execution,
+    /// Cumulative filled quantity of the order after this fill (FIX
+    /// `CumQty`).
+    pub cumulative_quantity: Decimal,
+}
+
+impl FillReport {
+    /// Builds a report.
+    #[must_use]
+    pub fn new(execution: Execution, cumulative_quantity: Decimal) -> Self {
+        Self {
+            execution,
+            cumulative_quantity,
+        }
+    }
+}
+
 /// Why trading is halted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -111,6 +132,14 @@ pub enum RiskReason {
     },
     /// A market data check is configured and no mark was received.
     NoMarketData,
+    /// The last mark is timestamped after the decision time: using it would
+    /// look ahead.
+    LookAheadMarketData {
+        /// Timestamp of the mark, in milliseconds.
+        mark_ms: u64,
+        /// Decision time, in milliseconds.
+        now_ms: u64,
+    },
     /// The last mark is older than allowed.
     StaleMarketData {
         /// Age of the last mark, in milliseconds.

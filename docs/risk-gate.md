@@ -32,7 +32,7 @@ Reasons are typed (`RiskReason`, `#[non_exhaustive]`). The checks run in this or
    - `Halted { reason }`;
    - `UnknownInstrument`;
    - `InvalidOrder { error }`: a non-positive price or quantity, or a value finer than the tick or lot;
-   - `NoMarketData` or `StaleMarketData { age_ms, max_age_ms }`, when `max_data_age_ms` is set;
+   - `NoMarketData`, `LookAheadMarketData { mark_ms, now_ms }` (a mark timestamped after the decision time) or `StaleMarketData { age_ms, max_age_ms }`, when `max_data_age_ms` or `price_band` is set;
    - `PriceOutsideBand { mark, band }`, when `price_band` is set. The check `|price - mark| > band * mark` is decided exactly;
    - `MaxOpenOrders { limit }`.
 2. **Quantity caps.** Each cap that binds is reported:
@@ -55,22 +55,44 @@ The position limits apply to the worst-case position on the order's side:
 
 ## Reservations
 
-- **Buy.** The gate reserves `round_up(price * remaining * (1 + max_fee_rate))` of the quote asset, rounded away from zero onto the quote grid and computed exactly with a single rounding. Fills only happen at the limit price or better, so this covers cash and fee whenever the venue's fee rate is at most `max_fee_rate`.
-- **Sell.** The gate reserves `remaining` of the base asset. Spot sell fees are assumed to be charged in the quote asset and paid from the proceeds.
-- **Affordability.** The affordable quantity is `floor(available / (price * (1 + max_fee_rate)))` to the lot. This is exact because `available` lies on the asset grid: rounding up stays within a grid value exactly when the unrounded amount does.
+Every approved order gets `ReservationTerms`, fixed at admission and stored in its `OrderRecord`. Later `set_limits` calls never change the reservation of a live order, so lowering `max_fee_rate` cannot release budget a live order may still need (M105-3).
+
+The reservation for `remaining` is `round_up(remaining / lot * per_lot)` on the asset grid.
+
+- **Sell.** `per_lot = lot` of the base asset, so the reservation is the remaining quantity itself. Spot sell fees are assumed to be charged in the quote asset and paid from the proceeds.
+- **Buy.** `per_lot` bounds the quote that one lot can cost in **any** fill at the limit price or better, however the order is fragmented (M105-1). With `x = price * lot` and `r = max_fee_rate`, it is the smaller of two valid bounds:
+  - `round_up(x) + round_up(r * round_up(x))`, on the grid, valid because rounding up is subadditive;
+  - `(1 + r) * (x + h) + (one ulp if r > 0)`, exact, where `h` is the largest error of the ledger's notional rounding: half an ulp for the half modes, 0 toward zero, one ulp away from zero.
+
+  The fee assumption is that a fill's fee is at most `r` times its booked notional, rounded up to the quote grid, and charged in the quote asset.
+- **Why it covers any fragmentation.** A fill of `k` lots debits a grid amount of at most `k * per_lot`. The reservation falls by at least the grid floor of `k * per_lot`, so every fill frees at least what it debits, and no sequence of fills exceeds the reservation. `no_fragmentation_exceeds_the_reservation` checks this on 400 pseudo-random cases with no free balance.
+- **Cost of the guarantee.** When `x` is on the quote grid, for example 100 USDC at a 1e-8 BTC lot, nothing is over-reserved. When `x` is off the grid, a fill of one lot really can cost more than `x`. Example: 150.01 at a 1e-8 lot is 1.5001e-6, booked as 2e-6. The bound reserves for that worst case. Choose the instrument's quantity scale to match the venue's real lot to keep it small.
+- **Affordability.** The affordable quantity is `floor(available / per_lot)` lots. It is exact: for a grid value `available`, the rounded-up reservation fits exactly when the unrounded one does.
 
 The lifecycle changes the reservation as follows:
 
 | Event | Reservation |
 |---|---|
 | `submit` (approved) | created for the approved quantity |
-| `on_fill` | shrunk to the amount the remaining quantity needs, **in the same atomic step** that books the fill (`Ledger::book_execution_with_reservation`); removed when the order is filled |
+| `on_fill` on a live order | shrunk to the amount the remaining quantity needs, **in the same atomic step** that books the fill (`Ledger::book_execution_with_reservation`); removed when the order is filled. A fee above the bound is taken from the free balance |
 | repeated fill (same `ExecutionId` and content) | unchanged; the ledger returns `Duplicate`, so the adjustment happens exactly once |
 | `request_cancel` | **unchanged**; the order may still fill until the venue confirms |
 | `on_cancel_confirmed` | the rest is released; repeated or late confirmations release 0 |
 | `on_venue_rejected` | the rest is released (only before any fill) |
+| `on_fill` on a canceled order (late report) | none left: booked against the free balance (M105-2) |
 
-A fill must match its order: same instrument and side, quantity no larger than the remaining quantity, and a price no worse than the limit. Otherwise `ExecutionMismatch` is returned and nothing changes.
+### Fill reports
+
+`on_fill(order_id, &FillReport)` takes the execution and the order's cumulative filled quantity after it (FIX `CumQty`). The fill must match its order:
+
+- same instrument and side;
+- price no worse than the limit;
+- quantity no larger than what is left;
+- `cumulative_quantity = filled so far + quantity`.
+
+That last rule orders one order's fills causally. A late report of a real fill is accepted, while an inconsistent or impossible one is rejected with `ExecutionMismatch` and changes nothing.
+
+A fill reported after the cancel was confirmed has already happened at the venue. It is therefore booked against the free balance, up to the quantity that was canceled. If the free balance cannot cover it, the gate trips `AccountingBreach` and nothing changes.
 
 ## Circuit breaker and quote withdrawal
 
@@ -95,9 +117,10 @@ The market-maker-rs integration is a separate PR in market-maker-rs (M1-05-INT).
 | `CircuitBreaker` back to `Active` | `resume()` |
 | `ExecutionReport` `Accepted` | `on_venue_accepted` |
 | `ExecutionReport` `Rejected` | `on_venue_rejected` |
-| `ExecutionReport` `PartialFill` / `Fill` | `on_fill(order_id, &Execution)`, with the execution mapped as in `docs/ledger.md` |
+| `ExecutionReport` `PartialFill` / `Fill` | `on_fill(order_id, &FillReport { execution, cumulative_quantity })`. The execution is mapped as in `docs/ledger.md`; `cumulative_quantity` comes from `ExecutionReport::cumulative_quantity` |
 | `ExecutionReport` `Canceled` | `on_cancel_confirmed` |
 | `ExecutionReport` `CancelRejected` (already filled) | nothing to do: the fill already ended the order and released the reservation |
+| A fill report arriving after `Canceled` | `on_fill` as usual; it is booked as a late fill |
 | `BacktestConfig::fee_rate` | `InstrumentLimits::max_fee_rate` (at least the rate actually charged) |
 
 ## Out of scope

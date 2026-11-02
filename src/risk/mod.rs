@@ -8,7 +8,9 @@
 //!
 //! - a fill shrinks the reservation to what the remaining quantity needs,
 //!   in the same atomic step that books the fill, so a repeated fill
-//!   message adjusts it exactly once;
+//!   message adjusts it exactly once; fills carry the order's cumulative
+//!   quantity ([`FillReport`]) so late and impossible reports are told
+//!   apart;
 //! - a venue reject or a confirmed cancel releases what is left;
 //! - a requested cancel keeps the reservation, because the order can still
 //!   fill until the venue confirms the cancel.
@@ -30,7 +32,7 @@
 //!
 //! ```
 //! use margin_rs::ledger::{Execution, Ledger, Side};
-//! use margin_rs::risk::{InstrumentLimits, OrderRequest, RiskDecision, RiskGate};
+//! use margin_rs::risk::{FillReport, InstrumentLimits, OrderRequest, RiskDecision, RiskGate};
 //! use margin_rs::{Asset, Decimal, ExecutionId, InstrumentId, OrderId, SpotInstrument, TransferId};
 //!
 //! # fn main() -> margin_rs::Result<()> {
@@ -52,7 +54,7 @@
 //! assert_eq!(gate.ledger().balance(&usdc).map(|b| b.reserved), Some(Decimal::from(500)));
 //!
 //! let fill = Execution::new(ExecutionId::new("e1")?, pair, Side::Buy, Decimal::from(100), Decimal::from(5));
-//! gate.on_fill(&order.id, &fill)?;
+//! gate.on_fill(&order.id, &FillReport::new(fill, Decimal::from(5)))?;
 //! assert_eq!(gate.ledger().balance(&usdc).map(|b| (b.total, b.reserved)), Some((Decimal::from(500), Decimal::ZERO)));
 //! # Ok(())
 //! # }
@@ -60,12 +62,11 @@
 //!
 //! # Reservation size
 //!
-//! - Buy: `round_up(price * remaining * (1 + max_fee_rate))` of the quote
-//!   asset, rounded away from zero to the quote scale. Fills happen at the
-//!   limit price or better, so this covers the cash and the fee as long as
-//!   the venue fee rate does not exceed `max_fee_rate`.
-//! - Sell: `remaining` of the base asset. Spot sell fees are assumed to be
-//!   charged in the quote asset and paid out of the proceeds.
+//! Fixed per order at admission ([`ReservationTerms`]): a whole number of
+//! lots times a per lot bound. For buys the bound covers the quote debited
+//! by any fragmentation of the order at the limit price or better,
+//! including the per fill rounding of the notional and a fee of up to
+//! `max_fee_rate` rounded up; for sells it is the base quantity itself.
 //!
 //! # Limits on joint exposure
 //!
@@ -89,13 +90,13 @@ use std::collections::BTreeMap;
 
 use rust_decimal::Decimal;
 
-pub use decision::{HaltReason, OrderPurpose, OrderRequest, RiskDecision, RiskReason};
+pub use decision::{FillReport, HaltReason, OrderPurpose, OrderRequest, RiskDecision, RiskReason};
 
-use crate::decimal::{Rounding, add, check_scale, mul_div_round, sub};
+use crate::decimal::{Rounding, add, check_scale, mul, mul_div_round, sub};
 use crate::error::{MarginError, Result};
 use crate::ids::{Asset, InstrumentId, OrderId, ReservationId, TransferId};
 use crate::instrument::{Instrument, SpotInstrument};
-use crate::ledger::{Booking, Execution, Ledger, Side};
+use crate::ledger::{Booking, Ledger, Side};
 
 /// Hard limits for one instrument. `None` disables a limit.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -111,8 +112,11 @@ pub struct InstrumentLimits {
     pub max_open_orders: Option<usize>,
     /// Minimum order quantity; defaults to one lot (`10^-quantity_scale`).
     pub min_quantity: Option<Decimal>,
-    /// Fee rate reserved on top of the notional of buy orders, as a
-    /// fraction (0.001 is 10 bp). Zero by default.
+    /// Highest fee rate the venue may charge on a buy, as a fraction (0.001
+    /// is 10 bp). Zero by default. The gate assumes that the fee of a fill is
+    /// at most `max_fee_rate` times the fill's booked notional, rounded up to
+    /// the quote grid, and charged in the quote asset. Fixed per order at
+    /// admission: later changes do not affect live orders.
     pub max_fee_rate: Decimal,
     /// Maximum relative distance between the limit price and the last mark
     /// (0.05 is 5 %). Requires market data.
@@ -193,6 +197,75 @@ impl OrderState {
     }
 }
 
+/// How an order's reservation is computed. Fixed when the order is
+/// admitted, so later limit changes never release budget that a live order
+/// may still need.
+///
+/// The reservation of `remaining` is `round_up(remaining / lot * per_lot)`
+/// on the asset grid:
+///
+/// - sell: `per_lot = lot` of the base asset, so the reservation is the
+///   remaining quantity itself;
+/// - buy: `per_lot` bounds the quote debited per lot by any fill at the
+///   limit price or better, whatever the fragmentation. It is the smaller
+///   of two valid bounds, with `x = price * lot` and `r = max_fee_rate`:
+///   - `round_up(x) + round_up(r * round_up(x))`, on the grid (rounding up
+///     is subadditive);
+///   - `(1 + r) * (x + h) + (ulp if r > 0)`, exact, where `h` is the largest
+///     error of the ledger's notional rounding (half an ulp for the half
+///     modes, 0 toward zero, one ulp away from zero).
+///
+/// A fill of `k` lots debits a grid amount of at most `k * per_lot`, and the
+/// reservation falls by at least the grid floor of that, so each fill frees
+/// at least what it debits and the reservation covers any sequence of
+/// fills. When `x` is on the grid (for example 100 USDC at a 1e-8 lot) the
+/// first bound is exact and nothing is over reserved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservationTerms {
+    /// Asset reserved: quote for buys, base for sells.
+    pub asset: Asset,
+    /// Scale of `asset`.
+    pub scale: u32,
+    /// Lot of the instrument.
+    pub lot: Decimal,
+    /// Amount reserved per open lot.
+    pub per_lot: Decimal,
+}
+
+impl ReservationTerms {
+    /// Reservation for `remaining` open quantity (a multiple of the lot),
+    /// rounded up to the asset grid.
+    ///
+    /// # Errors
+    ///
+    /// [`MarginError::Arithmetic`] if the amount cannot be represented.
+    pub fn amount(&self, remaining: Decimal) -> Result<Decimal> {
+        mul_div_round(
+            &[remaining, self.per_lot],
+            &[self.lot],
+            self.scale,
+            Rounding::AwayFromZero,
+            "remaining lots * per lot",
+        )
+    }
+
+    /// Largest multiple of the lot whose reservation fits in `available`.
+    ///
+    /// # Errors
+    ///
+    /// [`MarginError::Arithmetic`] if the quantity cannot be represented.
+    pub fn affordable(&self, available: Decimal) -> Result<Decimal> {
+        let lots = mul_div_round(
+            &[available.max(Decimal::ZERO)],
+            &[self.per_lot],
+            0,
+            Rounding::TowardZero,
+            "available / per lot",
+        )?;
+        mul(lots, self.lot, "lots * lot")
+    }
+}
+
 /// An order known to the gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderRecord {
@@ -212,6 +285,9 @@ pub struct OrderRecord {
     pub state: OrderState,
     /// Decision taken at submission.
     pub decision: RiskDecision,
+    /// Reservation terms fixed at admission; `None` if the gate rejected
+    /// the order.
+    pub terms: Option<ReservationTerms>,
 }
 
 impl OrderRecord {
@@ -358,9 +434,13 @@ impl RiskGate {
             };
         }
         let decision = self.decide(request, now_ms);
+        let mut terms = None;
         let decision = match decision.approved_quantity() {
             Some(quantity) => match self.reserve_for(request, quantity) {
-                Ok(()) => decision,
+                Ok(order_terms) => {
+                    terms = Some(order_terms);
+                    decision
+                }
                 // Unreachable by construction (sizing used the same
                 // numbers); reported rather than hidden.
                 Err(error) => RiskDecision::Rejected {
@@ -384,6 +464,7 @@ impl RiskGate {
                 filled: Decimal::ZERO,
                 state,
                 decision: decision.clone(),
+                terms,
             },
         );
         decision
@@ -458,8 +539,16 @@ impl RiskGate {
             reasons.push(RiskReason::NoMarketData);
             return;
         };
+        if at > now_ms {
+            // A mark from the future cannot be used at `now_ms`.
+            reasons.push(RiskReason::LookAheadMarketData {
+                mark_ms: at,
+                now_ms,
+            });
+            return;
+        }
         if let Some(max_age_ms) = limits.max_data_age_ms {
-            let age_ms = now_ms.saturating_sub(at);
+            let age_ms = now_ms - at;
             if age_ms > max_age_ms {
                 reasons.push(RiskReason::StaleMarketData { age_ms, max_age_ms });
             }
@@ -558,17 +647,17 @@ impl RiskGate {
             }
         }
 
-        let (asset, required) =
-            self.reservation(spot, limits, request.side, request.price, allowed)?;
+        let terms = self.terms_for(spot, limits, request.side, request.price)?;
+        let required = terms.amount(allowed)?;
         let available = self
             .ledger
-            .balance(&asset)
+            .balance(&terms.asset)
             .map(|b| b.available)
             .unwrap_or_default();
         if required > available {
-            let affordable = self.affordable(spot, limits, request, available)?;
+            let affordable = terms.affordable(available)?;
             caps.push(RiskReason::InsufficientBalance {
-                asset,
+                asset: terms.asset.clone(),
                 required,
                 available,
             });
@@ -577,83 +666,95 @@ impl RiskGate {
         Ok((allowed, caps))
     }
 
-    /// Largest quantity whose reservation fits in `available`.
-    ///
-    /// `available` is a balance, so it lies on the asset's grid. For such a
-    /// value, rounding a buy reservation up to the grid stays within it
-    /// exactly when the unrounded amount does, so the answer is the exact
-    /// ratio floored to the lot: `floor(available / (price * (1 + fee)))`.
-    fn affordable(
-        &self,
-        spot: &SpotInstrument,
-        limits: &InstrumentLimits,
-        request: &OrderRequest,
-        available: Decimal,
-    ) -> Result<Decimal> {
-        let lot_scale = spot.quantity_scale();
-        let available = available.max(Decimal::ZERO);
-        match request.side {
-            Side::Sell => mul_div_round(
-                &[available],
-                &[],
-                lot_scale,
-                Rounding::TowardZero,
-                "floor to lot",
-            ),
-            Side::Buy => mul_div_round(
-                &[available],
-                &[
-                    request.price,
-                    add(Decimal::ONE, limits.max_fee_rate, "1 + fee rate")?,
-                ],
-                lot_scale,
-                Rounding::TowardZero,
-                "available / unit cost",
-            ),
-        }
-    }
-
-    /// Asset and amount reserved for `quantity` of an order.
-    fn reservation(
+    /// Reservation terms for an order on `spot` under `limits`.
+    fn terms_for(
         &self,
         spot: &SpotInstrument,
         limits: &InstrumentLimits,
         side: Side,
         price: Decimal,
-        quantity: Decimal,
-    ) -> Result<(Asset, Decimal)> {
+    ) -> Result<ReservationTerms> {
+        let lot = Decimal::new(1, spot.quantity_scale());
+        let scale_of = |asset: &Asset| {
+            self.ledger
+                .asset_scale(asset)
+                .ok_or_else(|| MarginError::UnknownAsset {
+                    asset: asset.clone(),
+                })
+        };
         match side {
-            Side::Sell => Ok((spot.base().clone(), quantity)),
+            Side::Sell => Ok(ReservationTerms {
+                asset: spot.base().clone(),
+                scale: scale_of(spot.base())?,
+                lot,
+                per_lot: lot,
+            }),
             Side::Buy => {
-                let scale = self.ledger.asset_scale(spot.quote()).ok_or_else(|| {
-                    MarginError::UnknownAsset {
-                        asset: spot.quote().clone(),
-                    }
-                })?;
-                let amount = mul_div_round(
-                    &[
-                        price,
-                        quantity,
-                        add(Decimal::ONE, limits.max_fee_rate, "1 + fee rate")?,
-                    ],
-                    &[],
+                let scale = scale_of(spot.quote())?;
+                let ulp = Decimal::new(1, scale);
+                let rate = limits.max_fee_rate;
+                let up = |value: Decimal, op| {
+                    mul_div_round(&[value], &[], scale, Rounding::AwayFromZero, op)
+                };
+                // Cost of one lot at the limit price, exact.
+                let lot_cost = mul(price, lot, "price * lot")?;
+                // Bound 1, on the grid: round_up(lot cost) plus its fee
+                // rounded up. Rounding up is subadditive, so k lots cost at
+                // most k times this.
+                let cash = up(lot_cost, "round up lot cost")?;
+                let fee_part = if rate.is_zero() {
+                    Decimal::ZERO
+                } else {
+                    up(mul(rate, cash, "rate * lot cash")?, "round up lot fee")?
+                };
+                let on_grid = add(cash, fee_part, "lot cash + fee")?;
+                // Bound 2, exact: (1 + rate) * (lot cost + h) + fee ulp,
+                // where h is the largest error of the ledger's notional
+                // rounding. A fill of k lots debits at most k times this.
+                let half_ulp = Decimal::new(5, scale + 1);
+                let h = match self.ledger.config().rounding {
+                    Rounding::HalfEven | Rounding::HalfAwayFromZero => half_ulp,
+                    Rounding::TowardZero => Decimal::ZERO,
+                    Rounding::AwayFromZero => ulp,
+                };
+                let exact = add(lot_cost, h, "lot cost + h")
+                    .and_then(|v| mul(add(Decimal::ONE, rate, "1 + rate")?, v, "(1 + rate) * v"))
+                    .and_then(|v| {
+                        if rate.is_zero() {
+                            Ok(v)
+                        } else {
+                            add(v, ulp, "+ fee ulp")
+                        }
+                    });
+                let per_lot = match exact {
+                    Ok(bound) if bound < on_grid => bound,
+                    _ => on_grid,
+                };
+                Ok(ReservationTerms {
+                    asset: spot.quote().clone(),
                     scale,
-                    Rounding::AwayFromZero,
-                    "price * quantity * (1 + fee rate)",
-                )?;
-                Ok((spot.quote().clone(), amount))
+                    lot,
+                    per_lot,
+                })
             }
         }
     }
 
-    fn reserve_for(&mut self, request: &OrderRequest, quantity: Decimal) -> Result<()> {
+    fn reserve_for(
+        &mut self,
+        request: &OrderRequest,
+        quantity: Decimal,
+    ) -> Result<ReservationTerms> {
         let spot = self.spot(&request.instrument)?;
         let limits = self.limits(&request.instrument);
-        let (asset, amount) =
-            self.reservation(&spot, &limits, request.side, request.price, quantity)?;
-        self.ledger
-            .reserve(ReservationId::new(request.id.as_str())?, asset, amount)?;
-        Ok(())
+        let terms = self.terms_for(&spot, &limits, request.side, request.price)?;
+        let amount = terms.amount(quantity)?;
+        self.ledger.reserve(
+            ReservationId::new(request.id.as_str())?,
+            terms.asset.clone(),
+            amount,
+        )?;
+        Ok(terms)
     }
 
     fn open_quantities(&self, instrument: &InstrumentId) -> Result<(Decimal, Decimal)> {
@@ -804,31 +905,56 @@ impl RiskGate {
         }
     }
 
-    /// Books a fill of order `id` and shrinks its reservation to what the
-    /// remaining quantity needs, atomically.
+    /// Books a fill of order `id`.
     ///
-    /// A repeated execution (same [`ExecutionId`](crate::ExecutionId) and content) returns
-    /// [`Booking::Duplicate`] and changes nothing.
+    /// The report carries the order's cumulative filled quantity after the
+    /// fill (as FIX `CumQty`). It must equal the quantity filled so far plus
+    /// the fill, which orders the fills of one order causally and tells a
+    /// late report of a real fill from an impossible one.
+    ///
+    /// - Live order: the fill is booked and the reservation shrunk to what
+    ///   the remaining quantity needs, atomically. By the
+    ///   [`ReservationTerms`] bound the reservation frees at least the
+    ///   debit; anything above (a fee over `max_fee_rate`) comes from the
+    ///   free balance.
+    /// - Canceled order (a fill reported after the cancel was confirmed): it
+    ///   already happened at the venue, so it is booked against the free
+    ///   balance, up to the quantity that was canceled.
+    ///
+    /// A repeated execution (same [`ExecutionId`](crate::ExecutionId) and
+    /// content) returns [`Booking::Duplicate`] and changes nothing.
     ///
     /// # Errors
     ///
     /// Nothing changes on error.
     ///
-    /// - [`MarginError::UnknownOrder`] or [`MarginError::InvalidOrderState`].
-    /// - [`MarginError::ExecutionMismatch`] if the execution's instrument or
-    ///   side differs from the order, its quantity exceeds the remaining
-    ///   quantity, or its price is worse than the limit.
-    /// - Any [`Ledger::book_execution_with_reservation`] error. On
-    ///   [`MarginError::InsufficientBalance`] the gate also trips with
-    ///   [`HaltReason::AccountingBreach`]: a fill happened that the
-    ///   reservations did not cover.
-    pub fn on_fill(&mut self, id: &OrderId, execution: &Execution) -> Result<Booking> {
+    /// - [`MarginError::UnknownOrder`]; [`MarginError::InvalidOrderState`]
+    ///   for an order that is filled or was rejected.
+    /// - [`MarginError::ExecutionMismatch`] if the instrument or side differs
+    ///   from the order, the quantity exceeds what is left, the price is
+    ///   worse than the limit, or the cumulative quantity is inconsistent.
+    /// - Any ledger booking error. On [`MarginError::InsufficientBalance`]
+    ///   the gate also trips with [`HaltReason::AccountingBreach`].
+    pub fn on_fill(&mut self, id: &OrderId, report: &FillReport) -> Result<Booking> {
+        let execution = &report.execution;
         if self.ledger.execution_cashflow(&execution.id).is_some() {
             // Duplicate (or conflicting) message: the ledger decides, and
             // neither the order nor its reservation changes.
             return self.ledger.book_execution(execution);
         }
-        let order = self.live_order(id, "fill")?;
+        let order = self
+            .orders
+            .get(id)
+            .cloned()
+            .ok_or_else(|| MarginError::UnknownOrder { id: id.to_string() })?;
+        let late = order.state == OrderState::Canceled;
+        if !order.state.is_live() && !late {
+            return Err(MarginError::InvalidOrderState {
+                id: id.to_string(),
+                state: order.state.name(),
+                operation: "fill",
+            });
+        }
         let mismatch = |reason: &'static str| MarginError::ExecutionMismatch {
             id: id.to_string(),
             reason,
@@ -849,17 +975,29 @@ impl RiskGate {
         if worse {
             return Err(mismatch("price is worse than the limit"));
         }
+        let filled_after = add(order.filled, execution.quantity, "filled + fill")?;
+        if report.cumulative_quantity != filled_after {
+            return Err(mismatch(
+                "cumulative quantity is not the filled quantity plus the fill",
+            ));
+        }
 
-        let spot = self.spot(&order.instrument)?;
-        let limits = self.limits(&order.instrument);
         let remaining_after = sub(order.remaining(), execution.quantity, "remaining - fill")?;
-        let (_, reserved_after) =
-            self.reservation(&spot, &limits, order.side, order.price, remaining_after)?;
-        let booking = match self.ledger.book_execution_with_reservation(
-            execution,
-            &order.reservation_id()?,
-            reserved_after,
-        ) {
+        let booked = if late {
+            self.ledger.book_execution(execution)
+        } else {
+            let terms = order
+                .terms
+                .as_ref()
+                .ok_or_else(|| mismatch("order has no reservation terms"))?;
+            let reserved_after = terms.amount(remaining_after)?;
+            self.ledger.book_execution_with_reservation(
+                execution,
+                &order.reservation_id()?,
+                reserved_after,
+            )
+        };
+        let booking = match booked {
             Ok(booking) => booking,
             Err(error @ MarginError::InsufficientBalance { .. }) => {
                 self.halt.get_or_insert(HaltReason::AccountingBreach);
@@ -868,8 +1006,7 @@ impl RiskGate {
             Err(error) => return Err(error),
         };
         if let Some(record) = self.orders.get_mut(id) {
-            // remaining_after >= 0 was checked above.
-            record.filled = add(record.filled, execution.quantity, "filled + fill")?;
+            record.filled = filled_after;
             if remaining_after.is_zero() {
                 record.state = OrderState::Filled;
             }

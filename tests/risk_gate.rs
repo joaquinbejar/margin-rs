@@ -5,7 +5,8 @@
 
 use margin_rs::ledger::{Booking, Execution, Ledger, Side};
 use margin_rs::risk::{
-    HaltReason, InstrumentLimits, OrderRequest, OrderState, RiskDecision, RiskGate, RiskReason,
+    FillReport, HaltReason, InstrumentLimits, OrderRequest, OrderState, RiskDecision, RiskGate,
+    RiskReason,
 };
 use margin_rs::{
     Asset, Decimal, ExecutionId, InstrumentId, MarginError, OrderId, SpotInstrument, TransferId,
@@ -27,12 +28,22 @@ fn pair() -> InstrumentId {
 /// USDC at 6 decimals, BTC at 8, BTC-USDC with price scale 2 and quantity
 /// scale 8; `usdc` and `btc` deposited.
 fn gate(usdc: Decimal, btc: Decimal, limits: InstrumentLimits) -> RiskGate {
+    gate_with_lot_scale(8, usdc, btc, limits)
+}
+
+/// As [`gate`], with BTC-USDC quantity scale `lot_scale`.
+fn gate_with_lot_scale(
+    lot_scale: u32,
+    usdc: Decimal,
+    btc: Decimal,
+    limits: InstrumentLimits,
+) -> RiskGate {
     let mut ledger = Ledger::default();
     ledger.register_asset(asset("USDC"), 6).expect("register");
     ledger.register_asset(asset("BTC"), 8).expect("register");
     ledger
         .register_instrument(
-            SpotInstrument::new(pair(), asset("BTC"), asset("USDC"), 2, 8).expect("spot"),
+            SpotInstrument::new(pair(), asset("BTC"), asset("USDC"), 2, lot_scale).expect("spot"),
         )
         .expect("register");
     let mut gate = RiskGate::new(ledger);
@@ -64,6 +75,11 @@ fn fill(id: &str, side: Side, price: Decimal, quantity: Decimal) -> Execution {
         price,
         quantity,
     )
+}
+
+/// A fill report with the order's cumulative quantity after the fill.
+fn report(execution: Execution, cumulative: Decimal) -> FillReport {
+    FillReport::new(execution, cumulative)
 }
 
 /// (total, reserved, available) of an asset.
@@ -132,6 +148,12 @@ fn two_orders_cannot_spend_the_same_balance() {
 /// Buy 5 at 100 reserves 500. Cancel requested: still 500. A fill of 2 at
 /// 99 arrives: cash 1000 - 198 = 802, reservation 3 * 100 = 300. The cancel
 /// is confirmed: 300 released, 802 available.
+///
+/// M105-2: a fill of 1 at 99 reported after the confirmation (cumulative
+/// 3) already happened at the venue: it is booked against the free
+/// balance (802 - 99 = 703). Its duplicate changes nothing; an
+/// inconsistent cumulative quantity or more than the canceled 2 is
+/// rejected.
 #[test]
 fn requested_cancel_keeps_the_reservation_until_effective() {
     let mut gate = gate(dec!(1000), dec!(0), InstrumentLimits::default());
@@ -146,7 +168,10 @@ fn requested_cancel_keeps_the_reservation_until_effective() {
     );
 
     let booking = gate
-        .on_fill(&oid("o1"), &fill("e1", Side::Buy, dec!(99), dec!(2)))
+        .on_fill(
+            &oid("o1"),
+            &report(fill("e1", Side::Buy, dec!(99), dec!(2)), dec!(2)),
+        )
         .expect("fill");
     assert!(booking.is_new());
     assert_eq!(balance(&gate, "USDC"), (dec!(802), dec!(300), dec!(502)));
@@ -159,15 +184,64 @@ fn requested_cancel_keeps_the_reservation_until_effective() {
     );
     // A repeated confirmation changes nothing.
     assert_eq!(gate.on_cancel_confirmed(&oid("o1")), Ok(dec!(0)));
+
+    let late = report(fill("e2", Side::Buy, dec!(99), dec!(1)), dec!(3));
+    let booked = gate.on_fill(&oid("o1"), &late).expect("late fill");
+    assert!(booked.is_new());
+    assert_eq!(balance(&gate, "USDC"), (dec!(703), dec!(0), dec!(703)));
     assert_eq!(
-        gate.on_fill(&oid("o1"), &fill("e2", Side::Buy, dec!(99), dec!(1))),
-        Err(MarginError::InvalidOrderState {
-            id: "o1".into(),
-            state: "canceled",
-            operation: "fill",
+        gate.on_fill(&oid("o1"), &late),
+        Ok(Booking::Duplicate(booked.cashflow().clone()))
+    );
+    assert_eq!(gate.order(&oid("o1")).map(|o| o.filled), Some(dec!(3)));
+    let mismatch = |reason| MarginError::ExecutionMismatch {
+        id: "o1".into(),
+        reason,
+    };
+    assert_eq!(
+        gate.on_fill(
+            &oid("o1"),
+            &report(fill("e3", Side::Buy, dec!(99), dec!(1)), dec!(5))
+        ),
+        Err(mismatch(
+            "cumulative quantity is not the filled quantity plus the fill"
+        ))
+    );
+    assert_eq!(
+        gate.on_fill(
+            &oid("o1"),
+            &report(fill("e3", Side::Buy, dec!(99), dec!(3)), dec!(6))
+        ),
+        Err(mismatch("quantity exceeds the remaining quantity"))
+    );
+    assert_eq!(balance(&gate, "USDC"), (dec!(703), dec!(0), dec!(703)));
+    assert_eq!(gate.halted(), None);
+    gate.ledger().reconcile().expect("reconciles");
+}
+
+/// A late fill the free balance cannot cover trips an accounting breach
+/// and changes nothing.
+#[test]
+fn uncovered_late_fill_trips_an_accounting_breach() {
+    let mut gate = gate(dec!(100), dec!(0), InstrumentLimits::default());
+    gate.submit(&buy("o1", dec!(100), dec!(1)), 0);
+    gate.on_cancel_confirmed(&oid("o1")).expect("cancel");
+    gate.withdraw(TransferId::new("w1").expect("id"), asset("USDC"), dec!(50))
+        .expect("withdraw");
+    let before = gate.ledger().snapshot();
+    assert_eq!(
+        gate.on_fill(
+            &oid("o1"),
+            &report(fill("e1", Side::Buy, dec!(100), dec!(1)), dec!(1))
+        ),
+        Err(MarginError::InsufficientBalance {
+            asset: asset("USDC"),
+            required: dec!(100),
+            available: dec!(50),
         })
     );
-    gate.ledger().reconcile().expect("reconciles");
+    assert_eq!(gate.halted(), Some(HaltReason::AccountingBreach));
+    assert_eq!(gate.ledger().snapshot(), before);
 }
 
 /// Acceptance 2b: a partial fill adjusts the reservation exactly once.
@@ -182,14 +256,18 @@ fn partial_fill_adjusts_the_reservation_exactly_once() {
         max_fee_rate: dec!(0.001),
         ..InstrumentLimits::default()
     };
-    let mut gate = gate(dec!(1000), dec!(0), limits);
+    // Lot 0.01: per lot 1 USDC plus a 0.001 fee reserve.
+    let mut gate = gate_with_lot_scale(2, dec!(1000), dec!(0), limits);
     gate.submit(&buy("o1", dec!(100), dec!(4)), 0);
     assert_eq!(
         balance(&gate, "USDC"),
         (dec!(1000), dec!(400.4), dec!(599.6))
     );
 
-    let e1 = fill("e1", Side::Buy, dec!(100), dec!(1)).with_fee(asset("USDC"), dec!(0.1));
+    let e1 = report(
+        fill("e1", Side::Buy, dec!(100), dec!(1)).with_fee(asset("USDC"), dec!(0.1)),
+        dec!(1),
+    );
     let first = gate.on_fill(&oid("o1"), &e1).expect("fill");
     assert_eq!(
         balance(&gate, "USDC"),
@@ -206,7 +284,10 @@ fn partial_fill_adjusts_the_reservation_exactly_once() {
         (dec!(899.9), dec!(300.3), dec!(599.6))
     );
     assert_eq!(gate.order(&oid("o1")).map(|o| o.filled), Some(dec!(1)));
-    let conflicting = fill("e1", Side::Buy, dec!(100), dec!(2)).with_fee(asset("USDC"), dec!(0.1));
+    let conflicting = report(
+        fill("e1", Side::Buy, dec!(100), dec!(2)).with_fee(asset("USDC"), dec!(0.1)),
+        dec!(2),
+    );
     assert_eq!(
         gate.on_fill(&oid("o1"), &conflicting),
         Err(MarginError::ConflictingEntry {
@@ -215,7 +296,10 @@ fn partial_fill_adjusts_the_reservation_exactly_once() {
         })
     );
 
-    let e2 = fill("e2", Side::Buy, dec!(100), dec!(3)).with_fee(asset("USDC"), dec!(0.3));
+    let e2 = report(
+        fill("e2", Side::Buy, dec!(100), dec!(3)).with_fee(asset("USDC"), dec!(0.3)),
+        dec!(4),
+    );
     gate.on_fill(&oid("o1"), &e2).expect("fill");
     assert_eq!(balance(&gate, "USDC"), (dec!(599.6), dec!(0), dec!(599.6)));
     assert_eq!(
@@ -226,17 +310,199 @@ fn partial_fill_adjusts_the_reservation_exactly_once() {
     gate.ledger().reconcile().expect("reconciles");
 }
 
-/// The buy reservation is rounded up: 0.33333333 * 100.01 * 1.001 =
-/// 33.3700029996333, reserved as 33.370003.
+/// M105-1: the buy reservation covers any fragmentation of the order.
+///
+/// Lot 1e-8 at 150.01 costs 1.5001e-6, booked as 2e-6 on the 6 digit
+/// grid, so each lot reserves 2e-6. With 5e-6 USDC a buy of 3 lots
+/// (6e-6) does not fit; with 6e-6 it does, and three one lot fills (2e-6
+/// each) are all covered with nothing left free.
 #[test]
-fn buy_reservation_rounds_up_to_the_quote_grid() {
+fn reservation_covers_single_lot_fills() {
+    let mut gate_short = gate(dec!(0.000005), dec!(0), InstrumentLimits::default());
+    assert_eq!(
+        gate_short.submit(&buy("o0", dec!(150.01), dec!(0.00000003)), 0),
+        RiskDecision::Rejected {
+            reasons: vec![RiskReason::InsufficientBalance {
+                asset: asset("USDC"),
+                required: dec!(0.000006),
+                available: dec!(0.000005),
+            }]
+        }
+    );
+
+    let mut gate = gate(dec!(0.000006), dec!(0), InstrumentLimits::default());
+    gate.submit(&buy("o1", dec!(150.01), dec!(0.00000003)), 0);
+    assert_eq!(
+        balance(&gate, "USDC"),
+        (dec!(0.000006), dec!(0.000006), dec!(0))
+    );
+    for i in 1..=3_i64 {
+        gate.on_fill(
+            &oid("o1"),
+            &report(
+                fill(&format!("e{i}"), Side::Buy, dec!(150.01), dec!(0.00000001)),
+                Decimal::new(i, 8),
+            ),
+        )
+        .expect("covered");
+    }
+    assert_eq!(balance(&gate, "USDC"), (dec!(0), dec!(0), dec!(0)));
+    assert_eq!(gate.halted(), None);
+    gate.ledger().reconcile().expect("reconciles");
+}
+
+/// M105-1: mixed fill sizes with no free balance.
+///
+/// 1e-5 USDC, buy 5 lots at 150.01: reserved 5 * 2e-6 = 1e-5, nothing
+/// free. Fills of 2, 1 and 2 lots debit 3e-6, 2e-6 and 3e-6 (the
+/// notionals 3.0002e-6, 1.5001e-6 and 3.0002e-6 rounded half even); after
+/// each the reservation is what the rest needs (6e-6, 4e-6, 0) and the
+/// unused 2e-6 ends up free.
+#[test]
+fn reservation_covers_mixed_fills_without_free_balance() {
+    let mut gate = gate(dec!(0.00001), dec!(0), InstrumentLimits::default());
+    gate.submit(&buy("o1", dec!(150.01), dec!(0.00000005)), 0);
+    assert_eq!(
+        balance(&gate, "USDC"),
+        (dec!(0.00001), dec!(0.00001), dec!(0))
+    );
+    let steps = [
+        (
+            dec!(0.00000002),
+            dec!(0.00000002),
+            (dec!(0.000007), dec!(0.000006), dec!(0.000001)),
+        ),
+        (
+            dec!(0.00000001),
+            dec!(0.00000003),
+            (dec!(0.000005), dec!(0.000004), dec!(0.000001)),
+        ),
+        (
+            dec!(0.00000002),
+            dec!(0.00000005),
+            (dec!(0.000002), dec!(0), dec!(0.000002)),
+        ),
+    ];
+    for (i, (quantity, cumulative, expected)) in steps.into_iter().enumerate() {
+        gate.on_fill(
+            &oid("o1"),
+            &report(
+                fill(&format!("e{i}"), Side::Buy, dec!(150.01), quantity),
+                cumulative,
+            ),
+        )
+        .expect("covered");
+        assert_eq!(balance(&gate, "USDC"), expected);
+    }
+    assert_eq!(gate.halted(), None);
+    gate.ledger().reconcile().expect("reconciles");
+}
+
+/// With a fee bound, each lot also reserves the fee rounded up: at 150.01
+/// and 0.1 %, 2e-6 + round_up(2e-9) = 3e-6 per lot.
+#[test]
+fn reservation_includes_the_rounded_up_fee_per_lot() {
     let limits = InstrumentLimits {
         max_fee_rate: dec!(0.001),
         ..InstrumentLimits::default()
     };
+    let mut gate = gate(dec!(1), dec!(0), limits);
+    gate.submit(&buy("o1", dec!(150.01), dec!(0.00000002)), 0);
+    assert_eq!(balance(&gate, "USDC").1, dec!(0.000006));
+    let terms = gate
+        .order(&oid("o1"))
+        .and_then(|o| o.terms.clone())
+        .expect("terms");
+    assert_eq!(terms.per_lot, dec!(0.000003));
+}
+
+/// M105-3: the reservation terms are fixed when an order is admitted.
+///
+/// Lot 0.01. 110 USDC, fee bound 10 %: a buy of 1 at 100 reserves
+/// 100 lots times 1.1, that is 110. Lowering the bound to 0 does not free the fee buffer:
+/// after a fill of 0.5 with a 5 fee (debit 55) the reservation is 55 for
+/// the rest and nothing is free, so a withdrawal fails and the second
+/// identical fill is covered. Raising the bound later applies only to new
+/// orders.
+#[test]
+fn reservation_terms_are_fixed_at_admission() {
+    let limits = InstrumentLimits {
+        max_fee_rate: dec!(0.1),
+        ..InstrumentLimits::default()
+    };
+    let mut gate = gate_with_lot_scale(2, dec!(110), dec!(0), limits);
+    gate.submit(&buy("o1", dec!(100), dec!(1)), 0);
+    assert_eq!(balance(&gate, "USDC"), (dec!(110), dec!(110), dec!(0)));
+    gate.set_limits(&pair(), InstrumentLimits::default())
+        .expect("lower the bound");
+
+    let with_fee = |id: &str, cumulative| {
+        report(
+            fill(id, Side::Buy, dec!(100), dec!(0.5)).with_fee(asset("USDC"), dec!(5)),
+            cumulative,
+        )
+    };
+    gate.on_fill(&oid("o1"), &with_fee("e1", dec!(0.5)))
+        .expect("fill");
+    assert_eq!(balance(&gate, "USDC"), (dec!(55), dec!(55), dec!(0)));
+    assert_eq!(
+        gate.withdraw(TransferId::new("w1").expect("id"), asset("USDC"), dec!(5)),
+        Err(MarginError::InsufficientBalance {
+            asset: asset("USDC"),
+            required: dec!(5),
+            available: dec!(0),
+        })
+    );
+    gate.on_fill(&oid("o1"), &with_fee("e2", dec!(1)))
+        .expect("second fill covered");
+    assert_eq!(balance(&gate, "USDC"), (dec!(0), dec!(0), dec!(0)));
+    assert_eq!(gate.halted(), None);
+
+    // Raising the bound affects new orders only.
+    let mut gate = gate_with_lot_scale(2, dec!(1000), dec!(0), InstrumentLimits::default());
+    gate.submit(&buy("old", dec!(100), dec!(1)), 0);
+    gate.set_limits(
+        &pair(),
+        InstrumentLimits {
+            max_fee_rate: dec!(0.1),
+            ..InstrumentLimits::default()
+        },
+    )
+    .expect("raise the bound");
+    gate.submit(&buy("new", dec!(100), dec!(1)), 0);
+    assert_eq!(balance(&gate, "USDC"), (dec!(1000), dec!(210), dec!(790)));
+    gate.on_fill(
+        &oid("old"),
+        &report(fill("e1", Side::Buy, dec!(100), dec!(1)), dec!(1)),
+    )
+    .expect("fill");
+    assert_eq!(balance(&gate, "USDC"), (dec!(900), dec!(110), dec!(790)));
+    gate.ledger().reconcile().expect("reconciles");
+}
+
+/// A mark timestamped after the decision time is look ahead.
+#[test]
+fn future_marks_are_rejected_as_look_ahead() {
+    let limits = InstrumentLimits {
+        max_data_age_ms: Some(1000),
+        ..InstrumentLimits::default()
+    };
     let mut gate = gate(dec!(1000), dec!(0), limits);
-    gate.submit(&buy("o1", dec!(100.01), dec!(0.33333333)), 0);
-    assert_eq!(balance(&gate, "USDC").1, dec!(33.370003));
+    gate.on_market_data(&pair(), dec!(100), 2000).expect("mark");
+    assert_eq!(
+        gate.submit(&buy("o1", dec!(100), dec!(1)), 1500),
+        RiskDecision::Rejected {
+            reasons: vec![RiskReason::LookAheadMarketData {
+                mark_ms: 2000,
+                now_ms: 1500,
+            }]
+        }
+    );
+    assert!(
+        !gate
+            .submit(&buy("o2", dec!(100), dec!(1)), 2000)
+            .is_rejected()
+    );
 }
 
 /// Limits apply to the joint exposure of the position and every live
@@ -277,8 +543,11 @@ fn limits_apply_to_joint_exposure() {
             }]
         }
     );
-    gate.on_fill(&oid("b1"), &fill("f1", Side::Buy, dec!(100), dec!(6)))
-        .expect("fill");
+    gate.on_fill(
+        &oid("b1"),
+        &report(fill("f1", Side::Buy, dec!(100), dec!(6)), dec!(6)),
+    )
+    .expect("fill");
     assert_eq!(
         gate.submit(&buy("b3", dec!(100), dec!(1)), 0),
         RiskDecision::Rejected {
@@ -395,8 +664,10 @@ fn repeated_invalid_proposals_are_always_rejected() {
 /// orders are rejected. Mark 100 at t = 1000: at t = 1500 a buy at 100 and
 /// one at 105 pass, one at 106 does not; at t = 2500 the data is stale.
 /// Tripping on a data disconnect withdraws the two live orders and keeps
-/// their reservations (100 + 105) until each cancel is confirmed; a fill
-/// racing the withdrawal is still booked.
+/// their reservations until each cancel is confirmed; a fill racing the
+/// withdrawal is still booked. The buy at 100 reserves 100. At 105 a 1e-8
+/// lot costs 1.05e-6, off the 6 digit grid: the per lot bound is
+/// min(round_up(1.05e-6), 1.05e-6 + 0.5e-6) = 1.55e-6, so 155 is reserved.
 #[test]
 fn data_disconnect_trips_and_withdraws_quotes() {
     let limits = InstrumentLimits {
@@ -447,7 +718,7 @@ fn data_disconnect_trips_and_withdraws_quotes() {
     );
     assert_eq!(gate.trip(HaltReason::Manual), Vec::<OrderId>::new());
     assert_eq!(gate.halted(), Some(HaltReason::DataDisconnect));
-    assert_eq!(balance(&gate, "USDC"), (dec!(10000), dec!(205), dec!(9795)));
+    assert_eq!(balance(&gate, "USDC"), (dec!(10000), dec!(255), dec!(9745)));
     gate.on_market_data(&pair(), dec!(100), 2600).expect("mark");
     assert_eq!(
         gate.submit(&buy("o5", dec!(100), dec!(1)), 2600),
@@ -458,9 +729,12 @@ fn data_disconnect_trips_and_withdraws_quotes() {
         }
     );
 
-    gate.on_fill(&oid("o1"), &fill("e1", Side::Buy, dec!(100), dec!(1)))
-        .expect("fill races the cancel");
-    assert_eq!(gate.on_cancel_confirmed(&oid("o3")), Ok(dec!(105)));
+    gate.on_fill(
+        &oid("o1"),
+        &report(fill("e1", Side::Buy, dec!(100), dec!(1)), dec!(1)),
+    )
+    .expect("fill races the cancel");
+    assert_eq!(gate.on_cancel_confirmed(&oid("o3")), Ok(dec!(155)));
     assert_eq!(gate.on_cancel_confirmed(&oid("o1")), Ok(dec!(0)));
     assert_eq!(balance(&gate, "USDC"), (dec!(9900), dec!(0), dec!(9900)));
 
@@ -495,8 +769,11 @@ fn venue_reject_and_open_order_limit() {
     assert!(!gate.submit(&buy("o4", dec!(100), dec!(1)), 0).is_rejected());
 
     gate.on_venue_accepted(&oid("o2")).expect("ack");
-    gate.on_fill(&oid("o2"), &fill("e1", Side::Buy, dec!(100), dec!(1)))
-        .expect("fill");
+    gate.on_fill(
+        &oid("o2"),
+        &report(fill("e1", Side::Buy, dec!(100), dec!(1)), dec!(1)),
+    )
+    .expect("fill");
     assert_eq!(
         gate.on_venue_rejected(&oid("o2")),
         Err(MarginError::InvalidOrderState {
@@ -527,19 +804,40 @@ fn fills_must_match_their_order() {
         reason,
     };
     assert_eq!(
-        gate.on_fill(&oid("o1"), &fill("e1", Side::Buy, dec!(100.01), dec!(1))),
+        gate.on_fill(
+            &oid("o1"),
+            &report(fill("e1", Side::Buy, dec!(100.01), dec!(1)), dec!(1))
+        ),
         Err(mismatch("price is worse than the limit"))
     );
     assert_eq!(
-        gate.on_fill(&oid("o1"), &fill("e1", Side::Buy, dec!(100), dec!(3))),
+        gate.on_fill(
+            &oid("o1"),
+            &report(fill("e1", Side::Buy, dec!(100), dec!(3)), dec!(3))
+        ),
         Err(mismatch("quantity exceeds the remaining quantity"))
     );
     assert_eq!(
-        gate.on_fill(&oid("o1"), &fill("e1", Side::Sell, dec!(100), dec!(1))),
+        gate.on_fill(
+            &oid("o1"),
+            &report(fill("e1", Side::Sell, dec!(100), dec!(1)), dec!(1))
+        ),
         Err(mismatch("side differs from the order"))
     );
     assert_eq!(
-        gate.on_fill(&oid("nope"), &fill("e1", Side::Buy, dec!(100), dec!(1))),
+        gate.on_fill(
+            &oid("o1"),
+            &report(fill("e1", Side::Buy, dec!(100), dec!(1)), dec!(2))
+        ),
+        Err(mismatch(
+            "cumulative quantity is not the filled quantity plus the fill"
+        ))
+    );
+    assert_eq!(
+        gate.on_fill(
+            &oid("nope"),
+            &report(fill("e1", Side::Buy, dec!(100), dec!(1)), dec!(1))
+        ),
         Err(MarginError::UnknownOrder { id: "nope".into() })
     );
     assert_eq!(gate.ledger().snapshot(), before);
@@ -558,7 +856,7 @@ fn uncovered_fill_trips_an_accounting_breach() {
     let before = gate.ledger().snapshot();
     let e1 = fill("e1", Side::Buy, dec!(100), dec!(1)).with_fee(asset("USDC"), dec!(1));
     assert_eq!(
-        gate.on_fill(&oid("o1"), &e1),
+        gate.on_fill(&oid("o1"), &report(e1, dec!(1))),
         Err(MarginError::InsufficientBalance {
             asset: asset("USDC"),
             required: dec!(101),
@@ -568,4 +866,63 @@ fn uncovered_fill_trips_an_accounting_breach() {
     assert_eq!(gate.halted(), Some(HaltReason::AccountingBreach));
     assert_eq!(gate.ledger().snapshot(), before);
     assert_eq!(gate.order(&oid("o1")).map(|o| o.filled), Some(dec!(0)));
+}
+
+/// Property: with no free balance, no fragmentation of a buy at the limit
+/// price can exceed its reservation, with or without a fee charged at the
+/// bound and rounded up. Deterministic pseudo random cases: prices from
+/// 0.01 to 999.99, 1 to 60 lots of 1e-8, random fill sizes.
+#[test]
+fn no_fragmentation_exceeds_the_reservation() {
+    let mut state = 0x5DEE_CE66_D1CE_4E5B_u64;
+    let mut next = move |bound: u64| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state % bound
+    };
+    for case in 0..400 {
+        let price = Decimal::new(1 + next(99_999) as i64, 2);
+        let lots = 1 + next(60) as i64;
+        let rate = if case % 2 == 0 { dec!(0) } else { dec!(0.001) };
+        let limits = InstrumentLimits {
+            max_fee_rate: rate,
+            ..InstrumentLimits::default()
+        };
+        // Fund exactly the reservation, so nothing is free.
+        let probe = gate(dec!(1000000), dec!(0), limits.clone());
+        let mut probe = probe;
+        probe.submit(&buy("p", price, Decimal::new(lots, 8)), 0);
+        let needed = balance(&probe, "USDC").1;
+        let mut gate = gate(needed, dec!(0), limits);
+        assert!(
+            !gate
+                .submit(&buy("o", price, Decimal::new(lots, 8)), 0)
+                .is_rejected()
+        );
+        assert_eq!(balance(&gate, "USDC").2, dec!(0));
+
+        let mut done = 0_i64;
+        let mut n = 0;
+        while done < lots {
+            let k = 1 + next((lots - done) as u64) as i64;
+            done += k;
+            n += 1;
+            let quantity = Decimal::new(k, 8);
+            let mut execution = fill(&format!("e{n}"), Side::Buy, price, quantity);
+            if !rate.is_zero() {
+                // Fee at the bound on the booked notional, rounded up.
+                let notional = (price * quantity)
+                    .round_dp_with_strategy(6, rust_decimal::RoundingStrategy::MidpointNearestEven);
+                let fee = (rate * notional)
+                    .round_dp_with_strategy(6, rust_decimal::RoundingStrategy::AwayFromZero);
+                execution = execution.with_fee(asset("USDC"), fee);
+            }
+            gate.on_fill(&oid("o"), &report(execution, Decimal::new(done, 8)))
+                .unwrap_or_else(|e| panic!("case {case}: price {price}, {lots} lots: {e}"));
+        }
+        assert_eq!(gate.halted(), None);
+        assert_eq!(balance(&gate, "USDC").1, dec!(0));
+        gate.ledger().reconcile().expect("reconciles");
+    }
 }
