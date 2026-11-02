@@ -20,6 +20,9 @@ initial margin rule.
 | `factors`, `covariance::portfolio_variance` | Factor exposures with explicit units (price return, vol point, rate point) and portfolio variance under a validated, exactly positive semidefinite covariance matrix (one and two factors). |
 | `collateral::value_collateral` | Available collateral of one account with per asset haircuts, eligibility and a declared stale price policy; debts always count. |
 | `margin_reservations::MarginReservationService` | Initial margin reserved for pending derivative orders of one account: exact worst case requirement, idempotent fills and effective cancels, typed rejection reasons. |
+| `maintenance::assess` | Account state from the maintenance threshold (healthy, reduce only, default; equality is healthy) with excess, shortfall and debt. |
+| `liquidation::plan_liquidation` | Staged closeout plan (cancel, reduce, residual) against scenario liquidity: partial closeouts, fees, explicit deficit and debt, adapter intents. |
+| `ledger::DerivativeSettlement` | Cash of a derivative fill (realized PnL and fee), booked idempotently by execution id and never rejected. |
 | `SpotInstrument`, `Instrument` | Instrument definitions (spot only). |
 | `Asset`, `AccountId`, `VenueId`, `ExecutionId`, `InstrumentId`, `OrderId`, `TransferId`, `ReservationId` | Validated identifiers. |
 | `Rounding` | Rounding mode for the notional and the released cost. |
@@ -33,7 +36,8 @@ valuation and stress are in [docs/valuation.md](docs/valuation.md); margin
 rules are in [docs/initial-margin.md](docs/initial-margin.md); factor risk is
 in [docs/covariance.md](docs/covariance.md); collateral is in
 [docs/collateral.md](docs/collateral.md); margin reservations are in
-[docs/margin-reservations.md](docs/margin-reservations.md); the exact
+[docs/margin-reservations.md](docs/margin-reservations.md); maintenance and
+liquidation are in [docs/liquidation.md](docs/liquidation.md); the exact
 arithmetic rule is in [docs/exact-arithmetic.md](docs/exact-arithmetic.md).
 
 ## Usage

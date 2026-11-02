@@ -43,12 +43,13 @@
 //! authoritative PnL. [`PnlAttribution`] splits it into realized,
 //! unrealized and fees, all in the reporting asset:
 //!
-//! - `realized = sum(realized_pnl * price(quote))`;
+//! - `realized = sum(realized_pnl * price(quote)) + sum(settled_pnl * price(asset))`,
+//!   the second term being the realized PnL of derivative settlements;
 //! - `unrealized = sum(quantity * price(base) - cost_basis * price(quote))`;
 //! - `fees = sum(fees_paid * price(asset))`.
 //!
-//! For spot, `equity - net_transfers = realized + unrealized - fees`
-//! exactly; each figure is rounded once, so the attribution can differ from
+//! For spot and settled derivatives, `equity - net_transfers = realized +
+//! unrealized - fees` exactly; each figure is rounded once, so the attribution can differ from
 //! `net_pnl` by rounding only, reported as
 //! [`PnlAttribution::rounding_difference`].
 
@@ -543,6 +544,16 @@ pub fn value(
             if let Some(base) = price(spot.base()) {
                 unrealized_terms.push(vec![position.quantity, base]);
             }
+        }
+    }
+    // Realized PnL of derivative settlements, paid in cash.
+    for (asset, settled) in &snapshot.settled_pnl {
+        if settled.is_zero() {
+            continue;
+        }
+        needed.insert(asset);
+        if let Some(p) = price(asset) {
+            realized_terms.push(vec![*settled, p]);
         }
     }
     let mut fee_terms = Vec::new();

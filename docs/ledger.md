@@ -14,6 +14,8 @@ The first supported product is spot with maker and taker fees. The types already
 | Reservations | reservation id | `(asset, amount)` held back from available |
 | Transfers | transfer id | deposits and withdrawals |
 | Journal | booking order | one `ExecutionCashflow` per booked execution |
+| Settlement journal | booking order | one `SettlementCashflow` per derivative settlement (M3-04) |
+| Settled PnL | asset | cumulative realized PnL paid by derivative settlements, gross of fees |
 
 `quantity` is the net quantity traded on the instrument since the ledger was opened. It is not the base asset balance. The base balance also moves with transfers and with fees charged in the base asset.
 
@@ -114,8 +116,20 @@ The adapter maps types as follows:
 
 The currency, unit and cashflow contracts of market-maker-rs#78 (M0-05) are still open. Execution reports carry no currency yet, so the adapter supplies the instrument and fee asset from its configuration until #78 lands.
 
+## Derivative settlements (M3-04)
+
+Futures and perpetual positions are not ledger positions: they are margined by `initial_margin`, `margin_reservations` and `liquidation`. When such a position is reduced, the cash it moves is booked with `book_settlement(&DerivativeSettlement { id, instrument, asset, realized_pnl, fee })`:
+
+- the asset's total balance changes by `realized_pnl - fee`, one exact difference;
+- the fee joins `fees_paid` and the realized PnL joins `settled_pnl`, so `Ledger::valuation`, `valuation::value` and its PnL attribution count it as realized PnL;
+- it is **idempotent by execution id**, and the id space is shared with spot executions: the same id booked again identically is a duplicate (`is_new == false`, nothing changes); the same id with other content, or already used by a spot execution, is `ConflictingEntry`;
+- the instrument must not be a registered spot instrument, and an id that has been settled cannot be registered later as one;
+- it is a **mandatory debit** (Xynthex economics 11.2, MM-codex E2): never rejected for lack of balance, deferred or reduced. A settlement that leaves the balance below its reservations, or negative, is booked in full and returns the `shortfall`; the debt stays visible in `overdrafts()` and in `reconcile()`.
+
+`reconcile()` adds every settlement delta to its asset's total, its fee to `fees_paid` and its realized PnL to `settled_pnl`, and checks `delta = realized_pnl - fee` for each one.
+
 ## Limits and non-goals
 
-- Only spot instruments exist. Futures, perpetuals and options margin are out of scope for M1-04.
+- Only spot instruments are ledger positions. Derivatives post their cash as settlements (above); keeping perpetual and futures positions in the ledger (mark to market, basis) is follow up work for M3-INT.
 - The journal and the set of seen execution ids grow without bound for the life of a ledger. Pruning or checkpoints are future work.
 - Reservations are plain holds that a caller creates and releases. M1-05 builds order-level reservations on top: release on fill, reject and effective cancel, and exactly-once adjustment on a partial fill.

@@ -48,3 +48,10 @@ Spot reservations therefore reduce what margin can use, and the margin hold redu
 `RiskGate::set_hold` is atomic: if the new amount does not fit, the previous hold stays. A hold id cannot be an order id. Collateral here is cash in the settlement asset, as in Xynthex v1, where XYZ and long options count as zero collateral.
 
 Fills are idempotent by execution id. Reusing an id with another order or quantity returns `ConflictingEntry` and changes nothing.
+
+## Account in debt
+
+Cash can go negative after a mandatory debit (a fee, a realized loss or a closeout settlement; see `docs/liquidation.md`). Then collateral, which is the available cash plus the current hold, is negative too:
+
+- **`reserve_with_gate`.** Only risk-reducing orders (E3) can be accepted, because every other order fails the `collateral >= required` test. When one is accepted, the hold is set to `min(required, max(collateral, 0))`. It covers the requirement as far as the cash allows and is never negative, because a negative hold would create available cash. Under water, the hold is therefore 0. Once cash is positive again, the hold takes whatever cash there is, up to the requirement.
+- **`sync_hold`.** This call sets the hold to the full requirement. When the cash cannot cover it, as with any debt, `RiskGate::set_hold` fails with `InsufficientBalance`. The previous hold stays in place and the error is returned to the caller. This is by design: `sync_hold` reports that the requirement is not covered, and never quietly lowers the hold. The account state itself (`ReduceOnly` or `Default`) is computed by `maintenance::assess`.

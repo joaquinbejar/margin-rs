@@ -34,6 +34,11 @@
 //! - [`margin_reservations`]: initial margin reserved for pending
 //!   derivative orders of one account, recomputed exactly from positions
 //!   and live orders.
+//! - [`maintenance`] and [`liquidation`]: the maintenance threshold and
+//!   account state (healthy, reduce only, default), and a staged closeout
+//!   plan (cancel, reduce, residual) against scenario liquidity, with the
+//!   deficit left explicit. The cash it moves is posted in the [`ledger`]
+//!   as derivative settlements.
 //! - [`MarginError`] and [`Result`]: the typed error boundary.
 //!
 //! ## Policies
@@ -79,6 +84,8 @@ pub mod ids;
 pub mod initial_margin;
 pub mod instrument;
 pub mod ledger;
+pub mod liquidation;
+pub mod maintenance;
 pub mod margin_reservations;
 pub mod risk;
 pub mod rules;

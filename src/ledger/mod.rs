@@ -6,7 +6,9 @@
 //! - a position per instrument, with signed cost basis and realized PnL;
 //! - the fees paid per asset;
 //! - the journal of booked executions, each with its cashflow
-//!   reconciliation ([`ExecutionCashflow`]).
+//!   reconciliation ([`ExecutionCashflow`]);
+//! - the cash settlements of derivative fills held outside the ledger
+//!   ([`DerivativeSettlement`]), with the realized PnL they paid per asset.
 //!
 //! Strategy, risk, backtest and environment code read this state instead of
 //! keeping their own balances, so there is one place where cash and
@@ -19,7 +21,10 @@
 //!   identifier for different content is a [`MarginError::ConflictingEntry`].
 //! - Every operation is atomic: on error the ledger is left unchanged.
 //! - A booking that would leave an asset's available balance negative is
-//!   rejected with [`MarginError::InsufficientBalance`].
+//!   rejected with [`MarginError::InsufficientBalance`], except a real
+//!   execution booked with [`Ledger::book_execution_allowing_overdraft`]
+//!   and a derivative settlement ([`Ledger::book_settlement`]), which are
+//!   mandatory and report the shortfall instead.
 //! - Amounts are exact decimals. Inputs with more fractional digits than
 //!   allowed are rejected, never truncated. The only rounding steps are
 //!   the notional (`price * quantity` to the quote asset scale) and the cost
@@ -58,6 +63,7 @@
 //! ```
 
 mod execution;
+mod settlement;
 mod snapshot;
 mod valuation;
 
@@ -66,6 +72,7 @@ use std::collections::BTreeMap;
 use rust_decimal::Decimal;
 
 pub use execution::{Booking, Execution, ExecutionCashflow, Fee, Side};
+pub use settlement::{DerivativeSettlement, SettlementBooking, SettlementCashflow};
 
 pub use snapshot::{BalanceSnapshot, LedgerSnapshot, PositionSnapshot};
 pub use valuation::{AssetPnl, PositionValuation, Valuation};
@@ -174,6 +181,9 @@ pub struct Ledger {
     net_transfers: BTreeMap<Asset, Decimal>,
     executions: BTreeMap<ExecutionId, (Execution, usize)>,
     journal: Vec<ExecutionCashflow>,
+    settlements: BTreeMap<ExecutionId, (DerivativeSettlement, usize)>,
+    settlement_journal: Vec<SettlementCashflow>,
+    settled_pnl: BTreeMap<Asset, Decimal>,
 }
 
 impl Ledger {
@@ -216,7 +226,8 @@ impl Ledger {
                 self.assets.insert(asset.clone(), scale);
                 self.balances.insert(asset.clone(), Balance::default());
                 self.net_transfers.insert(asset.clone(), Decimal::ZERO);
-                self.fees_paid.insert(asset, Decimal::ZERO);
+                self.fees_paid.insert(asset.clone(), Decimal::ZERO);
+                self.settled_pnl.insert(asset, Decimal::ZERO);
                 Ok(())
             }
         }
@@ -233,7 +244,7 @@ impl Ledger {
     /// - [`MarginError::InvalidInput`] if the quantity scale exceeds the base
     ///   asset scale.
     /// - [`MarginError::AlreadyRegistered`] if a different instrument uses the
-    ///   same identifier.
+    ///   same identifier, or a derivative settlement was booked under it.
     pub fn register_instrument(&mut self, instrument: impl Into<Instrument>) -> Result<()> {
         let instrument = instrument.into();
         match &instrument {
@@ -249,6 +260,12 @@ impl Ledger {
             }
         }
         let id = instrument.id().clone();
+        if self.settlement_journal.iter().any(|s| s.instrument == id) {
+            return Err(MarginError::AlreadyRegistered {
+                kind: "derivative instrument",
+                id: id.to_string(),
+            });
+        }
         match self.instruments.get(&id) {
             Some(existing) if *existing == instrument => Ok(()),
             Some(_) => Err(MarginError::AlreadyRegistered {
@@ -630,6 +647,12 @@ impl Ledger {
                 id: execution.id.to_string(),
             });
         }
+        if self.settlements.contains_key(&execution.id) {
+            return Err(MarginError::ConflictingEntry {
+                kind: "execution",
+                id: execution.id.to_string(),
+            });
+        }
 
         let instrument = self.instruments.get(&execution.instrument).ok_or_else(|| {
             MarginError::UnknownInstrument {
@@ -815,6 +838,124 @@ impl Ledger {
         Ok((Booking::Booked(cashflow), shortfalls))
     }
 
+    // ----- derivative settlements --------------------------------------
+
+    /// Books the cash settlement of a derivative fill. See
+    /// [`DerivativeSettlement`].
+    ///
+    /// The asset's total balance changes by `realized_pnl - fee`, the fee is
+    /// added to the fees paid and the realized PnL to
+    /// [`Ledger::settled_pnl`]. The settlement is mandatory: it is booked
+    /// even when it leaves the balance below its reservations or negative,
+    /// and the result reports that shortfall. Booking the identical
+    /// settlement again changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// The ledger is unchanged on any error.
+    ///
+    /// - [`MarginError::ConflictingEntry`]: the id was booked as a different
+    ///   settlement or as a spot execution.
+    /// - [`MarginError::UnknownAsset`]: the asset is not registered.
+    /// - [`MarginError::InvalidInput`]: the instrument is a registered spot
+    ///   instrument.
+    /// - [`MarginError::PrecisionExceeded`]: an amount has more fractional
+    ///   digits than the asset allows.
+    /// - [`MarginError::Arithmetic`]: an amount overflows.
+    pub fn book_settlement(
+        &mut self,
+        settlement: &DerivativeSettlement,
+    ) -> Result<SettlementBooking> {
+        if let Some((previous, index)) = self.settlements.get(&settlement.id) {
+            if previous == settlement {
+                return Ok(SettlementBooking {
+                    cashflow: self.settlement_journal[*index].clone(),
+                    is_new: false,
+                    shortfall: None,
+                });
+            }
+            return Err(MarginError::ConflictingEntry {
+                kind: "settlement",
+                id: settlement.id.to_string(),
+            });
+        }
+        if self.executions.contains_key(&settlement.id) {
+            return Err(MarginError::ConflictingEntry {
+                kind: "settlement",
+                id: settlement.id.to_string(),
+            });
+        }
+        if self.instruments.contains_key(&settlement.instrument) {
+            return Err(MarginError::invalid_input(
+                "instrument",
+                "a settlement is for a derivative held outside the ledger",
+            ));
+        }
+        let scale = self.asset_scale_or_err(&settlement.asset)?;
+        check_scale(settlement.realized_pnl, scale, "realized_pnl")?;
+        check_scale(settlement.fee, scale, "fee")?;
+
+        let balance = self.balance_of(&settlement.asset)?;
+        let delta = sub(settlement.realized_pnl, settlement.fee, "realized - fee")?;
+        let total = add(balance.total, delta, "balance + settlement")?;
+        let available_after = sub(total, balance.reserved, "total - reserved")?;
+        let shortfall =
+            (delta < Decimal::ZERO && available_after < Decimal::ZERO).then_some(-available_after);
+        let fees = add(
+            self.fees_paid(&settlement.asset),
+            settlement.fee,
+            "fees_paid + fee",
+        )?;
+        let settled = add(
+            self.settled_pnl(&settlement.asset),
+            settlement.realized_pnl,
+            "settled_pnl + realized",
+        )?;
+
+        // Commit: nothing below can fail.
+        self.balances.insert(
+            settlement.asset.clone(),
+            Balance {
+                total,
+                reserved: balance.reserved,
+            },
+        );
+        self.fees_paid.insert(settlement.asset.clone(), fees);
+        self.settled_pnl.insert(settlement.asset.clone(), settled);
+        let index = self.settlement_journal.len();
+        let cashflow = SettlementCashflow {
+            id: settlement.id.clone(),
+            sequence: index as u64,
+            instrument: settlement.instrument.clone(),
+            asset: settlement.asset.clone(),
+            realized_pnl: settlement.realized_pnl,
+            fee: settlement.fee,
+            delta,
+            balance_after: total,
+        };
+        self.settlement_journal.push(cashflow.clone());
+        self.settlements
+            .insert(settlement.id.clone(), (settlement.clone(), index));
+        Ok(SettlementBooking {
+            cashflow,
+            is_new: true,
+            shortfall,
+        })
+    }
+
+    /// Booked settlements in booking order.
+    #[must_use]
+    pub fn settlement_journal(&self) -> &[SettlementCashflow] {
+        &self.settlement_journal
+    }
+
+    /// Cumulative realized PnL paid by settlements in `asset`, gross of
+    /// fees (zero if none or unregistered).
+    #[must_use]
+    pub fn settled_pnl(&self, asset: &Asset) -> Decimal {
+        self.settled_pnl.get(asset).copied().unwrap_or_default()
+    }
+
     // ----- reads --------------------------------------------------------
 
     /// Balance of a registered asset.
@@ -881,8 +1022,10 @@ impl Ledger {
                 .filter_map(|id| self.position(id).map(|p| (id.clone(), p)))
                 .collect(),
             fees_paid: self.fees_paid.clone(),
+            settled_pnl: self.settled_pnl.clone(),
             reservations: self.reservations.clone(),
             executions_booked: self.journal.len() as u64,
+            settlements_booked: self.settlement_journal.len() as u64,
         }
     }
 
@@ -962,6 +1105,15 @@ impl Ledger {
             );
         }
         // Per asset sums and net PnL, each one exact wide sum.
+        for (asset, settled) in &self.settled_pnl {
+            if !settled.is_zero() {
+                asset_terms
+                    .entry(asset.clone())
+                    .or_default()
+                    .0
+                    .push(*settled);
+            }
+        }
         for (asset, line) in by_asset.iter_mut() {
             if let Some((realized, unrealized)) = asset_terms.get(asset) {
                 line.realized_pnl = decimal::sum(realized, "realized sum")?;
@@ -1023,6 +1175,27 @@ impl Ledger {
         let mut quantity_terms: BTreeMap<&InstrumentId, Vec<Decimal>> = BTreeMap::new();
         let mut cash_terms: BTreeMap<&InstrumentId, Vec<Decimal>> = BTreeMap::new();
         let mut transfer_terms: BTreeMap<&Asset, Vec<Decimal>> = BTreeMap::new();
+        let mut settled_terms: BTreeMap<&Asset, Vec<Decimal>> = BTreeMap::new();
+        for settlement in &self.settlement_journal {
+            totals
+                .entry(&settlement.asset)
+                .or_default()
+                .push(settlement.delta);
+            fee_terms
+                .entry(&settlement.asset)
+                .or_default()
+                .push(settlement.fee);
+            settled_terms
+                .entry(&settlement.asset)
+                .or_default()
+                .push(settlement.realized_pnl);
+            mismatch(
+                "settlement delta = realized - fee",
+                settlement.id.as_str(),
+                sub(settlement.realized_pnl, settlement.fee, "realized - fee")?,
+                settlement.delta,
+            )?;
+        }
         for transfer in self.transfers.values() {
             totals
                 .entry(&transfer.asset)
@@ -1085,6 +1258,13 @@ impl Ledger {
             let expected = total_of(transfer_terms.get(asset), "reconcile transfers")?;
             let actual = self.net_transfers.get(asset).copied().unwrap_or_default();
             mismatch("net_transfers", asset.as_str(), expected, actual)?;
+            let expected = total_of(settled_terms.get(asset), "reconcile settlements")?;
+            mismatch(
+                "settled_pnl",
+                asset.as_str(),
+                expected,
+                self.settled_pnl(asset),
+            )?;
         }
         for (id, position) in &self.positions {
             let expected = total_of(quantity_terms.get(id), "reconcile quantity")?;
