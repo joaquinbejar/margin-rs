@@ -39,7 +39,7 @@ use std::collections::BTreeSet;
 
 use rust_decimal::Decimal;
 
-use crate::decimal::{Rounding, add, check_configured_scale, product, sub, sum_terms_round};
+use crate::decimal::{Rounding, check_configured_scale, product, sub, sum, sum_terms_round};
 use crate::error::{MarginError, Result};
 use crate::ids::Asset;
 use crate::initial_margin::{
@@ -242,8 +242,6 @@ impl InitialMarginModel for TieredLinearIm {
     fn requirement(&self, view: &ExposureView) -> Result<MarginRequirement> {
         let mut seen = BTreeSet::new();
         let mut positions = Vec::with_capacity(view.positions.len());
-        let mut initial = Decimal::ZERO;
-        let mut maintenance = Decimal::ZERO;
         for position in &view.positions {
             if !seen.insert(&position.instrument) {
                 return Err(MarginError::invalid_input(
@@ -251,11 +249,13 @@ impl InitialMarginModel for TieredLinearIm {
                     "at most one position per instrument",
                 ));
             }
-            let requirement = self.position(position)?;
-            initial = add(initial, requirement.initial, "total initial")?;
-            maintenance = add(maintenance, requirement.maintenance, "total maintenance")?;
-            positions.push(requirement);
+            positions.push(self.position(position)?);
         }
+        // Totals: exact wide sums of the rounded positions.
+        let initials: Vec<Decimal> = positions.iter().map(|p| p.initial).collect();
+        let maintenances: Vec<Decimal> = positions.iter().map(|p| p.maintenance).collect();
+        let initial = sum(&initials, "total initial")?;
+        let maintenance = sum(&maintenances, "total maintenance")?;
         Ok(MarginRequirement {
             rule: self.id.clone(),
             account: view.account.clone(),

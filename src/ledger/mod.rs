@@ -593,11 +593,26 @@ impl Ledger {
             Side::Sell => (-execution.quantity, -notional),
         };
 
-        let mut deltas: BTreeMap<Asset, Decimal> = BTreeMap::new();
-        accumulate(&mut deltas, spot.base(), signed_quantity)?;
-        accumulate(&mut deltas, spot.quote(), -signed_value)?;
+        // Changes per asset, each summed in one exact step (a fee in the
+        // base or quote asset joins that asset's change).
+        let mut changes: BTreeMap<Asset, Vec<Decimal>> = BTreeMap::new();
+        changes
+            .entry(spot.base().clone())
+            .or_default()
+            .push(signed_quantity);
+        changes
+            .entry(spot.quote().clone())
+            .or_default()
+            .push(-signed_value);
         if let Some(fee) = &execution.fee {
-            accumulate(&mut deltas, &fee.asset, -fee.amount)?;
+            changes
+                .entry(fee.asset.clone())
+                .or_default()
+                .push(-fee.amount);
+        }
+        let mut deltas: BTreeMap<Asset, Decimal> = BTreeMap::new();
+        for (asset, values) in changes {
+            deltas.insert(asset, decimal::sum(&values, "delta accumulation")?);
         }
 
         // Reservation consumed by this execution: (id, asset, remaining,
@@ -819,6 +834,7 @@ impl Ledger {
             })
             .collect();
         let mut positions = BTreeMap::new();
+        let mut asset_terms: BTreeMap<Asset, (Vec<Decimal>, Vec<Decimal>)> = BTreeMap::new();
         for (id, position) in &self.positions {
             let quote = self
                 .instruments
@@ -848,9 +864,9 @@ impl Ledger {
                 (Some(mark), value)
             };
             let unrealized_pnl = sub(market_value, position.cost_basis, "market_value - cost")?;
-            let line = by_asset.entry(quote.clone()).or_default();
-            line.realized_pnl = add(line.realized_pnl, position.realized_pnl, "realized sum")?;
-            line.unrealized_pnl = add(line.unrealized_pnl, unrealized_pnl, "unrealized sum")?;
+            let terms = asset_terms.entry(quote.clone()).or_default();
+            terms.0.push(position.realized_pnl);
+            terms.1.push(unrealized_pnl);
             positions.insert(
                 id.clone(),
                 PositionValuation {
@@ -864,13 +880,18 @@ impl Ledger {
                 },
             );
         }
-        for line in by_asset.values_mut() {
-            let gross = add(
-                line.realized_pnl,
-                line.unrealized_pnl,
-                "realized + unrealized",
-            )?;
-            line.net_pnl = sub(gross, line.fees_paid, "gross - fees")?;
+        // Per asset sums and net PnL, each one exact wide sum.
+        for (asset, line) in by_asset.iter_mut() {
+            if let Some((realized, unrealized)) = asset_terms.get(asset) {
+                line.realized_pnl = decimal::sum(realized, "realized sum")?;
+                line.unrealized_pnl = decimal::sum(unrealized, "unrealized sum")?;
+            }
+            let mut net = asset_terms
+                .get(asset)
+                .map(|(r, u)| r.iter().chain(u).copied().collect::<Vec<_>>())
+                .unwrap_or_default();
+            net.push(-line.fees_paid);
+            line.net_pnl = decimal::sum(&net, "realized + unrealized - fees")?;
         }
         Ok(Valuation {
             positions,
@@ -913,46 +934,56 @@ impl Ledger {
     /// [`MarginError::ReconciliationMismatch`] naming the first failed check,
     /// or [`MarginError::Arithmetic`] on overflow.
     pub fn reconcile(&self) -> Result<Reconciliation> {
-        let mut totals: BTreeMap<&Asset, Decimal> = BTreeMap::new();
-        let mut reserved: BTreeMap<&Asset, Decimal> = BTreeMap::new();
-        let mut fees: BTreeMap<&Asset, Decimal> = BTreeMap::new();
-        let mut quantities: BTreeMap<&InstrumentId, Decimal> = BTreeMap::new();
-        let mut trade_cash: BTreeMap<&InstrumentId, Decimal> = BTreeMap::new();
-
-        let mut transfer_sums: BTreeMap<&Asset, Decimal> = BTreeMap::new();
+        // Every figure is the exact wide sum of its terms, independent of
+        // order: partial sums never need to be representable.
+        let mut totals: BTreeMap<&Asset, Vec<Decimal>> = BTreeMap::new();
+        let mut reserved_terms: BTreeMap<&Asset, Vec<Decimal>> = BTreeMap::new();
+        let mut fee_terms: BTreeMap<&Asset, Vec<Decimal>> = BTreeMap::new();
+        let mut quantity_terms: BTreeMap<&InstrumentId, Vec<Decimal>> = BTreeMap::new();
+        let mut cash_terms: BTreeMap<&InstrumentId, Vec<Decimal>> = BTreeMap::new();
+        let mut transfer_terms: BTreeMap<&Asset, Vec<Decimal>> = BTreeMap::new();
         for transfer in self.transfers.values() {
-            let entry = totals.entry(&transfer.asset).or_default();
-            *entry = add(*entry, transfer.signed_amount(), "reconcile transfers")?;
-            let entry = transfer_sums.entry(&transfer.asset).or_default();
-            *entry = add(*entry, transfer.signed_amount(), "reconcile transfers")?;
+            totals
+                .entry(&transfer.asset)
+                .or_default()
+                .push(transfer.signed_amount());
+            transfer_terms
+                .entry(&transfer.asset)
+                .or_default()
+                .push(transfer.signed_amount());
         }
         for (asset, amount) in self.reservations.values() {
-            let entry = reserved.entry(asset).or_default();
-            *entry = add(*entry, *amount, "reconcile reservations")?;
+            reserved_terms.entry(asset).or_default().push(*amount);
         }
         for cashflow in &self.journal {
             for (asset, delta) in &cashflow.deltas {
-                let entry = totals.entry(asset).or_default();
-                *entry = add(*entry, *delta, "reconcile deltas")?;
+                totals.entry(asset).or_default().push(*delta);
             }
             if let Some(fee) = &cashflow.fee {
-                let entry = fees.entry(&fee.asset).or_default();
-                *entry = add(*entry, fee.amount, "reconcile fees")?;
+                fee_terms.entry(&fee.asset).or_default().push(fee.amount);
             }
             let (quantity, cash) = match cashflow.side {
                 Side::Buy => (cashflow.quantity, -cashflow.notional),
                 Side::Sell => (-cashflow.quantity, cashflow.notional),
             };
-            let entry = quantities.entry(&cashflow.instrument).or_default();
-            *entry = add(*entry, quantity, "reconcile quantity")?;
-            let entry = trade_cash.entry(&cashflow.instrument).or_default();
-            *entry = add(*entry, cash, "reconcile trade cash")?;
+            quantity_terms
+                .entry(&cashflow.instrument)
+                .or_default()
+                .push(quantity);
+            cash_terms
+                .entry(&cashflow.instrument)
+                .or_default()
+                .push(cash);
         }
+        let total_of = |terms: Option<&Vec<Decimal>>, op| match terms {
+            Some(values) => decimal::sum(values, op),
+            None => Ok(Decimal::ZERO),
+        };
 
         for (asset, balance) in &self.balances {
-            let expected = totals.get(asset).copied().unwrap_or_default();
+            let expected = total_of(totals.get(asset), "reconcile balance")?;
             mismatch("balance.total", asset.as_str(), expected, balance.total)?;
-            let expected = reserved.get(asset).copied().unwrap_or_default();
+            let expected = total_of(reserved_terms.get(asset), "reconcile reservations")?;
             mismatch(
                 "balance.reserved",
                 asset.as_str(),
@@ -967,22 +998,22 @@ impl Ledger {
                     actual: balance.reserved,
                 });
             }
-            let expected = fees.get(asset).copied().unwrap_or_default();
+            let expected = total_of(fee_terms.get(asset), "reconcile fees")?;
             let actual = self.fees_paid.get(asset).copied().unwrap_or_default();
             mismatch("fees_paid", asset.as_str(), expected, actual)?;
-            let expected = transfer_sums.get(asset).copied().unwrap_or_default();
+            let expected = total_of(transfer_terms.get(asset), "reconcile transfers")?;
             let actual = self.net_transfers.get(asset).copied().unwrap_or_default();
             mismatch("net_transfers", asset.as_str(), expected, actual)?;
         }
         for (id, position) in &self.positions {
-            let expected = quantities.get(id).copied().unwrap_or_default();
+            let expected = total_of(quantity_terms.get(id), "reconcile quantity")?;
             mismatch(
                 "position.quantity",
                 id.as_str(),
                 expected,
                 position.quantity,
             )?;
-            let expected = trade_cash.get(id).copied().unwrap_or_default();
+            let expected = total_of(cash_terms.get(id), "reconcile trade cash")?;
             let actual = sub(
                 position.realized_pnl,
                 position.cost_basis,
@@ -1012,12 +1043,6 @@ fn mismatch(check: &'static str, key: &str, expected: Decimal, actual: Decimal) 
             actual,
         })
     }
-}
-
-fn accumulate(deltas: &mut BTreeMap<Asset, Decimal>, asset: &Asset, delta: Decimal) -> Result<()> {
-    let entry = deltas.entry(asset.clone()).or_default();
-    *entry = add(*entry, delta, "delta accumulation")?;
-    Ok(())
 }
 
 fn position_snapshot(

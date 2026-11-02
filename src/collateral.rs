@@ -237,11 +237,7 @@ pub fn value_collateral(
                     Some(h) => Some(vec![
                         amount,
                         p,
-                        sub(
-                            Decimal::ONE,
-                            add(h, extra, "haircut + extra")?,
-                            "1 - h - extra",
-                        )?,
+                        sum(&[Decimal::ONE, -h, -extra], "1 - h - extra")?,
                     ]),
                     None => Some(Vec::new()),
                 },
