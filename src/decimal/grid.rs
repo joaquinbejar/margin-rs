@@ -166,6 +166,110 @@ impl ContractGrid {
         Ok(GridIndex(quotient.min(self.last)))
     }
 
+    /// The first index in `[from, to]` whose count leaves a position that
+    /// a `Decimal` can hold, when `held` contracts are reduced by it (the
+    /// contracts left, `held - count`, are exact); `None` if there is none.
+    ///
+    /// Found arithmetically, not by walking the grid. With `W` the larger of
+    /// the scales of `held` and the step, `R(k) = (held - k * step) * 10^W`
+    /// is an integer, and the contracts left can be held with `c`
+    /// decimals when `R(k) <= MAXM * 10^(W - c)` (they are small enough)
+    /// and `10^(W - c)` divides `R(k)` (they have at most `c` decimals),
+    /// for some `c <= W`. For each `c` the first condition holds from some
+    /// index on and the second is a linear congruence in `k`; the answer is
+    /// the smallest solution over every `c`. A candidate is confirmed with
+    /// the grid's actual count (which is rounded down near the limits of a
+    /// `Decimal`), and when that rounding makes it differ, at most
+    /// `fallback` further indices are checked one by one.
+    ///
+    /// # Errors
+    ///
+    /// [`MarginError::Arithmetic`] on an overflow of the wide integers.
+    pub(crate) fn first_holding(
+        &self,
+        held: Decimal,
+        (from, to): (GridIndex, GridIndex),
+        fallback: u32,
+    ) -> Result<Option<GridIndex>> {
+        let holds = |k: GridIndex| -> Result<bool> {
+            let count = self.contracts(k)?;
+            Ok(crate::decimal::sub(held, count, "contracts left").is_ok())
+        };
+        if from > to {
+            return Ok(None);
+        }
+        if holds(from)? {
+            return Ok(Some(from));
+        }
+        let error = || MarginError::arithmetic("grid holding index");
+        let held_scale = held.scale();
+        let wide_scale = held_scale.max(self.step_scale);
+        // R(k) = q - k * a, all at scale W.
+        let q = magnitude(held)
+            .checked_mul(
+                wide_scale
+                    .checked_sub(held_scale)
+                    .and_then(U768::pow10)
+                    .ok_or_else(error)?,
+            )
+            .ok_or_else(error)?;
+        let a = self
+            .step
+            .checked_mul(
+                wide_scale
+                    .checked_sub(self.step_scale)
+                    .and_then(U768::pow10)
+                    .ok_or_else(error)?,
+            )
+            .ok_or_else(error)?;
+        let max_mantissa = U768::from_u128((1_u128 << 96) - 1);
+        let mut best: Option<U768> = None;
+        for decimals in 0..=wide_scale {
+            let shift = wide_scale.checked_sub(decimals).ok_or_else(error)?;
+            // Small enough: R(k) <= MAXM * 10^shift, from index k_c on.
+            let bound = max_mantissa
+                .checked_mul(U768::pow10(shift).ok_or_else(error)?)
+                .ok_or_else(error)?;
+            let from_index = match q.checked_sub(bound) {
+                None => U768::ZERO,
+                Some(excess) if excess.is_zero() => U768::ZERO,
+                Some(excess) => ceil_div(excess, a).ok_or_else(error)?,
+            };
+            let low = from_index.max(from.0);
+            if low > to.0 {
+                continue;
+            }
+            // At most `decimals` decimals: 10^shift divides q - k * a.
+            let candidate = if shift == 0 {
+                Some(low)
+            } else {
+                let modulus = U768::pow10(shift).ok_or_else(error)?;
+                first_solution(a, q, modulus, low)?
+            };
+            if let Some(candidate) = candidate
+                && candidate <= to.0
+                && best.is_none_or(|b| candidate < b)
+            {
+                best = Some(candidate);
+            }
+        }
+        let mut k = match best {
+            Some(k) => GridIndex(k),
+            // The last index is the cap itself, not a multiple of the step.
+            None => return Ok(holds(to)?.then_some(to)),
+        };
+        for _ in 0..=fallback {
+            if holds(k)? {
+                return Ok(Some(k));
+            }
+            match self.next(k) {
+                Some(next) if next <= to => k = next,
+                _ => break,
+            }
+        }
+        Ok(None)
+    }
+
     /// `index + 1`, if it is still on the grid.
     pub(crate) fn next(&self, index: GridIndex) -> Option<GridIndex> {
         let next = index.0.checked_add(U768::from_u128(1))?;
@@ -189,6 +293,86 @@ impl ContractGrid {
         // low + half <= high, which is on the grid, so this cannot overflow.
         GridIndex(low.0.checked_add(half).unwrap_or(high.0))
     }
+}
+
+/// `ceil(numerator / denominator)`; `None` for a zero denominator.
+fn ceil_div(numerator: U768, denominator: U768) -> Option<U768> {
+    let (quotient, remainder) = numerator.div_rem(denominator)?;
+    if remainder.is_zero() {
+        Some(quotient)
+    } else {
+        quotient.checked_add(U768::from_u128(1))
+    }
+}
+
+/// The smallest `k >= low` with `k * a == q (mod modulus)`, `None` when
+/// the congruence has no solution. The modulus is a power of ten up to
+/// `10^28`, so the reduced values fit an `i128`.
+///
+/// # Errors
+///
+/// [`MarginError::Arithmetic`] on an overflow.
+fn first_solution(a: U768, q: U768, modulus: U768, low: U768) -> Result<Option<U768>> {
+    let error = || MarginError::arithmetic("grid congruence");
+    let m = modulus.to_u128().ok_or_else(error)?;
+    let a = a
+        .div_rem(modulus)
+        .and_then(|(_, r)| r.to_u128())
+        .ok_or_else(error)?;
+    let q = q
+        .div_rem(modulus)
+        .and_then(|(_, r)| r.to_u128())
+        .ok_or_else(error)?;
+    let g = gcd(a, m);
+    if q.checked_rem(g).ok_or_else(error)? != 0 {
+        return Ok(None);
+    }
+    let period = m.checked_div(g).ok_or_else(error)?;
+    let reduced_a = a.checked_div(g).ok_or_else(error)?;
+    let reduced_q = q.checked_div(g).ok_or_else(error)?;
+    // k = (q / g) * inverse(a / g) mod period.
+    let inverse = inverse_mod(reduced_a, period).ok_or_else(error)?;
+    let period = U768::from_u128(period);
+    let residue = U768::from_u128(reduced_q)
+        .checked_mul(U768::from_u128(inverse))
+        .and_then(|x| x.div_rem(period))
+        .ok_or_else(error)?
+        .1;
+    // The first k >= low with k == residue (mod period).
+    let offset = low.div_rem(period).ok_or_else(error)?.1;
+    let step = if residue >= offset {
+        residue.checked_sub(offset)
+    } else {
+        residue
+            .checked_add(period)
+            .and_then(|x| x.checked_sub(offset))
+    }
+    .ok_or_else(error)?;
+    Ok(Some(low.checked_add(step).ok_or_else(error)?))
+}
+
+fn gcd(mut a: u128, mut b: u128) -> u128 {
+    while let Some(r) = a.checked_rem(b) {
+        a = b;
+        b = r;
+    }
+    a
+}
+
+/// The inverse of `a` modulo `m` (`a` and `m` coprime); 0 when `m == 1`.
+fn inverse_mod(a: u128, m: u128) -> Option<u128> {
+    if m == 1 {
+        return Some(0);
+    }
+    let modulus = i128::try_from(m).ok()?;
+    let (mut old_r, mut r) = (i128::try_from(a.checked_rem(m)?).ok()?, modulus);
+    let (mut old_s, mut s) = (1_i128, 0_i128);
+    while r != 0 {
+        let quotient = old_r.checked_div(r)?;
+        (old_r, r) = (r, old_r.checked_sub(quotient.checked_mul(r)?)?);
+        (old_s, s) = (s, old_s.checked_sub(quotient.checked_mul(s)?)?);
+    }
+    u128::try_from(old_s.checked_rem_euclid(modulus)?).ok()
 }
 
 #[cfg(test)]
@@ -278,5 +462,55 @@ mod tests {
             .floor_index_of(&[&[dec!(3), tiny, tiny]], &[tiny, tiny])
             .expect("index");
         assert_eq!(grid.contracts(index).expect("count"), dec!(3));
+    }
+
+    fn index(k: u128) -> GridIndex {
+        GridIndex(U768::from_u128(k))
+    }
+
+    /// `MAX - n` fits a Decimal only for whole `n` (MAX already uses every
+    /// digit): at a step of 0.1 the first such count is 1 (index 10), at
+    /// 1e-26 it is index 1e26, found without walking; none lies in `[1,
+    /// 9]`.
+    #[test]
+    fn first_holding_jumps_to_counts_that_fit() {
+        let grid = ContractGrid::new(dec!(0.1), Decimal::MAX).expect("grid");
+        assert_eq!(
+            grid.first_holding(Decimal::MAX, (index(1), grid.last()), 0)
+                .expect("index"),
+            Some(index(10))
+        );
+        assert_eq!(
+            grid.first_holding(Decimal::MAX, (index(1), index(9)), 0)
+                .expect("index"),
+            None
+        );
+        let grid = ContractGrid::new(Decimal::new(1, 26), dec!(100)).expect("grid");
+        let k = grid
+            .first_holding(Decimal::MAX, (index(1), grid.last()), 0)
+            .expect("index")
+            .expect("a count");
+        assert_eq!(grid.contracts(k).expect("count"), dec!(1));
+        assert_eq!(k, index(100_000_000_000_000_000_000_000_000));
+    }
+
+    /// 1e27 + 0.5 contracts hold one decimal at most: at a step of 0.25 the
+    /// first count that fits is 0.5 (index 2), and every count does once
+    /// the step itself is 0.5.
+    #[test]
+    fn first_holding_with_a_fractional_position() {
+        let held = dec!(1000000000000000000000000000.5);
+        let grid = ContractGrid::new(dec!(0.25), dec!(10)).expect("grid");
+        assert_eq!(
+            grid.first_holding(held, (index(1), grid.last()), 0)
+                .expect("index"),
+            Some(index(2))
+        );
+        let grid = ContractGrid::new(dec!(0.5), dec!(10)).expect("grid");
+        assert_eq!(
+            grid.first_holding(held, (index(1), grid.last()), 0)
+                .expect("index"),
+            Some(index(1))
+        );
     }
 }

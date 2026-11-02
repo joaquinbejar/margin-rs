@@ -435,3 +435,62 @@ fn near_decimal_max_a_coarse_step_is_exact() {
         taken - step
     ));
 }
+
+/// `Decimal::MAX` contracts at a step of 1e-26: the counts that can be
+/// booked (whole contracts, since `MAX - n` must fit) are 1e26 steps
+/// apart, and the search jumps to them arithmetically instead of walking
+/// the counts in between (which once took about 1.3e25 iterations).
+///
+/// - Long, marked at 1e-28 (worth 8 after rounding, basis 8), cash 0,
+///   initial margin 1, sold at 1: one whole contract, leaving cash and
+///   collateral of 1, is the smallest count that meets the target, with a
+///   level of either 100 or 2.5.
+/// - The short mirror, bought back at 1e-18: no count of the 100 meets the
+///   target, and the plan takes the whole level.
+#[test]
+fn counts_that_cannot_be_booked_are_jumped_over() {
+    let rule = TieredLinearIm::new(RuleId::new("coarse", 1), asset("USD"), 0, one_tier()).unwrap();
+    let tiny = dec!(0.0000000000000000000000000001);
+    let step = dec!(0.00000000000000000000000001);
+    let cases = [
+        (Decimal::MAX, dec!(8), dec!(1), dec!(100), dec!(1)),
+        (Decimal::MAX, dec!(8), dec!(1), dec!(2.5), dec!(1)),
+        (
+            -Decimal::MAX,
+            dec!(-8),
+            dec!(0.000000000000000001),
+            dec!(100),
+            dec!(100),
+        ),
+    ];
+    for (contracts, basis, price, cap, taken) in cases {
+        let account = account(
+            ProductKind::LinearPerpetual,
+            &asset("USD"),
+            (contracts, ContractSize::Multiplier(dec!(1)), tiny),
+            basis,
+            dec!(0),
+        );
+        let started = std::time::Instant::now();
+        let plan = plan_liquidation(
+            &rule,
+            &account,
+            &level(price, cap),
+            &policy(CloseoutTarget::Initial, step),
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(plan.minimal);
+        assert_eq!(plan.reductions[0].contracts, taken);
+        let expected = if contracts > dec!(0) {
+            CloseoutOutcome::TargetMet
+        } else {
+            CloseoutOutcome::LiquidityExhausted
+        };
+        assert_eq!(plan.outcome, expected);
+    }
+}

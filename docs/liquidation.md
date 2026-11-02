@@ -148,12 +148,14 @@ The booked figures, however, are rounded: half-even fill value and released basi
    Both are intervals of the grid: the cash is linear and the excess concave, peaking at an end of the level or next to a tier floor. Their ends are found by exact bisection; a floor is crossed at `n = |Qc| - floor / (M * mark)`, or `|Qc| - floor * mark / CV`, kept in wide integers.
 3. **Walk.** The plan walks `J` upward, from its start to the start of `J'`, evaluating each count exactly as it would be booked, and takes the first that meets the target: the smallest on the level.
    - If `J` is empty, no count meets the target, and the plan takes the whole level.
-   - A count that would leave a position no `Decimal` can hold cannot be booked, and is skipped.
+   - A count that would leave a position no `Decimal` can hold cannot be booked. The walk jumps over such counts to the next one that can be booked, arithmetically and without visiting them: one linear congruence per number of decimals the contracts left can have. For example, with `Decimal::MAX` contracts and a step of `1e-26`, only whole contracts can be booked, `1e26` steps apart.
 
 The walk is short when the quantum is fine against what one step changes: a few counts for real cash quanta. All levels of one call share a budget of `SEARCH_BUDGET` = 4096 exact evaluations, which costs a few tens of milliseconds in an optimized build. When the budget runs out:
 
-- **`J'` not empty.** The plan takes the first count of `J'`, which meets the target, and reports `LiquidationPlan::minimal == false`. The count before it is not certified: unrounded, its cash is below `2q` or its excess below `3q`. This bound is in money, not in contracts. With a step that changes almost nothing, the certified count can be many contracts above the smallest.
-- **`J'` empty.** No count of the level is certified. The plan fails with `CloseoutSearchLimit { instrument, level, limit }`, and nothing is planned.
+- **`J'` not empty.** The plan takes the first count of `J'` that can be booked, which meets the target, and reports `LiquidationPlan::minimal == false`.
+  - The count just before the start of `J'` is not certified: unrounded, its cash is below `2q` or its excess below `3q`. This bound is in money, not in contracts. With a step that changes almost nothing, the certified count can be many contracts above the smallest.
+  - Counts that cannot be booked (for example `1e28 - n.5` contracts) are jumped over as in the walk. If no count that can be booked lies between the last one evaluated and the certified one, the certified count is the smallest, and `minimal` stays true. The certified count is evaluated once more and must meet the target.
+- **Otherwise.** If `J'` is empty, or none of its counts can be booked, the plan fails with `CloseoutSearchLimit { instrument, level, limit }`, and nothing is planned.
 
 `tests/closeout_oracle.rs` checks the search against an exhaustive oracle that tries every count on the grid. It covers 19 200 cases: linear and inverse, with cash at 0, 1, 2 and 8 decimals, one to three levels (including levels where no count meets the target), one and two tiers, fees of 0 and 0.3 %, long and short positions, and cash swept across the target. The plan matches the oracle on every case. `tests/closeout_search.rs` names the two rounding windows (inverse and linear), the breakpoints whose numerator overflows a `Decimal`, and an exact minimum near `Decimal::MAX`.
 

@@ -256,8 +256,8 @@ pub enum MarginError {
     },
 
     /// The closeout planner could not resolve the smallest count of a level
-    /// exactly within its work budget, and no count of that level is
-    /// certified to meet the target. Nothing is planned.
+    /// exactly within its work budget, and no count of that level that can
+    /// be booked is certified to meet the target. Nothing is planned.
     #[error(
         "closeout of {instrument} on level {level} needs more than {limit} exact evaluations to resolve"
     )]

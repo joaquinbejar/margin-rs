@@ -129,20 +129,29 @@
 //!    takes the first that meets the target: the smallest on the level.
 //!    If `J` is empty no count meets the target, and the plan takes the
 //!    whole level. A count that would leave a position a `Decimal` cannot
-//!    hold cannot be booked and is skipped.
+//!    hold cannot be booked: the walk jumps over such counts
+//!    arithmetically to the next one that can be, without visiting them
+//!    (a congruence per number of decimals the contracts left can have;
+//!    a step far finer than the position's precision can leave whole
+//!    contracts as the only such counts).
 //!
 //! The walk is short when the quantum is fine against what one step
 //! changes (a few counts for real cash quanta). It shares one budget per
 //! plan, [`SEARCH_BUDGET`] exact evaluations. When the budget runs out:
 //!
-//! - if `J'` is not empty the plan takes its first count, which meets the
-//!   target, and reports [`LiquidationPlan::minimal`] `== false`. The count
-//!   before it is not certified: unrounded, its cash is below `2q` or its
-//!   excess below `3q`. This bounds the money, not the contracts: with a
-//!   step that changes almost nothing, the certified count can be many
-//!   contracts above the smallest one;
-//! - if `J'` is empty no count of the level is certified, and the plan
-//!   fails with [`MarginError::CloseoutSearchLimit`]; nothing is planned.
+//! - if `J'` is not empty the plan takes its first count that can be
+//!   booked, which meets the target, and reports
+//!   [`LiquidationPlan::minimal`] `== false`. The first count of `J'` is
+//!   preceded by one that is not certified: unrounded, its cash is below
+//!   `2q` or its excess below `3q`. This bounds the money, not the
+//!   contracts: with a step that changes almost nothing, the certified
+//!   count can be many contracts above the smallest one. When no count
+//!   that can be booked lies between the last one evaluated and the
+//!   certified one, the certified count is the smallest and `minimal`
+//!   stays true. The certified count is evaluated once more and must meet
+//!   the target;
+//! - otherwise (`J'` empty, or no count of it can be booked) the plan fails
+//!   with [`MarginError::CloseoutSearchLimit`]; nothing is planned.
 //!
 //! If the exact evaluation itself does not fit the wide integers, `J` is
 //! the whole level and no count is certified in advance. The search is
@@ -717,44 +726,79 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
         };
         let Some((start, end)) = possible else {
             // No count on the level meets the target.
-            return at(last);
+            return Self::whole_level(&grid, size, last, &at);
         };
-        let stop = certain.map_or(end, |(certain_start, _)| certain_start.min(end));
+        // Only counts whose remaining position a Decimal can hold can be
+        // booked; the walk jumps to them arithmetically.
+        let holding =
+            |from: GridIndex, to: GridIndex| grid.first_holding(size, (from, to), self.limit);
+        let certified = |k: GridIndex| certain.is_some_and(|(low, high)| low <= k && k <= high);
         let mut k = start;
-        loop {
+        while let Some(next) = holding(k, end)? {
+            k = next;
             let left = self.budget.get();
             if left == 0 {
-                return match certain {
-                    Some(span) => {
-                        self.minimal.set(false);
-                        first_bookable(&grid, span, &at)
-                    }
-                    None => Err(MarginError::CloseoutSearchLimit {
-                        instrument: exposure.instrument.clone(),
-                        level,
-                        limit: self.limit,
-                    }),
+                let limit = MarginError::CloseoutSearchLimit {
+                    instrument: exposure.instrument.clone(),
+                    level,
+                    limit: self.limit,
                 };
+                // Every count of J' that can be booked meets the target.
+                let Some((low, high)) = certain else {
+                    return Err(limit);
+                };
+                let Some(count) = holding(k.max(low), high)? else {
+                    return Err(limit);
+                };
+                // Minimal when no count that can be booked lies between
+                // the last one evaluated and this one.
+                if holding(k, count)? != Some(count) {
+                    self.minimal.set(false);
+                }
+                return self.certified_count(at(count)?);
             }
             self.budget.set(left.saturating_sub(1));
-            // A count that leaves an unrepresentable position cannot be
-            // booked: it does not meet the target.
-            if let Some(attempt) = bookable(at(k))?
-                && self.met(&attempt.2)
-            {
+            let attempt = at(k)?;
+            if certified(k) {
+                return self.certified_count(attempt);
+            }
+            if self.met(&attempt.2) {
                 return Ok(attempt);
             }
-            if k >= stop {
-                break;
-            }
             match grid.next(k) {
-                Some(next) => k = next,
-                None => break,
+                Some(next) if next <= end => k = next,
+                _ => break,
             }
         }
-        if certain.is_some() {
-            // The first count of J' meets the target by construction.
-            return Err(MarginError::arithmetic("certified closeout count"));
+        // No count of J that can be booked meets the target.
+        Self::whole_level(&grid, size, last, &at)
+    }
+
+    /// A count certified to meet the target, checked.
+    fn certified_count(
+        &self,
+        attempt: (State, ForcedReduction, AccountSummary),
+    ) -> Result<(State, ForcedReduction, AccountSummary)> {
+        if self.met(&attempt.2) {
+            Ok(attempt)
+        } else {
+            // The margin tiers disagree with the rule's requirement.
+            Err(MarginError::arithmetic("certified closeout count"))
+        }
+    }
+
+    /// The whole level, when no smaller count meets the target.
+    fn whole_level(
+        grid: &ContractGrid,
+        size: Decimal,
+        last: GridIndex,
+        at: &dyn Fn(GridIndex) -> Result<(State, ForcedReduction, AccountSummary)>,
+    ) -> Result<(State, ForcedReduction, AccountSummary)> {
+        if grid.first_holding(size, (last, last), 0)?.is_none() {
+            return Err(MarginError::invalid_input(
+                "liquidity",
+                "closing the whole level leaves a position no Decimal can hold",
+            ));
         }
         at(last)
     }
@@ -1460,37 +1504,6 @@ fn last_true(
     Some(low)
 }
 
-/// The evaluation of a count, or `None` when the count leaves a position
-/// that cannot be represented (it cannot be booked either).
-fn bookable<T>(evaluation: Result<T>) -> Result<Option<T>> {
-    match evaluation {
-        Ok(value) => Ok(Some(value)),
-        Err(MarginError::Arithmetic {
-            operation: "Qc - n" | "Qc + n",
-        }) => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-/// The first count of a certified span whose position can be booked: every
-/// count of the span meets the target once it is representable.
-fn first_bookable<T>(
-    grid: &ContractGrid,
-    (start, end): Span,
-    at: &dyn Fn(GridIndex) -> Result<T>,
-) -> Result<T> {
-    let mut k = start;
-    loop {
-        if let Some(value) = bookable(at(k))? {
-            return Ok(value);
-        }
-        match grid.next(k) {
-            Some(next) if next <= end => k = next,
-            _ => return Err(MarginError::arithmetic("Qc - n")),
-        }
-    }
-}
-
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -1631,6 +1644,122 @@ mod tests {
             plan_with_budget(&model, &account, &bid(dec!(0.99)), &with(step), 4097).unwrap();
         assert!(enough.minimal);
         assert!(enough.reductions[0].contracts < taken);
+    }
+
+    /// 1e28 long marked at 0.001 (basis 1e25, upnl 0), cash 5e23 - 5e11 in
+    /// whole units, maintenance 5 %, sold at 0.0010007. Each count changes
+    /// almost nothing against the quantum of 1, so a small budget runs out
+    /// and the plan falls back to J'. With a step of 0.5 the first count of
+    /// J' (9861932938915187.5) leaves 1e28 - n.5 contracts, which no
+    /// `Decimal` holds: it cannot be booked, and the plan takes the next
+    /// count. At a step of 1e-12 the jump finds the same count; when no
+    /// count of J' can be booked, the plan is refused.
+    #[test]
+    fn the_fallback_skips_counts_it_cannot_book() {
+        let held = dec!(10000000000000000000000000000);
+        let account = LiquidationAccount {
+            cash: dec!(499999999999500000000000),
+            basis: BTreeMap::from([(iid("A"), dec!(10000000000000000000000000))]),
+            ..account(held, dec!(0), dec!(0))
+        };
+        let mut account = account;
+        account.view.positions[0].mark = dec!(0.001);
+        let price = dec!(0.0010007);
+        let model = TieredLinearIm::new(
+            RuleId::new("coarse", 1),
+            Asset::new("USD").unwrap(),
+            0,
+            vec![MarginTier {
+                floor: dec!(0),
+                initial_rate: dec!(0.10),
+                maintenance_rate: dec!(0.05),
+            }],
+        )
+        .unwrap();
+        let liquidity = BTreeMap::from([(
+            iid("A"),
+            vec![LiquidityLevel {
+                price,
+                contracts: held,
+            }],
+        )]);
+        let policy = |step| LiquidationPolicy {
+            target: CloseoutTarget::Maintenance,
+            fee_rate: dec!(0),
+            contract_step: step,
+        };
+
+        // The first count of J' at a step of 0.5.
+        let half = policy(dec!(0.5));
+        let planner = Planner {
+            model: &model,
+            policy: &half,
+            account: &account,
+            scale: 0,
+            budget: Cell::new(0),
+            limit: 0,
+            minimal: Cell::new(true),
+        };
+        let state = State {
+            cash: account.cash,
+            positions: vec![Open {
+                exposure: account.view.positions[0].clone(),
+                basis: account.basis[&iid("A")],
+            }],
+        };
+        let grid = ContractGrid::new(dec!(0.5), held).unwrap();
+        let first = grid.next(GridIndex::ZERO).unwrap();
+        let (_, certain) = planner
+            .continuous(&state, 0, price)
+            .unwrap()
+            .certify(&grid, first, grid.last(), 0)
+            .unwrap();
+        let first_certified = certain.span().unwrap().0;
+        let start = grid.contracts(first_certified).unwrap();
+        assert_eq!(start.fract(), dec!(0.5));
+        assert_eq!(
+            grid.first_holding(held, (first_certified, first_certified), 0)
+                .unwrap(),
+            None
+        );
+
+        let plan = plan_with_budget(&model, &account, &liquidity, &half, 16).unwrap();
+        assert!(!plan.minimal);
+        assert_eq!(plan.reductions[0].contracts, start + dec!(0.5));
+        assert_eq!(plan.outcome, CloseoutOutcome::TargetMet);
+
+        // At a step of 1e-12 the counts that can be booked are 1e12 steps
+        // apart: the walk jumps to them arithmetically and finds the same
+        // count, with no loop over the others.
+        let fine = plan_with_budget(
+            &model,
+            &account,
+            &liquidity,
+            &policy(dec!(0.000000000001)),
+            16,
+        )
+        .unwrap();
+        assert!(!fine.minimal);
+        assert_eq!(fine.reductions[0].contracts, start + dec!(0.5));
+
+        // A level of ...187.75 at a step of 0.25: every count of J' (and the
+        // whole level) leaves a fraction of 1e28 contracts that no Decimal
+        // holds. Nothing certified can be booked: the plan is refused.
+        let short_level = BTreeMap::from([(
+            iid("A"),
+            vec![LiquidityLevel {
+                price,
+                contracts: start + dec!(0.25),
+            }],
+        )]);
+        assert_eq!(
+            plan_with_budget(&model, &account, &short_level, &policy(dec!(0.25)), 16),
+            Err(MarginError::CloseoutSearchLimit {
+                instrument: iid("A"),
+                level: 0,
+                limit: 16,
+            })
+        );
     }
 
     /// 40 long, basis 45, cash 9, sold at 0.99, whole units. The counts
