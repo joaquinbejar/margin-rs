@@ -1,7 +1,7 @@
-//! Until margin rules and closeout plans support inverse futures and
-//! perpetuals (#26, parts B and C), every consumer that meets an open
-//! inverse position refuses it with a typed error: it is never skipped, so
-//! its requirement or its value can never go missing.
+//! Until closeout plans support inverse futures and perpetuals (#26, part
+//! C), every consumer that meets an open inverse position and cannot value
+//! or margin it refuses it with a typed error: it is never skipped, so its
+//! requirement or its value can never go missing.
 
 #![allow(
     clippy::unwrap_used,
@@ -15,13 +15,12 @@ use std::collections::BTreeMap;
 use margin_rs::initial_margin::ProductKind;
 use margin_rs::ledger::{Action, Execution, Ledger};
 use margin_rs::liquidation::LiquidationAccount;
-use margin_rs::margin_reservations::{MarginInstrument, MarginOrder, MarginReservationService};
 use margin_rs::risk::{InstrumentLimits, OrderRequest, RiskDecision, RiskGate, RiskReason};
 use margin_rs::rules::TieredLinearIm;
 use margin_rs::valuation::{Mark, MarkSet, PriceSource, ValuationPolicy};
 use margin_rs::{
-    AccountId, Asset, Decimal, ExecutionId, InstrumentId, InversePerpetual, InverseTerms,
-    LinearPerpetual, LinearTerms, MarginError, OrderId, ReservationId, TransferId, VenueId,
+    AccountId, Asset, ContractSize, Decimal, ExecutionId, InstrumentId, InversePerpetual,
+    InverseTerms, LinearPerpetual, LinearTerms, MarginError, OrderId, TransferId, VenueId,
 };
 use rust_decimal_macros::dec;
 
@@ -39,10 +38,6 @@ fn eid(id: &str) -> ExecutionId {
 
 fn oid(id: &str) -> OrderId {
     OrderId::new(id).unwrap()
-}
-
-fn hold() -> ReservationId {
-    ReservationId::new("margin").unwrap()
 }
 
 fn rule() -> TieredLinearIm {
@@ -99,66 +94,38 @@ fn unsupported(error: &MarginError) -> bool {
     )
 }
 
-fn buy(id: &str) -> MarginOrder {
-    MarginOrder {
-        id: oid(id),
-        instrument: iid("XYZ-PERP"),
-        side: Action::Buy,
-        contracts: dec!(1),
-    }
-}
-
-/// Every path of a margin reservation service on the ledger refuses an
-/// open inverse position, and changes nothing.
+/// The closeout planner refuses an inverse position given by hand.
 #[test]
-fn margin_reservations_refuse_an_open_inverse_position() {
-    let mut gate = gate();
-    let mut service = MarginReservationService::on_ledger(
-        rule(),
-        AccountId::new("acct").unwrap(),
-        VenueId::new("venue").unwrap(),
-        hold(),
-    );
-    service
-        .register(
-            iid("XYZ-PERP"),
-            MarginInstrument {
-                product: ProductKind::LinearPerpetual,
-                settlement: asset("USDC"),
-                multiplier: dec!(10),
-            },
-        )
-        .unwrap();
-    // An order reserved before the inverse position opens.
-    service
-        .reserve_with_gate(buy("a"), &mut gate, &hold(), &marks())
-        .unwrap();
-    let held = gate.hold(&hold());
-    open_inverse(&mut gate);
-    gate.book_derivative_execution(
-        &Execution::new(eid("f"), iid("XYZ-PERP"), Action::Buy, dec!(2000), dec!(1))
-            .with_executed_at(1),
+fn closeout_plans_refuse_an_inverse_position() {
+    let account = LiquidationAccount {
+        view: margin_rs::initial_margin::ExposureView {
+            account: AccountId::new("acct").unwrap(),
+            venue: VenueId::new("venue").unwrap(),
+            positions: vec![margin_rs::initial_margin::ExposurePosition {
+                instrument: iid("BTC-INV"),
+                product: ProductKind::InversePerpetual,
+                settlement: asset("BTC"),
+                contracts: dec!(100),
+                size: ContractSize::ContractValue(dec!(100)),
+                mark: dec!(50000),
+            }],
+        },
+        basis: BTreeMap::from([(iid("BTC-INV"), dec!(0.2))]),
+        cash: dec!(0),
+        resting_orders: vec![],
+    };
+    let error = margin_rs::liquidation::plan_liquidation(
+        &margin_rs::rules::TieredLinearIm::linear_v1(asset("BTC"), 8).unwrap(),
+        &account,
+        &BTreeMap::new(),
+        &margin_rs::liquidation::LiquidationPolicy {
+            target: margin_rs::liquidation::CloseoutTarget::Flat,
+            fee_rate: dec!(0),
+            contract_step: dec!(1),
+        },
     )
-    .unwrap();
-
-    assert!(unsupported(
-        &service.requirement_with_gate(&gate, &marks()).unwrap_err()
-    ));
-    assert!(unsupported(
-        &service
-            .reserve_with_gate(buy("b"), &mut gate, &hold(), &marks())
-            .unwrap_err()
-    ));
-    assert!(unsupported(
-        &service.sync_hold(&mut gate, &hold(), &marks()).unwrap_err()
-    ));
-    assert!(unsupported(
-        &service
-            .apply_booked_fill(&mut gate, &oid("a"), &eid("f"), &marks())
-            .unwrap_err()
-    ));
-    assert_eq!(service.remaining(&oid("a")), Some(dec!(1)));
-    assert_eq!(gate.hold(&hold()), held);
+    .unwrap_err();
+    assert!(unsupported(&error));
 }
 
 /// A closeout plan is never read from a ledger with an open inverse

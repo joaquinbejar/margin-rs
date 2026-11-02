@@ -19,7 +19,8 @@ use margin_rs::margin_reservations::{
 };
 use margin_rs::rules::TieredLinearIm;
 use margin_rs::{
-    AccountId, Asset, Decimal, ExecutionId, InstrumentId, MarginError, OrderId, VenueId,
+    AccountId, Asset, ContractSize, Decimal, ExecutionId, InstrumentId, MarginError, OrderId,
+    VenueId,
 };
 use rust_decimal_macros::dec;
 
@@ -52,7 +53,7 @@ fn service() -> MarginReservationService<TieredLinearIm> {
                 MarginInstrument {
                     product: ProductKind::LinearPerpetual,
                     settlement: usdc(),
-                    multiplier: dec!(10),
+                    size: ContractSize::Multiplier(dec!(10)),
                 },
             )
             .expect("register");

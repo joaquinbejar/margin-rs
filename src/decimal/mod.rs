@@ -166,6 +166,37 @@ pub(crate) fn sum_terms_round(
     round_ratio(sum, denominator, scale, rounding).ok_or_else(error)
 }
 
+/// `sum(product(term_i)) / product(denominators)`, computed exactly and
+/// rounded once to `scale` digits. An empty term or an empty denominator
+/// list is the product 1.
+///
+/// Fails on a zero denominator or if the rounded result cannot be
+/// represented.
+pub(crate) fn sum_terms_div_round(
+    terms: &[&[Decimal]],
+    denominators: &[Decimal],
+    scale: u32,
+    rounding: Rounding,
+    operation: &'static str,
+) -> Result<Decimal> {
+    let error = || MarginError::arithmetic(operation);
+    let mut products = Vec::with_capacity(terms.len());
+    for term in terms {
+        products.push(wide_product(term).ok_or_else(error)?);
+    }
+    let common = products.iter().map(|(_, s)| *s).max().unwrap_or(0);
+    let mut sum = Wide::ZERO;
+    for (product, product_scale) in products {
+        let aligned = product.align(product_scale, common).ok_or_else(error)?;
+        sum = sum.checked_add(aligned).ok_or_else(error)?;
+    }
+    // (sum / 10^common) / (d / 10^ds) = (sum * 10^ds) / (d * 10^common).
+    let (denominator, denominator_scale) = wide_product(denominators).ok_or_else(error)?;
+    let numerator = sum.scale_up(denominator_scale).ok_or_else(error)?;
+    let denominator = denominator.scale_up(common).ok_or_else(error)?;
+    round_ratio(numerator, denominator, scale, rounding).ok_or_else(error)
+}
+
 /// Exact sum of any number of values. Partial sums are kept in wide
 /// integers, so only the final sum must be representable, whatever the
 /// order of the values.

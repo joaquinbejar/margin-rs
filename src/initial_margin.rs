@@ -10,15 +10,27 @@
 //! exposure across accounts or venues: requirements for different views are
 //! computed separately and never combined by this crate.
 //!
-//! Rules live in [`crate::rules`]. The first one is
-//! [`TieredLinearIm::linear_v1`](crate::rules::TieredLinearIm::linear_v1).
+//! Rules live in [`crate::rules`]:
+//! [`TieredLinearIm`](crate::rules::TieredLinearIm) for linear futures and
+//! perpetuals and [`TieredInverseIm`](crate::rules::TieredInverseIm) for
+//! inverse ones.
+//!
+//! # Notional
+//!
+//! A position's notional is in its settlement asset: `|Qc| * M * mark` for
+//! a linear contract (multiplier `M`, mark per unit of the underlying in
+//! the settlement asset) and `|Qc| * CV / mark` for an inverse one
+//! (contract value `CV` in quote units, mark in that quote currency per
+//! unit of the base, which is the settlement asset). At a fixed mark both
+//! are linear in `Qc`.
 
 use core::fmt;
 
 use rust_decimal::Decimal;
 
-use crate::error::Result;
+use crate::error::{MarginError, Result};
 use crate::ids::{AccountId, Asset, InstrumentId, VenueId};
+use crate::instrument::ContractSize;
 
 /// Name and version of a margin rule, for example `linear-im/1`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -59,6 +71,41 @@ pub enum ProductKind {
     LinearPerpetual,
     /// Option.
     Option,
+    /// Inverse (base settled) dated future.
+    InverseFuture,
+    /// Inverse (base settled) perpetual.
+    InversePerpetual,
+}
+
+impl ProductKind {
+    /// True for inverse futures and perpetuals.
+    #[must_use]
+    pub fn is_inverse(self) -> bool {
+        matches!(self, Self::InverseFuture | Self::InversePerpetual)
+    }
+}
+
+/// Checks that `size` is positive and of the kind `product` needs: a
+/// multiplier for a linear product, a contract value for an inverse one.
+///
+/// # Errors
+///
+/// [`MarginError::InvalidInput`] otherwise.
+pub(crate) fn check_size(product: ProductKind, size: ContractSize) -> Result<Decimal> {
+    let (value, matches) = match size {
+        ContractSize::Multiplier(m) => (m, !product.is_inverse()),
+        ContractSize::ContractValue(cv) => (cv, product.is_inverse()),
+    };
+    if !matches {
+        return Err(MarginError::invalid_input(
+            "size",
+            "a linear product takes a multiplier, an inverse one a contract value",
+        ));
+    }
+    if value <= Decimal::ZERO {
+        return Err(MarginError::invalid_input("size", "must be positive"));
+    }
+    Ok(value)
 }
 
 /// One position as a margin rule sees it.
@@ -72,9 +119,12 @@ pub struct ExposurePosition {
     pub settlement: Asset,
     /// Signed number of contracts (`Qc`): positive long, negative short.
     pub contracts: Decimal,
-    /// Contract multiplier (`M`): underlying units per contract.
-    pub multiplier: Decimal,
-    /// Mark price, in the settlement asset per underlying unit.
+    /// Contract size: the multiplier `M` (underlying units per contract) of
+    /// a linear product, the contract value `CV` (quote units per contract)
+    /// of an inverse one.
+    pub size: ContractSize,
+    /// Mark price per unit of the underlying: in the settlement asset for a
+    /// linear product, in the quote currency of `CV` for an inverse one.
     pub mark: Decimal,
 }
 
@@ -94,8 +144,11 @@ pub struct ExposureView {
 pub struct TierSlice {
     /// Index of the tier in the rule's table.
     pub tier: usize,
-    /// Notional in this tier.
-    pub notional: Decimal,
+    /// Notional in this tier. Informational: exact for a linear position,
+    /// rounded half-even to 18 decimals for an inverse one, and `None` when
+    /// it does not fit a `Decimal`. The margins are computed from the exact
+    /// notional, never from this figure.
+    pub notional: Option<Decimal>,
     /// Initial margin rate of the tier.
     pub initial_rate: Decimal,
     /// Maintenance margin rate of the tier.
@@ -109,8 +162,10 @@ pub struct PositionRequirement {
     pub instrument: InstrumentId,
     /// Signed contracts.
     pub contracts: Decimal,
-    /// `|contracts| * multiplier * mark`, exact.
-    pub notional: Decimal,
+    /// The notional (see the [module docs](self#notional)). Informational:
+    /// exact for a linear position, rounded half-even to 18 decimals for an
+    /// inverse one, and `None` when it does not fit a `Decimal`.
+    pub notional: Option<Decimal>,
     /// How the notional splits across tiers.
     pub slices: Vec<TierSlice>,
     /// `sum(slice notional * initial rate)`, rounded up once to the
@@ -150,7 +205,7 @@ pub trait InitialMarginModel {
     /// # Errors
     ///
     /// Rule specific; at least
-    /// [`MarginError::UnsupportedInstrument`](crate::MarginError::UnsupportedInstrument)
+    /// [`MarginError::UnsupportedInstrument`]
     /// for a product the rule does not cover.
     fn requirement(&self, view: &ExposureView) -> Result<MarginRequirement>;
 }
@@ -164,8 +219,8 @@ pub trait InitialMarginModel {
 ///   positions (no netting between positions);
 /// - a position's initial and maintenance margin are, up to the final
 ///   rounding to [`PiecewiseLinearMargin::cash_scale`], continuous, convex,
-///   non decreasing and piecewise linear functions of its notional
-///   `|Qc| * M * mark`, with slope changes only at
+///   non decreasing and piecewise linear functions of its notional (see
+///   the [module docs](self#notional)), with slope changes only at
 ///   [`PiecewiseLinearMargin::notional_breakpoints`].
 pub trait PiecewiseLinearMargin: InitialMarginModel {
     /// Number of decimals every requirement is rounded to: the cash

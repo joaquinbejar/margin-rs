@@ -119,8 +119,9 @@ use crate::error::{MarginError, Result};
 use crate::ids::{AccountId, Asset, ExecutionId, InstrumentId, OrderId, VenueId};
 use crate::initial_margin::{
     ExposurePosition, ExposureView, MarginRequirement, PiecewiseLinearMargin, ProductKind, RuleId,
+    check_size,
 };
-use crate::instrument::Instrument;
+use crate::instrument::{ContractSize, Instrument};
 use crate::ledger::{Action, DerivativeSettlement, Execution, LedgerSnapshot};
 
 /// When the closeout stops.
@@ -290,7 +291,7 @@ impl LiquidationAccount {
                 product,
                 settlement: currency.clone(),
                 contracts: position.quantity,
-                multiplier: terms.multiplier(),
+                size: ContractSize::Multiplier(terms.multiplier()),
                 mark,
             });
             basis.insert(id.clone(), position.cost_basis);
@@ -579,7 +580,7 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
             let value = mul_div_round(
                 &[
                     open.exposure.contracts,
-                    open.exposure.multiplier,
+                    multiplier(&open.exposure)?,
                     open.exposure.mark,
                 ],
                 &[],
@@ -646,6 +647,7 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
     ) -> Result<(State, ForcedReduction, AccountSummary)> {
         let exposure = &state.open(index)?.exposure;
         let size = exposure.contracts.abs();
+        let m = multiplier(exposure)?;
         let grid = ContractGrid::new(self.policy.contract_step, offer.contracts.min(size))?;
         let at = |k: GridIndex| -> Result<(State, ForcedReduction, AccountSummary)> {
             let n = grid.contracts(k)?;
@@ -671,10 +673,10 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
         let mut ends = vec![GridIndex::ZERO, last];
         for floor in self.model.notional_breakpoints(exposure) {
             let numerator = sum_products(
-                &[&[size, exposure.multiplier, exposure.mark], &[neg(floor)]],
+                &[&[size, m, exposure.mark], &[neg(floor)]],
                 "|Qc| * M * mark - floor",
             )?;
-            let k = grid.floor_index_of(numerator, &[exposure.multiplier, exposure.mark])?;
+            let k = grid.floor_index_of(numerator, &[m, exposure.mark])?;
             ends.push(k);
             if let Some(next) = grid.next(k) {
                 ends.push(next);
@@ -747,10 +749,11 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
     ) -> Result<(State, ForcedReduction)> {
         let scale = self.scale;
         let open = state.open(index)?;
+        let m = multiplier(&open.exposure)?;
         let held = open.exposure.contracts;
         let held_abs = held.abs();
         let notional = mul_div_round(
-            &[price, contracts, open.exposure.multiplier],
+            &[price, contracts, m],
             &[],
             scale,
             Rounding::HalfEven,
@@ -774,12 +777,7 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
         };
         let realized_pnl = sub(fill_cash, released_basis, "fill cash - released")?;
         let fee = mul_div_round(
-            &[
-                self.policy.fee_rate,
-                price,
-                contracts,
-                open.exposure.multiplier,
-            ],
+            &[self.policy.fee_rate, price, contracts, m],
             &[],
             scale,
             Rounding::TowardZero,
@@ -820,6 +818,16 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
             ));
         }
         let account = self.account;
+        for position in &account.view.positions {
+            if position.product.is_inverse() {
+                return Err(MarginError::UnsupportedInstrument {
+                    rule: self.model.rule().to_string(),
+                    instrument: position.instrument.clone(),
+                    reason: "inverse futures and perpetuals are not planned yet",
+                });
+            }
+            check_size(position.product, position.size)?;
+        }
         check_scale(account.cash, self.scale, "cash")?;
         let mut orders = BTreeSet::new();
         if !account.resting_orders.iter().all(|o| orders.insert(o)) {
@@ -1034,4 +1042,16 @@ pub fn plan_liquidation<M: PiecewiseLinearMargin>(
         unfilled,
         outcome,
     )
+}
+
+/// The multiplier of a linear position; the plan covers linear positions
+/// only ([`plan_liquidation`] refuses the others before planning).
+fn multiplier(exposure: &ExposurePosition) -> Result<Decimal> {
+    match exposure.size {
+        ContractSize::Multiplier(m) => Ok(m),
+        ContractSize::ContractValue(_) => Err(MarginError::invalid_input(
+            "size",
+            "the plan covers linear positions only",
+        )),
+    }
 }

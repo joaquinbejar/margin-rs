@@ -202,7 +202,7 @@ use margin_rs::liquidation::{
 };
 use margin_rs::maintenance::{AccountState, CollateralView, assess};
 use margin_rs::rules::TieredLinearIm;
-use margin_rs::{AccountId, Asset, Decimal, InstrumentId, VenueId};
+use margin_rs::{AccountId, Asset, ContractSize, Decimal, InstrumentId, VenueId};
 
 fn main() -> margin_rs::Result<()> {
     let usdc = Asset::new("USDC")?;
@@ -218,7 +218,7 @@ fn main() -> margin_rs::Result<()> {
             product: ProductKind::LinearPerpetual,
             settlement: usdc.clone(),
             contracts: Decimal::from(10),
-            multiplier: Decimal::ONE,
+            size: ContractSize::Multiplier(Decimal::ONE),
             mark: Decimal::from(95),
         }],
     };

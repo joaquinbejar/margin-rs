@@ -22,7 +22,7 @@ use margin_rs::liquidation::{
 };
 use margin_rs::rules::{MarginTier, TieredLinearIm};
 use margin_rs::{
-    AccountId, Asset, Decimal, ExecutionId, InstrumentId, MarginError, ReservationId,
+    AccountId, Asset, ContractSize, Decimal, ExecutionId, InstrumentId, MarginError, ReservationId,
     SpotInstrument, TransferId, VenueId,
 };
 use rust_decimal_macros::dec;
@@ -254,7 +254,7 @@ fn liquidation_fixture_round_trips_through_the_ledger() {
                     product: ProductKind::LinearPerpetual,
                     settlement: asset("USDC"),
                     contracts: dec!(10),
-                    multiplier: dec!(1),
+                    size: ContractSize::Multiplier(dec!(1)),
                     mark: dec!(95),
                 }],
             },

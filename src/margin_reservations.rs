@@ -60,16 +60,16 @@
 //! - the hold is the service's own [`ReservationId`], fixed at
 //!   construction, and covers the whole account in the settlement asset:
 //!   the requirement margins the registered instruments (with their
-//!   orders) and every other open linear future or perpetual of the ledger
+//!   orders) and every other open future or perpetual of the ledger
 //!   settled in that asset, with the ledger's terms. Use one such service
 //!   per account and settlement asset;
 //! - collateral is `available + own hold + sum(upnl)` in the settlement
 //!   asset, one exact sum, where the unrealized PnL covers **every** open
-//!   linear future or perpetual in the ledger settled in that asset, the
+//!   future or perpetual in the ledger settled in that asset, the
 //!   ones this service does not trade included: a loss on another
 //!   instrument is never left out. Each needs a positive mark;
-//! - every registered instrument must be a linear future or perpetual of
-//!   the ledger with the same product, settlement asset and multiplier;
+//! - every registered instrument must be a future or perpetual of the
+//!   ledger with the same product, settlement asset and contract size;
 //!   orders can only be placed on registered instruments;
 //! - the operations of the other mode
 //!   ([`MarginReservationService::reserve`],
@@ -106,9 +106,9 @@ use crate::direction::Dir;
 use crate::error::{MarginError, Result};
 use crate::ids::{AccountId, Asset, ExecutionId, InstrumentId, OrderId, ReservationId, VenueId};
 use crate::initial_margin::{
-    ExposurePosition, ExposureView, InitialMarginModel, MarginRequirement, ProductKind, RuleId,
+    ExposurePosition, ExposureView, InitialMarginModel, MarginRequirement, ProductKind, check_size,
 };
-use crate::instrument::{ContractSize, Instrument, LinearTerms};
+use crate::instrument::{ContractSize, DerivativeContract, Instrument};
 use crate::ledger::{Action, LedgerSnapshot};
 use crate::risk::RiskGate;
 use crate::valuation::net_with_upnl;
@@ -120,8 +120,9 @@ pub struct MarginInstrument {
     pub product: ProductKind,
     /// Settlement asset.
     pub settlement: Asset,
-    /// Contract multiplier.
-    pub multiplier: Decimal,
+    /// Contract size: a multiplier for a linear product, a contract value
+    /// for an inverse one.
+    pub size: ContractSize,
 }
 
 /// A derivative order to margin.
@@ -348,10 +349,10 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
                     .ok_or_else(|| MarginError::UnknownInstrument {
                         instrument: id.clone(),
                     })?;
-            let Some((product, terms)) = linear(instrument, id, self.model.rule())? else {
+            let Some((product, terms)) = derivative_terms(instrument) else {
                 return Err(MarginError::invalid_input(
                     "instrument",
-                    "is not a linear future or perpetual in the ledger",
+                    "is not a future or perpetual in the ledger",
                 ));
             };
             if product != registered.product {
@@ -360,16 +361,16 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
                     "differs from the ledger instrument",
                 ));
             }
-            if terms.settlement() != &registered.settlement {
+            if terms.settlement != registered.settlement {
                 return Err(MarginError::CurrencyMismatch {
                     field: "settlement",
-                    expected: terms.settlement().clone(),
+                    expected: terms.settlement.clone(),
                     found: registered.settlement.clone(),
                 });
             }
-            if terms.multiplier() != registered.multiplier {
+            if terms.size != registered.size {
                 return Err(MarginError::invalid_input(
-                    "multiplier",
+                    "size",
                     "differs from the ledger instrument",
                 ));
             }
@@ -387,16 +388,16 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
                     .ok_or_else(|| MarginError::UnknownInstrument {
                         instrument: id.clone(),
                     })?;
-            let Some((product, terms)) = linear(instrument, id, self.model.rule())? else {
+            let Some((product, terms)) = derivative_terms(instrument) else {
                 continue;
             };
-            if terms.settlement() != &currency {
+            if terms.settlement != currency {
                 continue;
             }
             let margined = MarginInstrument {
                 product,
                 settlement: currency.clone(),
-                multiplier: terms.multiplier(),
+                size: terms.size,
             };
             book.insert(id.clone(), (margined, position.quantity));
         }
@@ -407,11 +408,11 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
     ///
     /// # Errors
     ///
-    /// [`MarginError::InvalidInput`] for a non positive multiplier.
+    /// [`MarginError::InvalidInput`] for a size that is not positive or not
+    /// of the product's kind (a multiplier for a linear product, a contract
+    /// value for an inverse one).
     pub fn register(&mut self, id: InstrumentId, instrument: MarginInstrument) -> Result<()> {
-        if instrument.multiplier <= Decimal::ZERO {
-            return Err(MarginError::invalid_input("multiplier", "must be positive"));
-        }
+        check_size(instrument.product, instrument.size)?;
         if let Mode::Own(positions) = &mut self.mode {
             positions.entry(id.clone()).or_default();
         }
@@ -552,7 +553,7 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
                 product: instrument.product,
                 settlement: instrument.settlement.clone(),
                 contracts: worst,
-                multiplier: instrument.multiplier,
+                size: instrument.size,
                 mark,
             });
         }
@@ -891,7 +892,7 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
     ///
     /// Collateral is the settlement asset's available balance plus the
     /// current hold (cash collateral), and on the ledger also the
-    /// unrealized PnL of every open linear future or perpetual settled in
+    /// unrealized PnL of every open future or perpetual settled in
     /// that asset (see
     /// [positions](self#positions-own-or-read-from-the-ledger)). On
     /// acceptance the hold is set to the new requirement, capped at the
@@ -1013,10 +1014,10 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
                     .ok_or_else(|| MarginError::UnknownInstrument {
                         instrument: id.clone(),
                     })?;
-            let Some((_, contract)) = linear(instrument, id, self.model.rule())? else {
+            let Some((_, contract)) = derivative_terms(instrument) else {
                 continue;
             };
-            if contract.settlement() != currency {
+            if contract.settlement != *currency {
                 continue;
             }
             let Some(mark) = marks.get(id) else {
@@ -1029,13 +1030,23 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
                 ));
             }
             check_scale(*mark, MAX_SCALE, "instrument mark")?;
-            terms.push(crate::ledger::derivative::market_value(
+            let value = crate::ledger::derivative::market_value(
                 position.quantity,
-                ContractSize::Multiplier(contract.multiplier()),
+                contract.size,
                 *mark,
                 scale,
-            )?);
-            terms.push(neg(position.cost_basis));
+            )?;
+            // upnl: value - basis (linear), basis - value (inverse).
+            match contract.size {
+                ContractSize::Multiplier(_) => {
+                    terms.push(value);
+                    terms.push(neg(position.cost_basis));
+                }
+                ContractSize::ContractValue(_) => {
+                    terms.push(position.cost_basis);
+                    terms.push(neg(value));
+                }
+            }
         }
         Ok((cash, Ok(terms)))
     }
@@ -1084,31 +1095,15 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
 /// Instruments with their terms and current positions.
 type Book = BTreeMap<InstrumentId, (MarginInstrument, Decimal)>;
 
-/// The product and terms of a linear future or perpetual `id`; `None` for
-/// spot. Exhaustive, so a new kind of instrument must be decided here.
-///
-/// # Errors
-///
-/// [`MarginError::UnsupportedInstrument`] for an inverse future or
-/// perpetual: never skipped, since its requirement and value would be
-/// missing.
-fn linear<'a>(
-    instrument: &'a Instrument,
-    id: &InstrumentId,
-    rule: &RuleId,
-) -> Result<Option<(ProductKind, &'a LinearTerms)>> {
-    match instrument {
-        Instrument::Spot(_) => Ok(None),
-        Instrument::LinearFuture(future) => Ok(Some((ProductKind::LinearFuture, future.terms()))),
-        Instrument::LinearPerpetual(perpetual) => {
-            Ok(Some((ProductKind::LinearPerpetual, perpetual.terms())))
-        }
-        Instrument::InverseFuture(_) | Instrument::InversePerpetual(_) => {
-            Err(MarginError::UnsupportedInstrument {
-                rule: rule.to_string(),
-                instrument: id.clone(),
-                reason: "inverse futures and perpetuals are not margined yet",
-            })
-        }
-    }
+/// The product and contract of a future or perpetual; `None` for spot.
+/// Exhaustive, so a new kind of instrument must be decided here.
+fn derivative_terms(instrument: &Instrument) -> Option<(ProductKind, DerivativeContract)> {
+    let product = match instrument {
+        Instrument::Spot(_) => return None,
+        Instrument::LinearFuture(_) => ProductKind::LinearFuture,
+        Instrument::LinearPerpetual(_) => ProductKind::LinearPerpetual,
+        Instrument::InverseFuture(_) => ProductKind::InverseFuture,
+        Instrument::InversePerpetual(_) => ProductKind::InversePerpetual,
+    };
+    Some((product, instrument.derivative()?))
 }

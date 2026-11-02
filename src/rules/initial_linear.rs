@@ -35,17 +35,15 @@
 //! `mm_rate = 0.05`. Spot and options are outside this rule: spot is
 //! margined by cash and options by a different formula.
 
-use std::collections::BTreeSet;
-
 use rust_decimal::Decimal;
 
-use crate::decimal::{Rounding, check_configured_scale, product, sub, sum, sum_terms_round};
 use crate::error::{MarginError, Result};
 use crate::ids::Asset;
 use crate::initial_margin::{
     ExposurePosition, ExposureView, InitialMarginModel, MarginRequirement, PiecewiseLinearMargin,
-    PositionRequirement, ProductKind, RuleId, TierSlice,
+    PositionRequirement, ProductKind, RuleId, check_size,
 };
+use crate::rules::tiers;
 
 /// One band of a tier table: the rates apply to the part of the notional
 /// at or above `floor` and below the next tier's floor.
@@ -105,35 +103,7 @@ impl TieredLinearIm {
     /// that never decrease from one tier to the next; or if `scale`
     /// exceeds [`MAX_SCALE`](crate::decimal::MAX_SCALE).
     pub fn new(id: RuleId, currency: Asset, scale: u32, tiers: Vec<MarginTier>) -> Result<Self> {
-        check_configured_scale(scale, "scale")?;
-        let invalid = |reason| Err(MarginError::invalid_input("tiers", reason));
-        let Some(first) = tiers.first() else {
-            return invalid("must not be empty");
-        };
-        if !first.floor.is_zero() {
-            return invalid("the first floor must be 0");
-        }
-        for tier in &tiers {
-            if tier.maintenance_rate <= Decimal::ZERO
-                || tier.maintenance_rate > tier.initial_rate
-                || tier.initial_rate > Decimal::ONE
-            {
-                return invalid("rates must satisfy 0 < maintenance <= initial <= 1");
-            }
-        }
-        for pair in tiers.windows(2) {
-            let [lower, upper] = pair else {
-                continue;
-            };
-            if upper.floor <= lower.floor {
-                return invalid("floors must be strictly increasing");
-            }
-            if upper.initial_rate < lower.initial_rate
-                || upper.maintenance_rate < lower.maintenance_rate
-            {
-                return invalid("rates must not decrease from one tier to the next");
-            }
-        }
+        tiers::validate(scale, &tiers)?;
         Ok(Self {
             id,
             currency,
@@ -178,52 +148,26 @@ impl TieredLinearIm {
                 found: position.settlement.clone(),
             });
         }
-        if position.multiplier <= Decimal::ZERO {
-            return Err(MarginError::invalid_input("multiplier", "must be positive"));
-        }
+        let multiplier = check_size(position.product, position.size)?;
         if position.mark <= Decimal::ZERO {
             return Err(MarginError::invalid_input("mark", "must be positive"));
         }
-        // One exact product: intermediate |Qc| * M may not be representable
-        // even when the notional is.
-        let notional = product(
-            &[position.contracts.abs(), position.multiplier, position.mark],
-            "|Qc| * M * mark",
+        // The notional |Qc| * M * mark is one exact product: intermediate
+        // |Qc| * M may not be representable even when the notional is, and
+        // the notional itself need not be (it is then reported as None).
+        let tiered = tiers::requirement(
+            &self.tiers,
+            &[position.contracts.abs(), multiplier, position.mark],
+            &[],
+            self.scale,
         )?;
-
-        let mut slices = Vec::new();
-        for (index, tier) in self.tiers.iter().enumerate() {
-            if notional <= tier.floor {
-                break;
-            }
-            let top = match index.checked_add(1).and_then(|next| self.tiers.get(next)) {
-                Some(next) => notional.min(next.floor),
-                None => notional,
-            };
-            slices.push(TierSlice {
-                tier: index,
-                notional: sub(top, tier.floor, "slice")?,
-                initial_rate: tier.initial_rate,
-                maintenance_rate: tier.maintenance_rate,
-            });
-        }
-        let round_up = |rate: fn(&TierSlice) -> Decimal, op| {
-            let terms: Vec<[Decimal; 2]> = slices.iter().map(|s| [s.notional, rate(s)]).collect();
-            let terms: Vec<&[Decimal]> = terms
-                .iter()
-                .map(<[rust_decimal::Decimal; 2]>::as_slice)
-                .collect();
-            sum_terms_round(&terms, self.scale, Rounding::AwayFromZero, op)
-        };
-        let initial = round_up(|s| s.initial_rate, "initial margin")?;
-        let maintenance = round_up(|s| s.maintenance_rate, "maintenance margin")?;
         Ok(PositionRequirement {
             instrument: position.instrument.clone(),
             contracts: position.contracts,
-            notional,
-            slices,
-            initial,
-            maintenance,
+            notional: tiered.notional,
+            slices: tiered.slices,
+            initial: tiered.initial,
+            maintenance: tiered.maintenance,
         })
     }
 }
@@ -254,34 +198,11 @@ impl InitialMarginModel for TieredLinearIm {
     ///   product other than linear futures and perpetuals.
     /// - [`MarginError::CurrencyMismatch`] if a position settles in another
     ///   asset than the rule's currency.
-    /// - [`MarginError::InvalidInput`] for a non positive multiplier or
-    ///   mark, or two positions in the same instrument.
+    /// - [`MarginError::InvalidInput`] for a size that is not a positive
+    ///   multiplier, a non positive mark, or two positions in the same
+    ///   instrument.
     /// - [`MarginError::Arithmetic`] if an amount cannot be represented.
     fn requirement(&self, view: &ExposureView) -> Result<MarginRequirement> {
-        let mut seen = BTreeSet::new();
-        let mut positions = Vec::with_capacity(view.positions.len());
-        for position in &view.positions {
-            if !seen.insert(&position.instrument) {
-                return Err(MarginError::invalid_input(
-                    "positions",
-                    "at most one position per instrument",
-                ));
-            }
-            positions.push(self.position(position)?);
-        }
-        // Totals: exact wide sums of the rounded positions.
-        let initials: Vec<Decimal> = positions.iter().map(|p| p.initial).collect();
-        let maintenances: Vec<Decimal> = positions.iter().map(|p| p.maintenance).collect();
-        let initial = sum(&initials, "total initial")?;
-        let maintenance = sum(&maintenances, "total maintenance")?;
-        Ok(MarginRequirement {
-            rule: self.id.clone(),
-            account: view.account.clone(),
-            venue: view.venue.clone(),
-            currency: self.currency.clone(),
-            initial,
-            maintenance,
-            positions,
-        })
+        tiers::account_requirement(&self.id, &self.currency, view, |p| self.position(p))
     }
 }

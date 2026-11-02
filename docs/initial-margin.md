@@ -4,17 +4,18 @@
 
 ## Contract
 
-- **Input.** An `ExposureView` covers **one account at one venue**: `account`, `venue`, and at most one `ExposurePosition` per instrument. Each position carries `product`, `settlement` asset, signed `contracts` (`Qc`), `multiplier` (`M`) and `mark`.
+- **Input.** An `ExposureView` covers **one account at one venue**: `account`, `venue`, and at most one `ExposurePosition` per instrument. Each position carries `product`, `settlement` asset, signed `contracts` (`Qc`), its `size` and `mark`. The size is a `ContractSize`: `Multiplier(M)` (underlying units per contract) for a linear product, `ContractValue(CV)` (quote units per contract) for an inverse one; any other pairing is `InvalidInput`.
+- **Notional.** In the settlement asset: `|Qc| * M * mark` for a linear position, `|Qc| * CV / mark` for an inverse one, whose mark is in the quote currency of `CV` per unit of the base (the settlement asset). At a fixed mark both are linear in `Qc`.
 - **No netting.** Exposure is never netted across accounts or venues. Two views give two requirements, and the crate never combines them. Within a view, positions are margined gross, with no netting between instruments.
 - **Output.** A `MarginRequirement` carries:
   - the `RuleId` (name and version) that produced it, for audit;
   - the account, venue and currency;
   - the totals `initial` and `maintenance`;
-  - a `PositionRequirement` per position, with the exact notional, the `TierSlice`s, and the rounded `initial` and `maintenance`. The totals are the exact sums of the positions, so the breakdown always adds up.
+  - a `PositionRequirement` per position, with the notional, the `TierSlice`s, and the rounded `initial` and `maintenance`. The totals are the exact sums of the positions, so the breakdown always adds up. The notionals are informational (`Option`): exact for a linear position, rounded half-even to 18 decimals for an inverse one, and `None` when they do not fit a `Decimal`. The margins never depend on them: a notional out of range does not block a representable margin.
 - **Errors.** All typed:
   - `UnsupportedInstrument { rule, instrument, reason }` for products the rule does not cover;
   - `CurrencyMismatch` for a settlement asset other than the rule's;
-  - `InvalidInput` for a non-positive multiplier or mark, or a duplicate instrument;
+  - `InvalidInput` for a size that is not positive or not of the product's kind, a non-positive mark, or a duplicate instrument;
   - `Arithmetic` for an amount that cannot be represented.
 
 ## `linear-im/1`
@@ -53,6 +54,24 @@ A table is valid when:
 - rates never decrease from one tier to the next.
 
 Each table must have its own `RuleId`. The two-tier fixture in `tests/initial_margin.rs` is labelled `synthetic-two-tier/1`. It exists to test boundaries and is not any venue's rule.
+
+## `inverse-im/1`
+
+| | |
+|---|---|
+| Rule | `rules::TieredInverseIm::inverse_v1(base, scale)` |
+| Products | Inverse futures and perpetuals (`ProductKind::InverseFuture`, `InversePerpetual`), settled in the base |
+| Formula | `im = 10 % * |Qc| * CV / mark`, `mm = 5 % * |Qc| * CV / mark`, in the base |
+| Units | `Qc` in contracts, `CV` in quote units per contract, `mark` in quote units per unit of the base; amounts in the base at the given scale |
+| Rounding | Each position rounded up once to the base scale; totals are exact sums |
+| Not covered | Spot, options and linear products: `UnsupportedInstrument` |
+
+`TieredInverseIm::new(rule_id, base, scale, tiers)` takes the same tier tables as the linear rule, with the floors in the base. The notional `N = |Qc| * CV / mark` is a quotient and generally not a finite decimal, so:
+
+- each tier is compared exactly by cross products: `N > floor` is `|Qc| * CV > floor * mark`;
+- each margin `sum over i < k of rate_i * (floor_{i+1} - floor_i) + rate_k * (N - floor_k)` is one exact sum over the common denominator `mark`, rounded up once.
+
+The linear rule computes its margins the same way (with denominator 1), so neither ever needs the notional itself to fit a `Decimal`.
 
 ## Future rules
 
