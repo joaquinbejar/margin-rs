@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rust_decimal::Decimal;
 
-use crate::decimal::{Rounding, compare_products, product, sum, sum_terms_round};
+use crate::decimal::{Rounding, compare_products, product, quadratic_form_round};
 use crate::error::{MarginError, Result};
 use crate::factors::{Factor, FactorExposure, FactorKind};
 use crate::ids::{Asset, FactorId};
@@ -175,8 +175,9 @@ impl ValidatedCovariance {
 pub struct PortfolioVariance {
     /// Currency of the exposures; the variance is in this currency squared.
     pub currency: Asset,
-    /// Net exposure per factor, in matrix order.
-    pub net_exposures: BTreeMap<FactorId, Decimal>,
+    /// Net exposure per factor; `None` when the exact net is not a
+    /// representable `Decimal` (the variance is still exact).
+    pub net_exposures: BTreeMap<FactorId, Option<Decimal>>,
     /// `e' C e`, rounded up once to `scale` digits. Never negative.
     pub variance: Decimal,
 }
@@ -237,28 +238,21 @@ pub fn portfolio_variance(
         slots.push(i);
     }
 
-    // Net exposure per factor, summed exactly in wide integers: partial
-    // sums never need to be representable and the order does not matter.
-    // O(exposures) time, memory bounded by the number of factors.
+    // Net exposure per factor and e' C e, kept in wide integers until the
+    // single final rounding: O(exposures) time, memory bounded by the
+    // number of factors, independent of order.
     let n = covariance.factors.len();
     let mut per_factor: Vec<Vec<Decimal>> = vec![Vec::new(); n];
     for (exposure, slot) in exposures.iter().zip(&slots) {
         per_factor[*slot].push(exposure.amount);
     }
-    let mut net = Vec::with_capacity(n);
-    for amounts in &per_factor {
-        net.push(sum(amounts, "net exposure")?);
-    }
-
-    // e' C e over at most n * n terms, exact, rounded up once.
-    let mut terms: Vec<[Decimal; 3]> = Vec::with_capacity(n * n);
-    for (i, ei) in net.iter().enumerate() {
-        for (j, ej) in net.iter().enumerate() {
-            terms.push([*ei, *ej, covariance.matrix[i][j]]);
-        }
-    }
-    let slices: Vec<&[Decimal]> = terms.iter().map(|t| t.as_slice()).collect();
-    let variance = sum_terms_round(&slices, scale, Rounding::AwayFromZero, "e' C e")?;
+    let (variance, net) = quadratic_form_round(
+        &per_factor,
+        &covariance.matrix,
+        scale,
+        Rounding::AwayFromZero,
+        "e' C e",
+    )?;
     if variance < Decimal::ZERO {
         // Unreachable for a validated matrix; reported rather than hidden.
         return Err(MarginError::InvalidCovariance {

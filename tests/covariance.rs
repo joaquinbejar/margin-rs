@@ -67,7 +67,7 @@ fn two_factors() {
     .expect("variance");
     assert_eq!(result.variance, dec!(325));
     assert_eq!(result.currency, usdc());
-    assert_eq!(result.net_exposures[&fid("ETH")], dec!(-500));
+    assert_eq!(result.net_exposures[&fid("ETH")], Some(dec!(-500)));
 }
 
 /// Extreme correlations, both factors at sigma 2 %.
@@ -327,7 +327,7 @@ fn netting_is_exact_in_any_order() {
     for amounts in orders {
         let exposures: Vec<FactorExposure> = amounts.iter().map(|a| delta("A", *a)).collect();
         let result = portfolio_variance(&exposures, &cov, 6).expect("variance");
-        assert_eq!(result.net_exposures[&fid("A")], dec!(0.1));
+        assert_eq!(result.net_exposures[&fid("A")], Some(dec!(0.1)));
         assert_eq!(result.variance, dec!(0.01));
     }
 }
@@ -362,7 +362,22 @@ fn many_exposures_net_first() {
     }
     exposures.push(delta("BTC", dec!(1000)));
     let result = portfolio_variance(&exposures, &cov, 6).expect("variance");
-    assert_eq!(result.net_exposures[&fid("BTC")], dec!(1000));
-    assert_eq!(result.net_exposures[&fid("ETH")], dec!(0));
+    assert_eq!(result.net_exposures[&fid("BTC")], Some(dec!(1000)));
+    assert_eq!(result.net_exposures[&fid("ETH")], Some(dec!(0)));
     assert_eq!(result.variance, dec!(400));
+}
+
+/// Nets stay exact until the final rounding: a net of 2 * MAX on a factor
+/// with zero variance is not a Decimal, yet the variance (0) is exact.
+#[test]
+fn unrepresentable_net_with_representable_variance() {
+    let cov = ValidatedCovariance::new(vec![price("A")], vec![vec![dec!(0)]]).expect("valid");
+    let result = portfolio_variance(
+        &[delta("A", Decimal::MAX), delta("A", Decimal::MAX)],
+        &cov,
+        6,
+    )
+    .expect("variance");
+    assert_eq!(result.variance, dec!(0));
+    assert_eq!(result.net_exposures[&fid("A")], None);
 }
