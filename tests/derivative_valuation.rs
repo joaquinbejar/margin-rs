@@ -390,3 +390,98 @@ fn stress_refuses_an_open_derivative() {
         Err(MarginError::UnsupportedInstrument { .. })
     ));
 }
+
+#[test]
+fn a_settlement_asset_without_a_balance_row_still_counts() {
+    // 100 USD, long 2 PERP-T (settled in USDT) at 100 marked at 90: upnl
+    // -20 USDT at 1 USD. Equity and collateral are 80, also when a
+    // hand-built snapshot has no USDT balance row (it counts as zero).
+    let mut ledger = ledger();
+    deposit(&mut ledger, "d1", "USD", dec!(100));
+    trade(&mut ledger, "e1", "PERP-T", Action::Buy, dec!(100), dec!(2));
+    let marks = MarkSet::new(10_000)
+        .with(asset("USDT"), mark(dec!(1), 9_500))
+        .with_instrument(iid("PERP-T"), mark(dec!(90), 9_500));
+    let mut collateral_policy = CollateralPolicy::new(asset("USD"), 1000);
+    collateral_policy.basis = BalanceBasis::Total;
+    let natural = ledger.snapshot();
+    let mut without_row = natural.clone();
+    without_row.balances.remove(&asset("USDT"));
+    for snapshot in [natural, without_row] {
+        let valuation = value(&snapshot, &marks, &policy()).unwrap();
+        assert_eq!(valuation.equity, Some(dec!(80)));
+        assert_eq!(valuation.collateral_equity, Some(dec!(80)));
+        let collateral = value_collateral(&snapshot, &marks, &collateral_policy).unwrap();
+        assert_eq!(collateral.total, Some(dec!(80)));
+        assert_eq!(collateral.lines[&asset("USDT")].balance, dec!(-20));
+    }
+}
+
+#[test]
+fn gains_net_with_the_cash_in_one_exact_sum() {
+    // BIG (0 decimals) is the reporting asset. Long 1 X and long 1 Y at 1,
+    // both marked at MAX: two gains of MAX - 1, whose sum does not fit a
+    // Decimal. With a cash balance of -MAX (a hand-built snapshot), the net
+    // MAX - 2 does, and is what equity and collateral report.
+    let max = Decimal::MAX;
+    let mut ledger = Ledger::default();
+    ledger.register_asset(asset("BIG"), 0).unwrap();
+    for id in ["X", "Y"] {
+        ledger
+            .register_instrument(LinearPerpetual::new(
+                LinearTerms::new(iid(id), asset("BIG"), dec!(1), 0, 0).unwrap(),
+            ))
+            .unwrap();
+    }
+    trade(&mut ledger, "e1", "X", Action::Buy, dec!(1), dec!(1));
+    trade(&mut ledger, "e2", "Y", Action::Buy, dec!(1), dec!(1));
+    let mut snapshot = ledger.snapshot();
+    let cash = snapshot.balances.get_mut(&asset("BIG")).unwrap();
+    cash.total = -max;
+    cash.available = -max;
+    let marks = MarkSet::new(10_000)
+        .with_instrument(iid("X"), mark(max, 9_500))
+        .with_instrument(iid("Y"), mark(max, 9_500));
+    let valuation = value(&snapshot, &marks, &ValuationPolicy::new(asset("BIG"), 1000)).unwrap();
+    assert_eq!(valuation.equity, Some(max - dec!(2)));
+    assert_eq!(valuation.collateral_equity, Some(max - dec!(2)));
+    // The unrealized figure alone (2 * MAX - 2) does not fit: no split.
+    assert_eq!(valuation.attribution, None);
+    let mut collateral_policy = CollateralPolicy::new(asset("BIG"), 1000);
+    collateral_policy.basis = BalanceBasis::Total;
+    let collateral = value_collateral(&snapshot, &marks, &collateral_policy).unwrap();
+    let line = &collateral.lines[&asset("BIG")];
+    assert_eq!(line.balance, max - dec!(2));
+    assert_eq!(line.unrealized_pnl, None);
+    assert_eq!(collateral.total, Some(max - dec!(2)));
+}
+
+#[test]
+fn a_missing_balance_row_follows_every_collateral_rule() {
+    // Long 2 PERP-T at 100 with 100 USD and no USDT row (hand-built), USDT
+    // at 1 USD. Per instrument mark: a valid gain at 110 counts (+20, the
+    // USDT held is not eligible in value_collateral by default, so only in
+    // value), a stale gain is excluded, a stale loss makes it unknown.
+    let mut ledger = ledger();
+    deposit(&mut ledger, "d1", "USD", dec!(100));
+    trade(&mut ledger, "e1", "PERP-T", Action::Buy, dec!(100), dec!(2));
+    let mut snapshot = ledger.snapshot();
+    snapshot.balances.remove(&asset("USDT"));
+    let marks_at = |price, at| {
+        MarkSet::new(10_000)
+            .with(asset("USDT"), mark(dec!(1), 9_500))
+            .with_instrument(iid("PERP-T"), mark(price, at))
+    };
+    let mut collateral_policy = CollateralPolicy::new(asset("USD"), 1000);
+    collateral_policy.basis = BalanceBasis::Total;
+    for (marks, collateral_equity, collateral_total) in [
+        (marks_at(dec!(110), 9_500), Some(dec!(120)), Some(dec!(100))),
+        (marks_at(dec!(110), 8_000), Some(dec!(100)), Some(dec!(100))),
+        (marks_at(dec!(90), 8_000), None, None),
+    ] {
+        let valuation = value(&snapshot, &marks, &policy()).unwrap();
+        assert_eq!(valuation.collateral_equity, collateral_equity);
+        let collateral = value_collateral(&snapshot, &marks, &collateral_policy).unwrap();
+        assert_eq!(collateral.total, collateral_total);
+    }
+}

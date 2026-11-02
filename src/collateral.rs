@@ -47,8 +47,8 @@ use crate::ids::Asset;
 use crate::ids::InstrumentId;
 use crate::ledger::LedgerSnapshot;
 use crate::valuation::{
-    Mark, MarkSet, MarkStatus, ValuationPolicy, collateral_upnl, derivative_values, pricing,
-    validate,
+    Mark, MarkSet, MarkStatus, ValuationPolicy, collateral_upnl, derivative_values, net_with_upnl,
+    pricing, validate,
 };
 
 /// Which balance counts as collateral.
@@ -125,9 +125,10 @@ pub struct CollateralLine {
     /// the linear futures and perpetuals settled in this asset.
     pub balance: Decimal,
     /// Unrealized PnL of the open derivatives settled in this asset that
-    /// the line counts (gains at an invalid instrument mark excluded);
-    /// `None` when a loss is at an invalid mark, which makes the line
-    /// unknown.
+    /// the line counts (gains at an invalid instrument mark excluded), as a
+    /// report. `None` when a loss is at an invalid mark (the line `value`
+    /// is then `None` too), or when this sum alone does not fit a `Decimal`
+    /// (the line is still valued: `balance` is the exact net).
     pub unrealized_pnl: Option<Decimal>,
     /// Mark used, if any.
     pub mark: Option<Mark>,
@@ -232,27 +233,36 @@ pub fn value_collateral(
         }
         instrument_flags.insert(id.clone(), value.status);
     }
-    let counted_upnl = collateral_upnl(&derivatives)?;
+    let counted_upnl = collateral_upnl(&derivatives);
 
     let mut lines = BTreeMap::new();
     let mut flags = BTreeMap::new();
     let mut line_values = Vec::new();
-    for (asset, balance) in &snapshot.balances {
+    // Every asset with a balance row, and every settlement asset of an open
+    // derivative even without one (its balance then counts as zero).
+    let collateral_assets: std::collections::BTreeSet<&Asset> = snapshot
+        .balances
+        .keys()
+        .chain(counted_upnl.keys())
+        .collect();
+    for asset in collateral_assets {
+        let balance = snapshot.balances.get(asset).copied().unwrap_or_default();
         let held = match policy.basis {
             BalanceBasis::Available => balance.available,
             BalanceBasis::Total => balance.total,
         };
         // The cash and the unrealized PnL settled in this asset count as one
         // net amount; a loss at an invalid instrument mark makes it unknown.
-        let unrealized_pnl = counted_upnl
-            .get(asset)
-            .copied()
-            .unwrap_or(Some(Decimal::ZERO));
-        let amount = match unrealized_pnl {
-            Some(upnl) => add(held, upnl, "balance + unrealized pnl")?,
+        let upnl_terms = counted_upnl.get(asset).cloned().unwrap_or(Some(Vec::new()));
+        let known = upnl_terms.is_some();
+        let amount = match &upnl_terms {
+            Some(terms) => net_with_upnl(held, terms)?,
             None => held,
         };
-        if amount.is_zero() && unrealized_pnl.is_some() {
+        // The counted unrealized PnL alone, for the report; `None` when the
+        // line is unknown or the sum alone does not fit a Decimal.
+        let unrealized_pnl = upnl_terms.and_then(|terms| sum(&terms, "unrealized pnl").ok());
+        if amount.is_zero() && known {
             continue;
         }
         let status = pricing
@@ -277,7 +287,7 @@ pub fn value_collateral(
         // Factors of the contribution, or None for unknown, or an empty
         // vector for nothing.
         let factors: Option<Vec<Decimal>> = match (status, price, debt) {
-            _ if unrealized_pnl.is_none() => None,
+            _ if !known => None,
             (MarkStatus::Valid, Some(p), true) => Some(vec![amount, p]),
             (MarkStatus::Valid, Some(p), false) => match haircut {
                 Some(h) => Some(vec![amount, p, sub(Decimal::ONE, h, "1 - haircut")?]),

@@ -313,7 +313,9 @@ pub struct AccountValuation {
     pub net_transfers: Option<Decimal>,
     /// `equity - net_transfers`.
     pub net_pnl: Option<Decimal>,
-    /// Attribution of `net_pnl`.
+    /// Attribution of `net_pnl`; `None` when a needed price is missing, or
+    /// when one of its figures alone does not fit a `Decimal` (large
+    /// offsetting gains and losses), even if `net_pnl` does.
     pub attribution: Option<PnlAttribution>,
     /// Equity that marks can be trusted for, rounded down; `None` when a
     /// debt cannot be valued conservatively. See the [module docs](self).
@@ -467,13 +469,15 @@ pub(crate) fn derivative_values(
     Ok(values)
 }
 
-/// The unrealized PnL a collateral figure may count per settlement asset:
-/// `Some(sum)` of the gains and losses at valid instrument marks, where a
-/// gain at an invalid (stale or future) mark is excluded, and `None` when a
-/// loss is at an invalid mark (it cannot be bounded). Summed exactly.
+/// The unrealized PnL terms a collateral figure may count per settlement
+/// asset: `Some(terms)`, the gains and losses at valid instrument marks
+/// (a gain at an invalid, stale or future, mark is excluded), or `None`
+/// when a loss is at an invalid mark (it cannot be bounded). The terms are
+/// summed with the cash in one exact step by the caller, so their partial
+/// sum never needs to fit a `Decimal`.
 pub(crate) fn collateral_upnl(
     derivatives: &BTreeMap<InstrumentId, DerivativeValue>,
-) -> Result<BTreeMap<Asset, Option<Decimal>>> {
+) -> BTreeMap<Asset, Option<Vec<Decimal>>> {
     let mut terms: BTreeMap<Asset, Option<Vec<Decimal>>> = BTreeMap::new();
     for value in derivatives.values() {
         let entry = terms
@@ -488,15 +492,14 @@ pub(crate) fn collateral_upnl(
         }
     }
     terms
-        .into_iter()
-        .map(|(asset, values)| {
-            let total = match values {
-                Some(values) => Some(sum(&values, "unrealized pnl")?),
-                None => None,
-            };
-            Ok((asset, total))
-        })
-        .collect()
+}
+
+/// `cash` plus the counted unrealized PnL `terms`, as one exact sum.
+pub(crate) fn net_with_upnl(cash: Decimal, terms: &[Decimal]) -> Result<Decimal> {
+    let mut values = Vec::with_capacity(terms.len().saturating_add(1));
+    values.push(cash);
+    values.extend_from_slice(terms);
+    sum(&values, "cash + unrealized pnl")
 }
 
 pub(crate) fn validate(
@@ -638,7 +641,7 @@ pub fn value(
     // Every open derivative at its instrument mark (an error without one),
     // and what collateral may count of it per settlement asset.
     let derivatives = derivative_values(snapshot, marks, policy.max_age_ms)?;
-    let counted_upnl = collateral_upnl(&derivatives)?;
+    let counted_upnl = collateral_upnl(&derivatives);
     let instrument_flags: BTreeMap<InstrumentId, MarkStatus> = derivatives
         .iter()
         .filter(|(_, value)| !value.status.is_valid())
@@ -661,7 +664,17 @@ pub fn value(
     let mut equity_known = true;
     let mut collateral_terms: Vec<Vec<Decimal>> = Vec::new();
     let mut collateral_known = true;
-    for (asset, balance) in &snapshot.balances {
+    // Every asset with a balance row, and every settlement asset of an open
+    // derivative even without one (its balance then counts as zero), so no
+    // unrealized PnL is left out of collateral.
+    let collateral_assets: BTreeSet<&Asset> = snapshot
+        .balances
+        .keys()
+        .chain(counted_upnl.keys())
+        .collect();
+    for asset in collateral_assets {
+        let balance = snapshot.balances.get(asset).copied().unwrap_or_default();
+        let balance = &balance;
         let state = status.get(asset).copied().unwrap_or(MarkStatus::Missing);
         let asset_price = price(asset);
         let line_value = match asset_price {
@@ -685,8 +698,8 @@ pub fn value(
         let collateral = match counted_upnl.get(asset) {
             None => collateral_factors(balance.total, state, asset_price, policy)?,
             Some(None) => Collateral::Unknown,
-            Some(Some(upnl)) => {
-                let net = add(balance.total, *upnl, "cash + unrealized pnl")?;
+            Some(Some(terms)) => {
+                let net = net_with_upnl(balance.total, terms)?;
                 collateral_factors(net, state, asset_price, policy)?
             }
         };
@@ -839,20 +852,29 @@ pub fn value(
     }
     let attribution = match net_pnl {
         Some(net) if needed.iter().all(|asset| price(asset).is_some()) => {
-            let realized = round_terms(&realized_terms, rounding, "realized")?;
-            let unrealized = round_terms(&unrealized_terms, rounding, "unrealized")?;
-            let fees = round_terms(&fee_terms, rounding, "fees")?;
-            // net - (realized + unrealized - fees), in one exact step.
-            let rounding_difference = sum(
-                &[net, neg(realized), neg(unrealized), fees],
-                "net - explained",
-            )?;
-            Some(PnlAttribution {
-                realized,
-                unrealized,
-                fees,
-                rounding_difference,
-            })
+            let split = (|| -> Result<PnlAttribution> {
+                let realized = round_terms(&realized_terms, rounding, "realized")?;
+                let unrealized = round_terms(&unrealized_terms, rounding, "unrealized")?;
+                let fees = round_terms(&fee_terms, rounding, "fees")?;
+                // net - (realized + unrealized - fees), in one exact step.
+                let rounding_difference = sum(
+                    &[net, neg(realized), neg(unrealized), fees],
+                    "net - explained",
+                )?;
+                Ok(PnlAttribution {
+                    realized,
+                    unrealized,
+                    fees,
+                    rounding_difference,
+                })
+            })();
+            match split {
+                Ok(split) => Some(split),
+                // A figure of the split alone may not fit a Decimal even
+                // when the net does (large offsetting gains and losses).
+                Err(MarginError::Arithmetic { .. }) => None,
+                Err(error) => return Err(error),
+            }
         }
         _ => None,
     };

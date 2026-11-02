@@ -81,6 +81,10 @@ impl CollateralView {
     /// own balance, not converted equity. Both figures work on total
     /// balances: reservations are not deducted, so a consumer deducts them
     /// once, where it applies.
+    ///
+    /// The view carries no mark flags: a consumer that needs them (which
+    /// assets or instruments were valued at an invalid mark) keeps the
+    /// [`AccountValuation`] alongside.
     #[must_use]
     pub fn from_valuation(valuation: &AccountValuation) -> Self {
         Self {
