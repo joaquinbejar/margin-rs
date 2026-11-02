@@ -110,6 +110,33 @@ pub enum MarginError {
         available: Decimal,
     },
 
+    /// No order with this identifier is known to the risk gate.
+    #[error("unknown order {id}")]
+    UnknownOrder {
+        /// Order identifier.
+        id: String,
+    },
+
+    /// The operation is not valid in the order's current state.
+    #[error("cannot {operation} order {id} in state {state}")]
+    InvalidOrderState {
+        /// Order identifier.
+        id: String,
+        /// State the order is in.
+        state: &'static str,
+        /// Operation attempted.
+        operation: &'static str,
+    },
+
+    /// An execution does not match the order it is reported for.
+    #[error("execution for order {id} rejected: {reason}")]
+    ExecutionMismatch {
+        /// Order identifier.
+        id: String,
+        /// Rule the execution violates.
+        reason: &'static str,
+    },
+
     /// An open position has no mark price.
     #[error("missing mark price for {instrument}")]
     MissingMark {

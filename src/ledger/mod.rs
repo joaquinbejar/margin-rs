@@ -435,6 +435,41 @@ impl Ledger {
     ///   execution would end with a negative available balance.
     /// - [`MarginError::Arithmetic`]: overflow or a non exact intermediate.
     pub fn book_execution(&mut self, execution: &Execution) -> Result<Booking> {
+        self.book(execution, None)
+    }
+
+    /// Books one execution that consumes an open reservation, in one atomic
+    /// step.
+    ///
+    /// The reservation `reservation` is shrunk to `remaining_reserved` (and
+    /// removed when that is zero) and the execution is booked against the
+    /// balance freed this way. A duplicate execution returns
+    /// [`Booking::Duplicate`] and leaves the reservation untouched, so a
+    /// repeated fill message adjusts the reservation exactly once.
+    ///
+    /// # Errors
+    ///
+    /// As [`Ledger::book_execution`], plus:
+    ///
+    /// - [`MarginError::UnknownReservation`] if the reservation is not open;
+    /// - [`MarginError::InvalidInput`] if `remaining_reserved` is negative or
+    ///   larger than the current reservation (a fill never grows it);
+    /// - [`MarginError::PrecisionExceeded`] if `remaining_reserved` is finer
+    ///   than the reserved asset scale.
+    pub fn book_execution_with_reservation(
+        &mut self,
+        execution: &Execution,
+        reservation: &ReservationId,
+        remaining_reserved: Decimal,
+    ) -> Result<Booking> {
+        self.book(execution, Some((reservation, remaining_reserved)))
+    }
+
+    fn book(
+        &mut self,
+        execution: &Execution,
+        reservation: Option<(&ReservationId, Decimal)>,
+    ) -> Result<Booking> {
         if let Some((previous, index)) = self.executions.get(&execution.id) {
             if previous == execution {
                 return Ok(Booking::Duplicate(self.journal[*index].clone()));
@@ -495,27 +530,60 @@ impl Ledger {
             accumulate(&mut deltas, &fee.asset, -fee.amount)?;
         }
 
-        let mut new_balances = Vec::with_capacity(deltas.len());
-        for (asset, delta) in &deltas {
+        // Reservation consumed by this execution: (id, asset, remaining,
+        // released).
+        let reservation_change = match reservation {
+            Some((id, remaining)) => {
+                let (asset, amount) = self
+                    .reservations
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| MarginError::UnknownReservation { id: id.to_string() })?;
+                if remaining < Decimal::ZERO || remaining > amount {
+                    return Err(MarginError::invalid_input(
+                        "remaining_reserved",
+                        "must be between zero and the current reservation",
+                    ));
+                }
+                check_scale(
+                    remaining,
+                    self.asset_scale_or_err(&asset)?,
+                    "remaining_reserved",
+                )?;
+                let released = sub(amount, remaining, "reservation - remaining")?;
+                Some((id.clone(), asset, remaining, released))
+            }
+            None => None,
+        };
+
+        let mut touched: Vec<&Asset> = deltas.keys().collect();
+        if let Some((_, asset, _, _)) = &reservation_change {
+            if !deltas.contains_key(asset) {
+                touched.push(asset);
+            }
+        }
+        let mut new_balances = Vec::with_capacity(touched.len());
+        for asset in touched {
             let balance = self.balance_of(asset)?;
-            let total = add(balance.total, *delta, "balance + delta")?;
-            if *delta < Decimal::ZERO {
-                let available_after = sub(total, balance.reserved, "total - reserved")?;
+            let delta = deltas.get(asset).copied().unwrap_or_default();
+            let reserved = match &reservation_change {
+                Some((_, reserved_asset, _, released)) if reserved_asset == asset => {
+                    sub(balance.reserved, *released, "reserved - released")?
+                }
+                _ => balance.reserved,
+            };
+            let total = add(balance.total, delta, "balance + delta")?;
+            if delta < Decimal::ZERO {
+                let available_after = sub(total, reserved, "total - reserved")?;
                 if available_after < Decimal::ZERO {
                     return Err(MarginError::InsufficientBalance {
                         asset: asset.clone(),
-                        required: -*delta,
-                        available: balance.available()?,
+                        required: -delta,
+                        available: sub(balance.total, reserved, "total - reserved")?,
                     });
                 }
             }
-            new_balances.push((
-                asset.clone(),
-                Balance {
-                    total,
-                    reserved: balance.reserved,
-                },
-            ));
+            new_balances.push((asset.clone(), Balance { total, reserved }));
         }
 
         let position = self
@@ -548,6 +616,13 @@ impl Ledger {
             .insert(execution.instrument.clone(), new_position);
         if let Some((asset, total)) = new_fee_total {
             self.fees_paid.insert(asset, total);
+        }
+        if let Some((id, asset, remaining, _)) = reservation_change {
+            if remaining.is_zero() {
+                self.reservations.remove(&id);
+            } else {
+                self.reservations.insert(id, (asset, remaining));
+            }
         }
         let index = self.journal.len();
         let cashflow = ExecutionCashflow {

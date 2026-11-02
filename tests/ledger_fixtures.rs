@@ -828,3 +828,69 @@ fn eighteen_digit_scales_open_reduce_and_value() {
     assert_eq!(fine_buy.rounding_residual, None);
     ledger.reconcile().expect("reconciles");
 }
+
+/// `book_execution_with_reservation` books against the reservation it
+/// shrinks, atomically, and validates the new reservation amount.
+///
+/// 100 USDC with 100 reserved: a plain buy of 1 at 60 fails, but booked
+/// against the reservation (shrunk to 40) it succeeds: total 40, reserved
+/// 40, available 0. A duplicate leaves the reservation at 40.
+#[test]
+fn booking_against_a_reservation_is_atomic() {
+    let mut ledger = ledger();
+    let usdc = asset("USDC");
+    ledger
+        .deposit(tid("d1"), usdc.clone(), dec!(100))
+        .expect("deposit");
+    let hold = ReservationId::new("r1").expect("id");
+    ledger
+        .reserve(hold.clone(), usdc.clone(), dec!(100))
+        .expect("reserve");
+    let e1 = exec("e1", Side::Buy, dec!(60), dec!(1));
+    assert!(matches!(
+        ledger.book_execution(&e1),
+        Err(MarginError::InsufficientBalance { .. })
+    ));
+    let before = ledger.snapshot();
+    assert_eq!(
+        ledger.book_execution_with_reservation(&e1, &hold, dec!(101)),
+        Err(MarginError::invalid_input(
+            "remaining_reserved",
+            "must be between zero and the current reservation"
+        ))
+    );
+    assert_eq!(
+        ledger.book_execution_with_reservation(&e1, &hold, dec!(0.0000001)),
+        Err(MarginError::PrecisionExceeded {
+            field: "remaining_reserved",
+            scale: 7,
+            max_scale: 6,
+        })
+    );
+    let other = ReservationId::new("r2").expect("id");
+    assert_eq!(
+        ledger.book_execution_with_reservation(&e1, &other, dec!(0)),
+        Err(MarginError::UnknownReservation { id: "r2".into() })
+    );
+    // Shrinking to 50 frees only 50: not enough for 60.
+    assert!(matches!(
+        ledger.book_execution_with_reservation(&e1, &hold, dec!(50)),
+        Err(MarginError::InsufficientBalance { .. })
+    ));
+    assert_eq!(ledger.snapshot(), before);
+
+    let first = ledger
+        .book_execution_with_reservation(&e1, &hold, dec!(40))
+        .expect("books");
+    let b = ledger.balance(&usdc).expect("balance");
+    assert_eq!(
+        (b.total, b.reserved, b.available),
+        (dec!(40), dec!(40), dec!(0))
+    );
+    assert_eq!(
+        ledger.book_execution_with_reservation(&e1, &hold, dec!(0)),
+        Ok(Booking::Duplicate(first.cashflow().clone()))
+    );
+    assert_eq!(ledger.balance(&usdc).expect("balance").reserved, dec!(40));
+    ledger.reconcile().expect("reconciles");
+}

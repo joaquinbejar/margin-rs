@@ -251,8 +251,12 @@ impl Wide {
     ///
     /// Trailing zeros are removed only as far as needed to fit the 96 bit
     /// mantissa and the 28 digit scale; otherwise the scale is kept.
+    /// Zero is always returned as `Decimal::ZERO` (scale 0).
     pub(crate) fn to_decimal(self, scale: u32) -> Option<Decimal> {
         const MAX_MANTISSA: u128 = (1 << 96) - 1;
+        if self.magnitude.is_zero() {
+            return Some(Decimal::ZERO);
+        }
         let ten = U768::from_u128(10);
         let mut magnitude = self.magnitude;
         let mut scale = scale;
@@ -330,5 +334,7 @@ mod tests {
         // A value needing 29 digits cannot be represented.
         assert_eq!(Wide::new(false, u(1)).to_decimal(29), None);
         assert_eq!(Wide::new(true, U768::ZERO), Wide::ZERO);
+        // Zero comes back at scale 0, whatever the requested scale.
+        assert_eq!(Wide::ZERO.to_decimal(56).map(|d| d.scale()), Some(0));
     }
 }
