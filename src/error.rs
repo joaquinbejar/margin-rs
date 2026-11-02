@@ -9,7 +9,7 @@
 use rust_decimal::Decimal;
 use thiserror::Error;
 
-use crate::ids::{Asset, InstrumentId};
+use crate::ids::{Asset, FactorId, InstrumentId};
 
 /// Result alias used by every fallible function in this crate.
 pub type Result<T> = core::result::Result<T, MarginError>;
@@ -157,6 +157,32 @@ pub enum MarginError {
         expected: Asset,
         /// Asset given.
         found: Asset,
+    },
+
+    /// An exposure refers to a factor the covariance matrix does not have.
+    #[error("unknown factor {factor}")]
+    UnknownFactor {
+        /// Factor identifier.
+        factor: FactorId,
+    },
+
+    /// An exposure's unit does not match its factor's unit, for example a
+    /// vega exposure (per volatility point) against a price return factor.
+    #[error("exposure to {factor} is per {found}, the factor moves in {expected}")]
+    FactorUnitMismatch {
+        /// Factor identifier.
+        factor: FactorId,
+        /// Unit of the factor.
+        expected: &'static str,
+        /// Unit of the exposure.
+        found: &'static str,
+    },
+
+    /// A covariance matrix fails validation.
+    #[error("invalid covariance matrix: {reason}")]
+    InvalidCovariance {
+        /// Rule violated.
+        reason: &'static str,
     },
 
     /// An open position has no mark price.

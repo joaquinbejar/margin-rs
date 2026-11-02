@@ -247,6 +247,16 @@ impl Wide {
         ))
     }
 
+    /// Signed comparison.
+    pub(crate) fn cmp_signed(&self, other: &Self) -> Ordering {
+        match (self.negative, other.negative) {
+            (false, true) => Ordering::Greater,
+            (true, false) => Ordering::Less,
+            (false, false) => self.magnitude.cmp(&other.magnitude),
+            (true, true) => other.magnitude.cmp(&self.magnitude),
+        }
+    }
+
     /// The decimal `self / 10^scale`, if it can be represented exactly.
     ///
     /// Trailing zeros are removed only as far as needed to fit the 96 bit

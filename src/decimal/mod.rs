@@ -146,6 +146,76 @@ pub(crate) fn sum_terms_round(
     round_ratio(sum, denominator, scale, rounding).ok_or_else(error)
 }
 
+/// Quadratic form `e' C e` where `e_i` is the exact sum of `groups[i]`,
+/// rounded once to `scale`. The sums stay in wide integers until the final
+/// rounding, so neither a partial sum nor a net `e_i` needs to be
+/// representable; only the result must be. Also returns each net as a
+/// `Decimal` when it is representable.
+///
+/// `matrix` must be `groups.len()` square.
+pub(crate) fn quadratic_form_round(
+    groups: &[Vec<Decimal>],
+    matrix: &[Vec<Decimal>],
+    scale: u32,
+    rounding: Rounding,
+    operation: &'static str,
+) -> Result<(Decimal, Vec<Option<Decimal>>)> {
+    let error = || MarginError::arithmetic(operation);
+    // Net of each group in wide integers, at the group's largest scale.
+    let mut nets = Vec::with_capacity(groups.len());
+    for values in groups {
+        let common = values.iter().map(Decimal::scale).max().unwrap_or(0);
+        let mut total = Wide::ZERO;
+        for value in values {
+            let (wide, s) = Wide::from_decimal(*value);
+            total = total
+                .checked_add(wide.scale_up(common - s).ok_or_else(error)?)
+                .ok_or_else(error)?;
+        }
+        nets.push((total, common));
+    }
+    // sum_ij net_i * net_j * c_ij, aligned to a common scale.
+    let mut terms = Vec::with_capacity(nets.len() * nets.len());
+    for (i, (ni, si)) in nets.iter().enumerate() {
+        for (j, (nj, sj)) in nets.iter().enumerate() {
+            let (c, sc) = Wide::from_decimal(matrix[i][j]);
+            let value = ni
+                .checked_mul(*nj)
+                .and_then(|v| v.checked_mul(c))
+                .ok_or_else(error)?;
+            terms.push((value, si + sj + sc));
+        }
+    }
+    let common = terms.iter().map(|(_, s)| *s).max().unwrap_or(0);
+    let mut total = Wide::ZERO;
+    for (value, s) in terms {
+        total = total
+            .checked_add(value.scale_up(common - s).ok_or_else(error)?)
+            .ok_or_else(error)?;
+    }
+    let denominator = Wide::new(false, U768::pow10(common).ok_or_else(error)?);
+    let result = round_ratio(total, denominator, scale, rounding).ok_or_else(error)?;
+    let nets = nets.into_iter().map(|(n, s)| n.to_decimal(s)).collect();
+    Ok((result, nets))
+}
+
+/// Exact comparison of `product(left)` with `product(right)`, without
+/// converting either product to a `Decimal` (they need not be
+/// representable).
+pub(crate) fn compare_products(
+    left: &[Decimal],
+    right: &[Decimal],
+    operation: &'static str,
+) -> Result<core::cmp::Ordering> {
+    let error = || MarginError::arithmetic(operation);
+    let (l, ls) = wide_product(left).ok_or_else(error)?;
+    let (r, rs) = wide_product(right).ok_or_else(error)?;
+    let common = ls.max(rs);
+    let l = l.scale_up(common - ls).ok_or_else(error)?;
+    let r = r.scale_up(common - rs).ok_or_else(error)?;
+    Ok(l.cmp_signed(&r))
+}
+
 /// Product of the mantissas and sum of the scales.
 fn wide_product(values: &[Decimal]) -> Option<(Wide, u32)> {
     let mut product = Wide::new(false, U768::from_u128(1));
@@ -531,6 +601,53 @@ mod tests {
             Err(MarginError::arithmetic("t"))
         );
         assert_eq!(product(&[], "t"), Ok(dec!(1)));
+    }
+
+    #[test]
+    fn exact_sums_and_product_comparisons() {
+        // MAX + 0.1 - MAX: the partial sum is not representable, the net is.
+        let (q, nets) = quadratic_form_round(
+            &[vec![Decimal::MAX, dec!(0.1), Decimal::MIN]],
+            &[vec![dec!(1)]],
+            6,
+            Rounding::HalfEven,
+            "t",
+        )
+        .expect("exact");
+        assert_eq!((q, nets), (dec!(0.01), vec![Some(dec!(0.1))]));
+        // 2 * MAX is not a Decimal; with a zero covariance the form is 0.
+        let (q, nets) = quadratic_form_round(
+            &[vec![Decimal::MAX, Decimal::MAX]],
+            &[vec![dec!(0)]],
+            6,
+            Rounding::HalfEven,
+            "t",
+        )
+        .expect("exact");
+        assert_eq!((q, nets), (dec!(0), vec![None]));
+        use core::cmp::Ordering;
+        // 1e-16 * 1e-16 = 1e-32 is not a Decimal, but compares exactly.
+        let tiny = Decimal::new(1, 16);
+        assert_eq!(
+            compare_products(&[tiny, tiny], &[Decimal::ZERO], "t"),
+            Ok(Ordering::Greater)
+        );
+        assert_eq!(
+            compare_products(&[tiny, tiny], &[tiny, tiny], "t"),
+            Ok(Ordering::Equal)
+        );
+        assert_eq!(
+            compare_products(
+                &[Decimal::MAX, Decimal::MAX],
+                &[Decimal::MAX, Decimal::MAX, dec!(1.1)],
+                "t"
+            ),
+            Ok(Ordering::Less)
+        );
+        assert_eq!(
+            compare_products(&[dec!(-1), dec!(2)], &[dec!(1)], "t"),
+            Ok(Ordering::Less)
+        );
     }
 
     /// Wide results agree with i128 arithmetic where i128 suffices.
