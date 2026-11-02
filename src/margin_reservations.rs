@@ -539,8 +539,10 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
         let (decision, candidate) = self.decide(&order, Some(collateral), marks)?;
         if let MarginDecision::Reserved { required, .. } = &decision {
             // A risk reducing order may be accepted while the requirement
-            // exceeds the cash; the hold then takes all of it.
-            gate.set_hold(hold, currency, (*required).min(collateral))?;
+            // exceeds the cash; the hold then takes whatever cash there is,
+            // never a negative amount (the account may be in debt).
+            let holdable = collateral.max(Decimal::ZERO);
+            gate.set_hold(hold, currency, (*required).min(holdable))?;
         }
         self.seen_orders.insert(order.id);
         if let Some(orders) = candidate {

@@ -549,6 +549,96 @@ mod with_gate {
         ));
     }
 
+    /// E3 with debt: the account is overdrawn (USDC -20), so collateral is
+    /// negative. A reducing sell is still accepted and the hold is 0, never
+    /// negative; a risk increasing buy is rejected. Same with a previous
+    /// hold of 80 (total -20, reserved 80): the hold shrinks to 0.
+    #[test]
+    fn reducing_orders_are_accepted_in_debt() {
+        for previous_hold in [dec!(0), dec!(80)] {
+            let mut ledger = Ledger::default();
+            ledger.register_asset(usdc(), 6).expect("register");
+            ledger
+                .register_asset(Asset::new("BTC").expect("asset"), 8)
+                .expect("register");
+            ledger
+                .register_instrument(
+                    SpotInstrument::new(
+                        iid("BTC-USDC"),
+                        Asset::new("BTC").expect("asset"),
+                        usdc(),
+                        2,
+                        2,
+                    )
+                    .expect("spot"),
+                )
+                .expect("register");
+            if !previous_hold.is_zero() {
+                ledger
+                    .deposit(TransferId::new("d").expect("id"), usdc(), dec!(100))
+                    .expect("deposit");
+                ledger
+                    .set_reservation(&hold(), usdc(), previous_hold)
+                    .expect("hold");
+            }
+            let debt = if previous_hold.is_zero() {
+                dec!(20)
+            } else {
+                dec!(120)
+            };
+            let buy = margin_rs::ledger::Execution::new(
+                ExecutionId::new("x").expect("id"),
+                iid("BTC-USDC"),
+                Side::Buy,
+                debt,
+                dec!(1),
+            );
+            ledger
+                .book_execution_allowing_overdraft(&buy, None)
+                .expect("booked");
+            assert_eq!(ledger.balance(&usdc()).expect("balance").total, dec!(-20));
+            let mut gate = RiskGate::new(ledger);
+
+            let mut service = service();
+            service
+                .reserve(
+                    order("b", "XYZ-PERP", Side::Buy, dec!(10)),
+                    Some(dec!(100000)),
+                    &marks(),
+                )
+                .expect("decision");
+            service
+                .apply_fill(&oid("b"), eid("f"), dec!(10))
+                .expect("fill");
+
+            assert!(matches!(
+                service
+                    .reserve_with_gate(
+                        order("s", "XYZ-PERP", Side::Sell, dec!(5)),
+                        &mut gate,
+                        &hold(),
+                        &marks()
+                    )
+                    .expect("decision"),
+                MarginDecision::Reserved { .. }
+            ));
+            assert_eq!(gate.hold(&hold()), dec!(0));
+            assert!(matches!(
+                service
+                    .reserve_with_gate(
+                        order("b2", "XYZ-PERP", Side::Buy, dec!(1)),
+                        &mut gate,
+                        &hold(),
+                        &marks()
+                    )
+                    .expect("decision"),
+                MarginDecision::Rejected {
+                    reason: MarginRejection::InsufficientMargin { .. }
+                }
+            ));
+        }
+    }
+
     /// The hold id cannot be an order id of the gate.
     #[test]
     fn hold_ids_do_not_collide_with_orders() {
