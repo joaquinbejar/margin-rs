@@ -6,6 +6,8 @@ use crate::error::MarginError;
 use crate::ids::{Asset, InstrumentId, OrderId};
 use crate::ledger::{Action, Execution};
 
+use super::FeeDeclarationBreach;
+
 /// Why an order is sent. Informational: every purpose goes through the same
 /// checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -225,6 +227,13 @@ pub enum RiskReason {
         limit: Decimal,
         /// Largest quantity this order may still add.
         headroom: Decimal,
+    },
+    /// The venue breached its declared base fees on this instrument (see
+    /// [`RiskGate::fee_declaration_breaches`](super::RiskGate::fee_declaration_breaches)):
+    /// no new order is admitted under that declaration until it is reset.
+    FeeDeclarationBreached {
+        /// The first breach.
+        breach: FeeDeclarationBreach,
     },
     /// The reservation for the requested quantity exceeds the available
     /// balance.

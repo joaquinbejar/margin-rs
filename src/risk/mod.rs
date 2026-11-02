@@ -108,7 +108,9 @@ pub use decision::{
 };
 
 use crate::decimal::{
-    Rounding, add, check_scale, mul, mul_div_round, neg, sub, sum, sum_products, sum_terms_round,
+    Rounding, Wide, add, check_scale, mul, mul_div_round, mul_div_round_wide,
+    mul_wide_div_round_wide, neg, sub, sum, sum_products, sum_terms_round,
+    sum_terms_with_wide_round_wide, wide_from_u128, wide_to_decimal,
 };
 use crate::direction::Dir;
 use crate::error::{MarginError, Result};
@@ -130,6 +132,115 @@ pub enum FeeAsset {
     /// The base asset.
     Base,
 }
+
+/// How a venue rounds the fees it charges in the base asset, declared so
+/// that the gate can reserve less than the worst case of rounding every
+/// fill up. See [`InstrumentLimits::fee_rounding`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum FeeRounding {
+    /// Each fill of `n` is charged at most `round(max_fee_rate * n)` on the
+    /// base grid, in `mode`. With `min_fill`, every fill except the one that
+    /// completes the order is at least `min_fill` (a positive multiple of
+    /// the lot).
+    PerFill {
+        /// How each fill's fee is rounded.
+        mode: Rounding,
+        /// The smallest fill the venue sends, except the last.
+        min_fill: Option<Decimal>,
+    },
+    /// The fees of an order are charged on its cumulative quantity at an
+    /// exact, fixed rate: after a cumulative `c` the venue has charged
+    /// exactly `round(rate * c)` on the base grid, in `mode`, so a fill of
+    /// `n` after `c` is charged `round(rate * (c + n)) - round(rate * c)`.
+    /// `max_fee_rate` is not used. When the rate is not known exactly, use
+    /// [`FeeRounding::PerFill`].
+    Cumulative {
+        /// How the cumulative fee is rounded.
+        mode: Rounding,
+        /// The exact rate, in `[0, 1)`.
+        rate: Decimal,
+    },
+}
+
+impl Default for FeeRounding {
+    /// Every fill rounded up, with no minimum fill: the worst case, and the
+    /// gate's behaviour before fee rounding could be declared.
+    fn default() -> Self {
+        Self::PerFill {
+            mode: Rounding::AwayFromZero,
+            min_fill: None,
+        }
+    }
+}
+
+/// The base fee terms of an order whose fees are charged in the base asset,
+/// fixed at admission.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BaseFeeTerms {
+    /// `max_fee_rate` for [`FeeRounding::PerFill`]; the exact rate for
+    /// [`FeeRounding::Cumulative`].
+    pub rate: Decimal,
+    /// The declared rounding.
+    pub rounding: FeeRounding,
+    /// The base asset the fees are charged in.
+    pub base: Asset,
+}
+
+/// What a fill did outside the venue's declared fees. The fill is always
+/// booked; the gate records the first such breach of an instrument and
+/// stops admitting orders under that declaration (see
+/// [`RiskGate::fee_declaration_breaches`]). Repeated breaches on one
+/// instrument mean the declaration is wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FeeBreach {
+    /// The base fee is above its declared bound.
+    AboveBound {
+        /// The declared bound for this fill.
+        bound: Decimal,
+        /// The fee charged.
+        fee: Decimal,
+    },
+    /// With cumulative charging at an exact rate, the base fee differs from
+    /// the declared increment, above or below it (a missing fee conforms
+    /// only when the increment is zero).
+    DeclaredFeeMismatch {
+        /// The declared increment for this fill.
+        expected: Decimal,
+        /// The fee charged in base.
+        fee: Decimal,
+    },
+    /// A fill below the declared minimum that does not complete the order.
+    BelowMinimumFill {
+        /// The declared minimum fill.
+        min_fill: Decimal,
+        /// The fill's quantity.
+        quantity: Decimal,
+    },
+    /// The fee is charged in an asset other than the declared base asset.
+    UnexpectedAsset {
+        /// The asset charged.
+        asset: Asset,
+        /// The fee charged.
+        fee: Decimal,
+    },
+}
+
+/// The first fee breach recorded for an instrument, with the declaration
+/// it breached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeeDeclarationBreach {
+    /// The order whose fill breached it.
+    pub order: OrderId,
+    /// What happened.
+    pub breach: FeeBreach,
+    /// The declaration breached: the order's base fee terms.
+    pub declaration: BaseFeeTerms,
+}
+
+/// The largest mantissa of a `Decimal`, `2^96 - 1`.
+const MAX_MANTISSA: i128 = 79_228_162_514_264_337_593_543_950_335;
 
 /// Hard limits for one instrument. `None` disables a limit.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -160,12 +271,22 @@ pub struct InstrumentLimits {
     /// Rounding up per fill makes a fine lot expensive: with a lot equal to
     /// the base grid (1e-8 BTC on an 8 digit grid) and any positive rate,
     /// every lot can be charged one more unit, so a sell reserves twice its
-    /// quantity (a venue fee rounding of its own is margin-rs#38). Fixed per
+    /// quantity unless the venue declares a rounding
+    /// ([`InstrumentLimits::fee_rounding`]). Fixed per
     /// order at admission: later changes do not affect live orders.
     pub max_fee_rate: Decimal,
     /// Asset fees are charged in. Quote by default. Fixed per order at
     /// admission, like `max_fee_rate`.
     pub fee_asset: FeeAsset,
+    /// How the venue rounds fees in the base asset. The default rounds
+    /// every fill up, the worst case; a declared rounding lets a sell with
+    /// fees in base reserve less. Only [`FeeAsset::Base`] accepts a value
+    /// other than the default. Fixed per order at admission.
+    ///
+    /// The reservation of a sell of 2 BTC on an 8 digit grid with a lot of
+    /// 1e-8 and a rate of 0.001 is 4 BTC by default, 3.002 with a half mode
+    /// and 2.002 toward zero or cumulative; see `docs/risk-gate.md`.
+    pub fee_rounding: FeeRounding,
     /// Maximum relative distance between the limit price and the last mark
     /// (0.05 is 5 %). Requires market data.
     pub price_band: Option<Decimal>,
@@ -197,8 +318,39 @@ impl InstrumentLimits {
                 "must not be negative",
             ));
         }
+        match (self.fee_asset, self.fee_rounding) {
+            (
+                _,
+                FeeRounding::PerFill {
+                    min_fill: Some(m), ..
+                },
+            ) if m <= Decimal::ZERO => {
+                return Err(MarginError::invalid_input("min_fill", "must be positive"));
+            }
+            (
+                _,
+                FeeRounding::PerFill {
+                    min_fill: Some(m), ..
+                },
+            ) => {
+                check_scale(m, spot.quantity_scale(), "min_fill")?;
+            }
+            (_, FeeRounding::Cumulative { rate, .. })
+                if rate < Decimal::ZERO || rate >= Decimal::ONE =>
+            {
+                return Err(MarginError::invalid_input("fee rate", "must be in [0, 1)"));
+            }
+            (_, FeeRounding::PerFill { min_fill: None, .. } | FeeRounding::Cumulative { .. }) => {}
+        }
         match self.fee_asset {
-            FeeAsset::Quote => {}
+            FeeAsset::Quote => {
+                if self.fee_rounding != FeeRounding::default() {
+                    return Err(MarginError::invalid_input(
+                        "fee_rounding",
+                        "only fees charged in the base asset can declare a rounding",
+                    ));
+                }
+            }
             // A buy pays a base fee from the base it receives: the fee must
             // stay below the quantity.
             FeeAsset::Base => {
@@ -294,39 +446,303 @@ pub struct ReservationTerms {
     pub lot: Decimal,
     /// Amount reserved per open lot.
     pub per_lot: Decimal,
+    /// The base fee terms when fees are charged in the base asset (for a
+    /// sell they shape the reservation; for a buy they bound the fee that
+    /// the fill pays from what it receives). `None` for fees in quote.
+    pub base_fee: Option<BaseFeeTerms>,
 }
 
 impl ReservationTerms {
     /// Reservation for `remaining` open quantity (a multiple of the lot),
-    /// rounded up to the asset grid.
+    /// as a whole order (with a cumulative base fee, nothing filled yet). A
+    /// live order's reservation is [`ReservationTerms::amount_of_order`].
+    /// Both are the hold `H`: the smallest Decimal at least the exact
+    /// requirement on the asset grid (see `amount_of_order`).
     ///
     /// # Errors
     ///
-    /// [`MarginError::Arithmetic`] if the amount cannot be represented.
+    /// [`MarginError::Arithmetic`] if no Decimal is at least the
+    /// requirement.
     pub fn amount(&self, remaining: Decimal) -> Result<Decimal> {
-        mul_div_round(
-            &[remaining, self.per_lot],
-            &[self.lot],
-            self.scale,
-            Rounding::AwayFromZero,
-            "remaining lots * per lot",
-        )
+        self.hold(self.amount_of_lots(self.lots(remaining)?)?)
     }
 
-    /// Largest multiple of the lot whose reservation fits in `available`.
+    /// Reservation of an order of `quantity` that has `filled` so far (the
+    /// real cumulative, overfills and late fills included): zero once
+    /// nothing is left. The exact requirement, in units of the asset grid,
+    /// is, for a sell with fees in base:
+    ///
+    /// - per fill: `R + min(A, B)` rounded up, with `R` the remaining
+    ///   quantity, `A = (R / lot) * round_up(r * lot)` (every fill rounded
+    ///   up, valid for any mode) and `B = r * R + h * ceil(R / m)`, where
+    ///   `h` is one unit of the base grid when rounding away from zero,
+    ///   half of it in a half mode and 0 toward zero, and `m` is the
+    ///   minimum fill (the lot if none). Each fill of at least `m` (or the
+    ///   last) frees at least its fee under each bound, so under their
+    ///   minimum too: when the minimum switches from `A` to `B`, the fall is
+    ///   `A(R) - B(R - n) >= A(R) - A(R - n)`, and the other way round.
+    ///   With the default rounding `A <= B`, the bound before declared
+    ///   rounding;
+    /// - cumulative: `R + round(r * quantity) - round(r * filled)`, exactly
+    ///   the fees still to be charged;
+    ///
+    /// and `R * per_lot / lot` otherwise. Every count and bound stays wide;
+    /// the reservation is the hold `H`, the smallest Decimal at least that
+    /// requirement (it equals it whenever the requirement is a Decimal).
+    /// `H` is monotone, and a fill stays covered: if the order's hold `B` is
+    /// at least the requirement `A(R)`, and a fill within the declaration
+    /// debits `d` with `A(R') <= A(R) - d`, then `A(R') <= B - d`; whenever
+    /// `B - d` is a Decimal (a state the ledger can book), `H(A(R')) <= B -
+    /// d` by the definition of `H`: the new hold stays within what is left of
+    /// the old one after the debit, so the fill causes no shortfall.
     ///
     /// # Errors
     ///
-    /// [`MarginError::Arithmetic`] if the quantity cannot be represented.
-    pub fn affordable(&self, available: Decimal) -> Result<Decimal> {
-        let lots = mul_div_round(
-            &[available.max(Decimal::ZERO)],
-            &[self.per_lot],
+    /// [`MarginError::Arithmetic`] if no Decimal is at least the
+    /// requirement.
+    pub fn amount_of_order(&self, quantity: Decimal, filled: Decimal) -> Result<Decimal> {
+        if filled >= quantity {
+            return Ok(Decimal::ZERO);
+        }
+        let remaining = self
+            .lots(quantity)?
+            .checked_add(self.lots(filled)?.negated())
+            .ok_or(MarginError::arithmetic("remaining lots"))?;
+        let units = match self.sell_base_fee() {
+            Some(BaseFeeTerms {
+                rate,
+                rounding: FeeRounding::Cumulative { mode, .. },
+                ..
+            }) => {
+                let left = mul_wide_div_round_wide(
+                    remaining,
+                    &[self.lot],
+                    &[],
+                    self.scale,
+                    Rounding::AwayFromZero,
+                    "remaining",
+                )?;
+                let total =
+                    mul_div_round_wide(&[*rate, quantity], &[], self.scale, *mode, "order fee")?;
+                let charged =
+                    mul_div_round_wide(&[*rate, filled], &[], self.scale, *mode, "charged fee")?;
+                left.checked_add(total)
+                    .and_then(|w| w.checked_add(charged.negated()))
+                    .ok_or(MarginError::arithmetic("remaining + fees to charge"))?
+            }
+            _ => self.amount_of_lots(remaining)?,
+        };
+        self.hold(units)
+    }
+
+    /// `quantity / lot`, a whole number of lots, as a wide integer.
+    fn lots(&self, quantity: Decimal) -> Result<Wide> {
+        mul_div_round_wide(&[quantity], &[self.lot], 0, Rounding::TowardZero, "lots")
+    }
+
+    /// The hold for a requirement of `units` grid units: the smallest Decimal
+    /// at least `units * 10^-scale`, the requirement itself when it is one,
+    /// otherwise rounded up to the fewest digits that make it one.
+    fn hold(&self, units: Wide) -> Result<Decimal> {
+        for digits in 0..=self.scale {
+            let coarse = mul_wide_div_round_wide(
+                units,
+                &[Decimal::new(1, digits)],
+                &[],
+                0,
+                Rounding::AwayFromZero,
+                "hold",
+            )?;
+            let scale = self
+                .scale
+                .checked_sub(digits)
+                .ok_or(MarginError::arithmetic("hold"))?;
+            if let Ok(hold) = wide_to_decimal(coarse, scale, "hold") {
+                return Ok(hold);
+            }
+        }
+        Err(MarginError::arithmetic("reservation"))
+    }
+
+    /// The base fee terms when they shape this reservation: a sell, which
+    /// reserves the base asset its fees are charged in.
+    fn sell_base_fee(&self) -> Option<&BaseFeeTerms> {
+        self.base_fee.as_ref().filter(|fee| fee.base == self.asset)
+    }
+
+    /// Largest multiple of the lot, at most `max`, whose reservation as a
+    /// whole order ([`ReservationTerms::amount`], the hold) fits in
+    /// `available`. The hold is monotone in the quantity, so it is found
+    /// exactly by an integer bisection over lot counts, with every count and
+    /// requirement kept wide (a candidate with no Decimal hold does not
+    /// fit). The answer is converted once; if it has more digits
+    /// than a Decimal holds, it is the largest multiple of the lot below it
+    /// that does.
+    ///
+    /// # Errors
+    ///
+    /// [`MarginError::Arithmetic`] if a quantity cannot be represented.
+    pub fn affordable(&self, available: Decimal, max: Decimal) -> Result<Decimal> {
+        // A candidate fits when its hold is at most the available balance;
+        // the hold is monotone, and a requirement with no Decimal above it
+        // does not fit. Lot counts and requirements stay wide.
+        let fits = |lots: Wide| -> Result<bool> {
+            match self.hold(self.amount_of_lots(lots)?) {
+                Ok(hold) => Ok(hold <= available),
+                Err(MarginError::Arithmetic { .. }) => Ok(false),
+                Err(other) => Err(other),
+            }
+        };
+        let one = wide_from_u128(1);
+        let mut hi = mul_div_round_wide(
+            &[max.max(Decimal::ZERO)],
+            &[self.lot],
             0,
             Rounding::TowardZero,
-            "available / per lot",
+            "max lots",
         )?;
-        mul(lots, self.lot, "lots * lot")
+        let best = if fits(hi)? {
+            hi
+        } else {
+            // Integer bisection over lot counts: `lo` fits, `hi` does not,
+            // and the gap shrinks every step.
+            let mut lo = Wide::ZERO;
+            loop {
+                let gap = hi
+                    .checked_add(lo.negated())
+                    .ok_or(MarginError::arithmetic("gap"))?;
+                if gap.cmp_signed(&one).is_le() {
+                    break lo;
+                }
+                let half = mul_wide_div_round_wide(
+                    gap,
+                    &[],
+                    &[Decimal::TWO],
+                    0,
+                    Rounding::TowardZero,
+                    "half gap",
+                )?;
+                let mid = lo.checked_add(half).ok_or(MarginError::arithmetic("mid"))?;
+                if fits(mid)? {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+        };
+        self.quantity_of_lots(best)
+    }
+
+    /// The reservation of `lots` whole lots as a whole order, in grid units,
+    /// wide: the same bounds as [`ReservationTerms::amount`].
+    fn amount_of_lots(&self, lots: Wide) -> Result<Wide> {
+        let scale = self.scale;
+        let linear = || {
+            sum_terms_with_wide_round_wide(
+                &[],
+                &[(lots, &[self.per_lot])],
+                scale,
+                Rounding::AwayFromZero,
+                "lots * per lot",
+            )
+        };
+        let Some(fee) = self.sell_base_fee() else {
+            return linear();
+        };
+        match fee.rounding {
+            FeeRounding::PerFill { mode, min_fill } => {
+                let ulp = Decimal::new(1, scale);
+                let half = match mode {
+                    Rounding::AwayFromZero => Decimal::ONE,
+                    Rounding::HalfEven | Rounding::HalfAwayFromZero => Decimal::new(5, 1),
+                    Rounding::TowardZero => Decimal::ZERO,
+                };
+                let m = min_fill.map_or(self.lot, |m| m.max(self.lot));
+                let fills = mul_wide_div_round_wide(
+                    lots,
+                    &[self.lot],
+                    &[m],
+                    0,
+                    Rounding::AwayFromZero,
+                    "fills",
+                )?;
+                let by_lot = linear()?;
+                let by_fill = sum_terms_with_wide_round_wide(
+                    &[],
+                    &[
+                        (lots, &[self.lot]),
+                        (lots, &[fee.rate, self.lot]),
+                        (fills, &[ulp, half]),
+                    ],
+                    scale,
+                    Rounding::AwayFromZero,
+                    "lots + fee bound",
+                )?;
+                Ok(if by_fill.cmp_signed(&by_lot).is_lt() {
+                    by_fill
+                } else {
+                    by_lot
+                })
+            }
+            FeeRounding::Cumulative { mode, .. } => {
+                let quantity = mul_wide_div_round_wide(
+                    lots,
+                    &[self.lot],
+                    &[],
+                    scale,
+                    Rounding::AwayFromZero,
+                    "quantity",
+                )?;
+                let fee_part = mul_wide_div_round_wide(
+                    lots,
+                    &[fee.rate, self.lot],
+                    &[],
+                    scale,
+                    mode,
+                    "order fee",
+                )?;
+                quantity
+                    .checked_add(fee_part)
+                    .ok_or(MarginError::arithmetic("quantity + fee"))
+            }
+        }
+    }
+
+    /// The largest multiple of the lot that a Decimal represents and that is
+    /// at most `lots * lot`: `lots * lot` itself when it fits, otherwise the
+    /// best candidate over scales `s <= lot.scale()`, either `lots * lot`
+    /// truncated to `s` digits or, when that mantissa is too large, the
+    /// largest mantissa at `s` (which is then below it), each floored to the
+    /// lot.
+    fn quantity_of_lots(&self, lots: Wide) -> Result<Decimal> {
+        let floor_to_lot = |q: Decimal| -> Result<Decimal> {
+            let rest = q
+                .checked_rem(self.lot)
+                .ok_or(MarginError::arithmetic("quantity % lot"))?;
+            sub(q, rest, "quantity - rest")
+        };
+        // From the finest scale down: the first scale at which the
+        // truncation is a Decimal gives the best value at that scale and
+        // above every coarser one; finer scales contribute their largest
+        // Decimal, which is below the value.
+        let mut best = Decimal::ZERO;
+        for scale in (0..=self.lot.scale()).rev() {
+            let value = mul_wide_div_round_wide(
+                lots,
+                &[self.lot],
+                &[],
+                scale,
+                Rounding::TowardZero,
+                "quantity",
+            )?;
+            if let Ok(q) = wide_to_decimal(value, scale, "quantity") {
+                return Ok(best.max(floor_to_lot(q)?));
+            }
+            let largest = Decimal::try_from_i128_with_scale(MAX_MANTISSA, scale)
+                .map_err(|_| MarginError::arithmetic("largest decimal"))?;
+            best = best.max(floor_to_lot(largest)?);
+        }
+        Ok(best)
     }
 }
 
@@ -377,6 +793,7 @@ impl OrderRecord {
 
 /// Result of [`RiskGate::on_fill`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FillOutcome {
     /// The booking, new or duplicate.
     pub booking: Booking,
@@ -390,6 +807,11 @@ pub struct FillOutcome {
     /// Empty when the fill did not halt the gate, for a duplicate, and when
     /// every live order already had a cancel pending.
     pub withdraw: Vec<OrderId>,
+    /// What the fill did outside the venue's declared base fees (empty for
+    /// fees in quote and for a duplicate). The fill is booked anyway; the
+    /// first breach latches the instrument
+    /// ([`RiskGate::fee_declaration_breaches`]).
+    pub fee_breaches: Vec<FeeBreach>,
 }
 
 impl FillOutcome {
@@ -408,6 +830,7 @@ pub struct RiskGate {
     marks: BTreeMap<InstrumentId, (Decimal, u64)>,
     orders: BTreeMap<OrderId, OrderRecord>,
     halts: Vec<HaltReason>,
+    fee_breach: BTreeMap<InstrumentId, Vec<FeeDeclarationBreach>>,
 }
 
 impl RiskGate {
@@ -421,6 +844,7 @@ impl RiskGate {
             marks: BTreeMap::new(),
             orders: BTreeMap::new(),
             halts: Vec::new(),
+            fee_breach: BTreeMap::new(),
         }
     }
 
@@ -542,6 +966,127 @@ impl RiskGate {
         limits.validate(&spot)?;
         self.limits.insert(instrument.clone(), limits);
         Ok(())
+    }
+
+    /// The breaches of declared base fees recorded on `instrument`: the
+    /// first breach of each declaration, in order. While a declaration is
+    /// recorded, new orders under it (the same base fee rate, rounding and
+    /// asset) are rejected with [`RiskReason::FeeDeclarationBreached`];
+    /// cancels, confirmations and fill reports go on, and an order under a
+    /// declaration not recorded (for example the default, worst case
+    /// rounding) is admitted.
+    #[must_use]
+    pub fn fee_declaration_breaches(&self, instrument: &InstrumentId) -> &[FeeDeclarationBreach] {
+        self.fee_breach.get(instrument).map_or(&[], Vec::as_slice)
+    }
+
+    /// The first breach of the fee declaration latches the instrument (only
+    /// that declaration's new orders are refused).
+    fn record_fee_breach(&mut self, id: &OrderId, order: &OrderRecord, breaches: &[FeeBreach]) {
+        if let (Some(breach), Some(declaration)) = (
+            breaches.first(),
+            order.terms.as_ref().and_then(|t| t.base_fee.clone()),
+        ) {
+            let recorded = self.fee_breach.entry(order.instrument.clone()).or_default();
+            // The first breach of each declaration is kept.
+            if !recorded.iter().any(|b| b.declaration == declaration) {
+                recorded.push(FeeDeclarationBreach {
+                    order: id.clone(),
+                    breach: breach.clone(),
+                    declaration,
+                });
+            }
+        }
+    }
+
+    /// Clears every recorded fee breach of `instrument`, once its
+    /// declarations are checked or corrected. Returns `false` if none was
+    /// recorded.
+    /// Executions, reservations and the terms of live orders are kept.
+    pub fn reset_fee_declaration(&mut self, instrument: &InstrumentId) -> bool {
+        self.fee_breach.remove(instrument).is_some()
+    }
+
+    /// The breaches of the declared base fees by a new fill of `order`
+    /// (before it is applied, so `order.filled` is the cumulative before
+    /// it). A buy's fee in base is at most what its fill credits: in units
+    /// of the base grid the fill `n` is an integer and `b = r * n < n`, so
+    /// `ceil(a + b) - ceil(a) <= ceil(b) <= n`, a half mode gives at most
+    /// `floor(b + 1) <= n` and toward zero at most `ceil(b) <= n`; both a
+    /// per fill fee and a cumulative increment stay within `n`.
+    fn fee_breaches(
+        &self,
+        order: &OrderRecord,
+        execution: &Execution,
+        filled_after: Decimal,
+    ) -> Result<Vec<FeeBreach>> {
+        let Some(fee_terms) = order.terms.as_ref().and_then(|t| t.base_fee.as_ref()) else {
+            return Ok(Vec::new());
+        };
+        let scale =
+            self.ledger
+                .asset_scale(&fee_terms.base)
+                .ok_or_else(|| MarginError::UnknownAsset {
+                    asset: fee_terms.base.clone(),
+                })?;
+        let mut breaches = Vec::new();
+        let charged = match &execution.fee {
+            None => Decimal::ZERO,
+            Some(fee) if fee.asset == fee_terms.base => fee.amount,
+            Some(fee) => {
+                breaches.push(FeeBreach::UnexpectedAsset {
+                    asset: fee.asset.clone(),
+                    fee: fee.amount,
+                });
+                Decimal::ZERO
+            }
+        };
+        let n = execution.quantity;
+        match fee_terms.rounding {
+            FeeRounding::PerFill { mode, min_fill } => {
+                if let Some(m) = min_fill
+                    && n < m
+                    && filled_after < order.quantity
+                {
+                    breaches.push(FeeBreach::BelowMinimumFill {
+                        min_fill: m,
+                        quantity: n,
+                    });
+                }
+                let bound =
+                    mul_div_round(&[fee_terms.rate, n], &[], scale, mode, "fill fee bound")?;
+                if charged > bound {
+                    breaches.push(FeeBreach::AboveBound {
+                        bound,
+                        fee: charged,
+                    });
+                }
+            }
+            FeeRounding::Cumulative { mode, .. } => {
+                let after = mul_div_round(
+                    &[fee_terms.rate, filled_after],
+                    &[],
+                    scale,
+                    mode,
+                    "fee after",
+                )?;
+                let before = mul_div_round(
+                    &[fee_terms.rate, order.filled],
+                    &[],
+                    scale,
+                    mode,
+                    "fee before",
+                )?;
+                let expected = sub(after, before, "fee increment")?;
+                if charged != expected {
+                    breaches.push(FeeBreach::DeclaredFeeMismatch {
+                        expected,
+                        fee: charged,
+                    });
+                }
+            }
+        }
+        Ok(breaches)
     }
 
     /// Limits in force for `instrument` (all disabled if never set).
@@ -701,6 +1246,16 @@ impl RiskGate {
             return RiskDecision::Rejected { reasons };
         }
         let limits = self.limits(&request.instrument);
+        if let Some(declaration) = base_fee_terms(&limits, &spot)
+            && let Some(breach) = self
+                .fee_breach
+                .get(&request.instrument)
+                .and_then(|all| all.iter().find(|b| b.declaration == declaration))
+        {
+            reasons.push(RiskReason::FeeDeclarationBreached {
+                breach: breach.clone(),
+            });
+        }
         self.check_market_data(request, &limits, now_ms, &mut reasons);
         if let Some(limit) = limits.max_open_orders {
             let live = self
@@ -877,7 +1432,7 @@ impl RiskGate {
             .map(|b| b.available)
             .unwrap_or_default();
         if required > available {
-            let affordable = terms.affordable(available)?;
+            let affordable = terms.affordable(available, allowed)?;
             caps.push(RiskReason::InsufficientBalance {
                 asset: terms.asset.clone(),
                 required,
@@ -904,6 +1459,7 @@ impl RiskGate {
                     asset: asset.clone(),
                 })
         };
+        let base_fee = base_fee_terms(limits, spot);
         match Dir::from_action(side, "side")? {
             Dir::Sell => {
                 let scale = scale_of(spot.base())?;
@@ -919,7 +1475,10 @@ impl RiskGate {
                     // As the lot is on the grid, lot + round_up(r * lot) is
                     // round_up(lot + r * lot): one exact sum, rounded once.
                     FeeAsset::Base => sum_terms_round(
-                        &[&[lot], &[limits.max_fee_rate, lot]],
+                        &[
+                            &[lot],
+                            &[base_fee.as_ref().map_or(Decimal::ZERO, |f| f.rate), lot],
+                        ],
                         scale,
                         Rounding::AwayFromZero,
                         "lot + round up lot base fee",
@@ -930,6 +1489,7 @@ impl RiskGate {
                     scale,
                     lot,
                     per_lot,
+                    base_fee,
                 })
             }
             Dir::Buy => {
@@ -994,6 +1554,7 @@ impl RiskGate {
                     scale,
                     lot,
                     per_lot,
+                    base_fee,
                 })
             }
         }
@@ -1230,6 +1791,7 @@ impl RiskGate {
                 anomalies: Vec::new(),
                 shortfalls: BTreeMap::new(),
                 withdraw: Vec::new(),
+                fee_breaches: Vec::new(),
             });
         }
         let order = self
@@ -1282,13 +1844,13 @@ impl RiskGate {
             });
         }
 
+        let fee_breaches = self.fee_breaches(&order, execution, filled_after)?;
+
         // Only a live order still holds a reservation; shrink it to what the
         // rest needs (nothing after an overfill).
-        let remaining_after =
-            sub(remaining, execution.quantity, "remaining - fill")?.max(Decimal::ZERO);
         let reservation_id = order.reservation_id()?;
         let reservation = match (&order.terms, order.state.is_live()) {
-            (Some(terms), true) => Some(terms.amount(remaining_after)?),
+            (Some(terms), true) => Some(terms.amount_of_order(order.quantity, filled_after)?),
             _ => None,
         };
         let booked = self.ledger.book_execution_allowing_overdraft(
@@ -1296,6 +1858,7 @@ impl RiskGate {
             reservation.map(|amount| (&reservation_id, amount)),
         )?;
 
+        self.record_fee_breach(id, &order, &fee_breaches);
         // Both are recorded when both happen; halted() reports the more
         // severe one (the accounting breach).
         if let Some(anomaly) = anomalies.first() {
@@ -1326,6 +1889,7 @@ impl RiskGate {
             anomalies,
             shortfalls: booked.shortfalls,
             withdraw,
+            fee_breaches,
         })
     }
 
@@ -1362,6 +1926,22 @@ impl RiskGate {
     /// Lifts the halt and clears every recorded reason.
     pub fn resume(&mut self) {
         self.halts.clear();
+    }
+}
+
+/// The base fee terms an order on `spot` gets under `limits`: `None` for
+/// fees in quote.
+fn base_fee_terms(limits: &InstrumentLimits, spot: &SpotInstrument) -> Option<BaseFeeTerms> {
+    match limits.fee_asset {
+        FeeAsset::Quote => None,
+        FeeAsset::Base => Some(BaseFeeTerms {
+            rate: match limits.fee_rounding {
+                FeeRounding::PerFill { .. } => limits.max_fee_rate,
+                FeeRounding::Cumulative { rate, .. } => rate,
+            },
+            rounding: limits.fee_rounding,
+            base: spot.base().clone(),
+        }),
     }
 }
 
