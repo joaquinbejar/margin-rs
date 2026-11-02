@@ -243,6 +243,36 @@ pub enum MarginError {
         action: financial_types::Action,
     },
 
+    /// A future is still open at or after its expiry: it can no longer
+    /// trade and must be settled first.
+    #[error("{instrument} expired at {expiry_ms} ms and is not settled at {as_of_ms} ms")]
+    ExpiredUnsettled {
+        /// Future instrument.
+        instrument: InstrumentId,
+        /// The future's expiry.
+        expiry_ms: u64,
+        /// When it was found open.
+        as_of_ms: u64,
+    },
+
+    /// A fill was reported to a margin reservation service that reads its
+    /// positions from a ledger before the execution was booked there.
+    #[error("execution {id} is not booked in the ledger")]
+    FillNotBooked {
+        /// Execution identifier.
+        id: String,
+    },
+
+    /// The operation belongs to the other mode of a margin reservation
+    /// service (its own positions, or positions read from a ledger).
+    #[error("{operation} is not available in {mode} mode")]
+    WrongReservationMode {
+        /// Operation called.
+        operation: &'static str,
+        /// Mode of the service.
+        mode: &'static str,
+    },
+
     /// A reconciliation check failed: stored state differs from the state
     /// recomputed from the journal.
     #[error("reconciliation failed: {check} for {key}: expected {expected}, found {actual}")]

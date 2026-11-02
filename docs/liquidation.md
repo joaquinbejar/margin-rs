@@ -4,7 +4,7 @@ This document covers two modules and one ledger posting:
 
 - `maintenance::assess` computes the account state that the maintenance margin of a rule implies.
 - `liquidation::plan_liquidation` simulates one staged closeout against supplied scenario prices and liquidity. There is no live liquidator.
-- `Ledger::book_settlement` posts the cash of each forced fill (see `docs/ledger.md`).
+- `LiquidationAccount::from_ledger` reads the account from the ledger, and `ForcedReduction::execution` books each forced fill back into it (see [Ledger round trip](#ledger-round-trip)). For positions kept outside the ledger, `Ledger::book_settlement` posts the cash of each forced fill (see `docs/ledger.md`).
 
 ## Who owns what
 
@@ -13,7 +13,7 @@ This document covers two modules and one ledger posting:
 | Liquidation trigger, account state, cancelling resting orders | the venue, when it keeps its own account state |
 | What to close, in what order, size limits, outcome against book liquidity | margin-rs: `LiquidationPlan` |
 | Journal of record when the venue keeps its own ledger | the venue's ledger; margin-rs reads its collateral figures (`CollateralView`) |
-| Backtests and accounts without a venue ledger | margin-rs `Ledger`, with `book_settlement` |
+| Backtests and accounts without a venue ledger | margin-rs `Ledger`: `from_ledger` and `ForcedReduction::execution` for positions held in it, `book_settlement` for positions kept outside it |
 
 Both functions are pure. Neither books, triggers or cancels anything.
 
@@ -132,7 +132,27 @@ The plan finds `a` exactly, up to the rounding of single cash quanta, in three s
 
 Counts sit on the `contract_step` grid. Grid indices are wide integers, so `k * step`, `ceil(available / step)` and the bisection midpoints never overflow, even for `Decimal::MAX` contracts with a step of 0.5. Near the limits of `Decimal`, a fractional count with too many digits is rounded down to the scale of the cap.
 
-## Ledger postings
+## Ledger round trip
+
+When the futures and perpetuals are held in the margin-rs `Ledger`:
+
+1. `LiquidationAccount::from_ledger(model, snapshot, account, venue, currency, marks, as_of_ms)` builds the account. The caller sets `resting_orders` afterwards.
+   - **Positions.** Every open linear future and perpetual, with its contracts, the multiplier of the ledger's instrument and its instrument mark. The snapshot's instrument definitions are authoritative; marks never change them.
+   - **Basis.** Each position's cost basis. A basis of zero (an entry notional rounded to zero) is valid; a non zero basis must have the sign of the position.
+   - **Cash.** The **total** balance of `currency`, reservations included: a closeout is not limited to the available part.
+   - **Left out.** Spot holdings, in `currency` or any other asset, are not part of the plan. Flat and settled derivatives take no part.
+   - **Errors, never a skip.** An open derivative settled in another asset is `CurrencyMismatch`. One without a mark is `MissingMark`; a mark that is not positive is `InvalidInput`, and one with more than 18 decimals `PrecisionExceeded`. An open future whose expiry is at or before `as_of_ms` is `ExpiredUnsettled`: it can no longer trade (a forced fill would be `ExecutedAfterExpiry`) and must be settled with `Ledger::settle_expiry` first. The ledger scale of `currency` must equal the rule's `cash_scale`, so that the plan and the ledger round to the same quantum (`InvalidInput` otherwise).
+2. `plan_liquidation` plans as usual.
+3. Each `ForcedReduction::execution(execution_id, currency, executed_at_ms)` is the fill as an `Execution` (side, price, contracts, the fee in `currency`, the execution time), booked with `Ledger::book_execution_allowing_overdraft` (mandatory) or `RiskGate::book_derivative_execution`.
+
+The ledger books a derivative fill with the cash conventions above, so the booked plan leaves exactly the cash, contracts and basis of `plan.after`. The fixtures in `tests/ledger_liquidation.rs` check this round trip, with reconcile, on:
+
+- the fixture below (sell 3 at 94: cash 71.859, 7 contracts, basis 700);
+- a closeout into debt (cash -150.35, `overdrafts` equal to `plan.debt`);
+- half-quantum rounding at 2 decimals, long and short, with a partial close (released `rhe(100 / 3) = 33.33`) followed by a full close (the rest of the basis);
+- a basis of zero.
+
+## Ledger postings for positions outside the ledger
 
 Each `ForcedReduction::settlement(execution_id, currency)` returns the `DerivativeSettlement` for that fill. `Ledger::book_settlement` books it:
 
@@ -166,5 +186,4 @@ The account holds 10 BTC-PERP long, `M = 1`, entry 100 (basis 1000), mark 95, wi
 ## Out of scope
 
 - Insurance fund, loss allocation and auto-deleveraging. The debt and the deficit are left for them, explicitly.
-- Perpetual and futures positions inside the margin-rs `Ledger` (option B). That is follow-up work for M3-INT.
 - Options. `TieredLinearIm` covers only linear futures and perpetuals.
