@@ -43,10 +43,12 @@
 //! # Lifecycle
 //!
 //! - [`MarginReservationService::reserve`] accepts an order if the
-//!   requirement with it stays within collateral, or if it does not raise
-//!   the requirement at all (a risk reducing order, accepted even when the
-//!   account is under margined); otherwise it is rejected with the
-//!   requirement, the collateral and the shortfall. Orders are
+//!   requirement with it stays within collateral, or if it is risk
+//!   reducing in the sense of Xynthex economics 11.2 E3 (opposite side to
+//!   the position, size at most `|position|` minus the reducing orders
+//!   already resting, so it can neither flip nor extend the position),
+//!   which is accepted even when the account is under margined; otherwise
+//!   it is rejected with the requirement, the collateral and the shortfall. Orders are
 //!   decided one at a time against the requirement of everything already
 //!   accepted, so two orders can never use the same capital.
 //! - [`MarginReservationService::apply_fill`] is idempotent by execution
@@ -324,6 +326,39 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
         Ok(decision)
     }
 
+    /// Xynthex economics 11.2 E3: the order is on the side opposite to the
+    /// position, and its size is at most `|position|` minus the live
+    /// reducing orders already resting on that instrument, so no
+    /// combination of fills can flip or extend the position.
+    fn is_risk_reducing(&self, order: &MarginOrder) -> Result<bool> {
+        let position = self
+            .positions
+            .get(&order.instrument)
+            .copied()
+            .unwrap_or_default();
+        let reducing_side = if position > Decimal::ZERO {
+            Side::Sell
+        } else if position < Decimal::ZERO {
+            Side::Buy
+        } else {
+            return Ok(false);
+        };
+        if order.side != reducing_side {
+            return Ok(false);
+        }
+        let resting: Vec<Decimal> = self
+            .orders
+            .values()
+            .filter(|p| p.order.instrument == order.instrument && p.order.side == reducing_side)
+            .map(|p| p.remaining)
+            .collect();
+        let room = sum(
+            &[position.abs(), -sum(&resting, "resting reducing")?],
+            "reducing room",
+        )?;
+        Ok(order.contracts <= room)
+    }
+
     /// The decision on `order` and, if accepted, the order book with it.
     /// Changes nothing.
     fn decide(
@@ -367,10 +402,9 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
             }
             Err(error) => return Err(error),
         };
-        // An order that does not raise the requirement (a risk reducing
-        // order) is accepted whatever the collateral, even when the account
-        // is already under margined.
-        if after.total > collateral && after.total > before.total {
+        // Risk reducing exception (Xynthex economics 11.2 E3): accepted
+        // whatever the collateral, even when under margined.
+        if after.total > collateral && !self.is_risk_reducing(order)? {
             return reject(MarginRejection::InsufficientMargin {
                 required: after.total,
                 collateral,

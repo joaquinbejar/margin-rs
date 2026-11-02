@@ -569,12 +569,16 @@ mod with_gate {
     }
 }
 
-/// M303C-1: an order that does not raise the requirement is accepted even
-/// when the account is under margined; one that raises it is not.
+/// M303C-1: risk reducing orders (Xynthex economics 11.2 E3) are accepted
+/// when under margined; flips and aggregate over-reduction are not.
 ///
-/// Long 10 XYZ (20000) with collateral 10000. Sell 5: worst case
-/// max(10, 5) = 10, requirement unchanged, accepted. Sell 25 on top would
-/// make the worst case |10 - 30| = 20 (40000): rejected.
+/// Long 10 XYZ (20000) with collateral 10000.
+/// - Sell 5: opposite side, 5 <= 10: accepted.
+/// - Sell 25 on top: 25 > 10 - 5, and the worst case |10 - 30| = 20
+///   (40000) exceeds collateral: rejected.
+/// - Sell 20 alone would flip to -10: rejected although the worst case
+///   (|10| or |-10|) needs no more margin.
+/// - Two sells of 6: the first fits, the second exceeds 10 - 6 = 4.
 #[test]
 fn reducing_orders_are_accepted_when_under_margined() {
     let mut service = service();
@@ -618,4 +622,90 @@ fn reducing_orders_are_accepted_when_under_margined() {
             },
         }
     );
+}
+
+fn long_ten_under_margined() -> MarginReservationService<TieredLinearIm> {
+    let mut service = service();
+    service
+        .reserve(
+            order("b", "XYZ-PERP", Side::Buy, dec!(10)),
+            Some(dec!(100000)),
+            &marks(),
+        )
+        .expect("decision");
+    service
+        .apply_fill(&oid("b"), eid("f"), dec!(10))
+        .expect("fill");
+    service
+}
+
+#[test]
+fn flips_are_not_risk_reducing() {
+    let mut service = long_ten_under_margined();
+    assert_eq!(
+        service
+            .reserve(
+                order("s", "XYZ-PERP", Side::Sell, dec!(20)),
+                Some(dec!(10000)),
+                &marks()
+            )
+            .expect("decision"),
+        MarginDecision::Rejected {
+            reason: MarginRejection::InsufficientMargin {
+                required: dec!(20000),
+                collateral: dec!(10000),
+                shortfall: dec!(10000),
+            },
+        }
+    );
+    // A buy on the same side as the long is never reducing.
+    assert!(matches!(
+        service
+            .reserve(
+                order("b2", "XYZ-PERP", Side::Buy, dec!(1)),
+                Some(dec!(10000)),
+                &marks()
+            )
+            .expect("decision"),
+        MarginDecision::Rejected { .. }
+    ));
+}
+
+#[test]
+fn reducing_orders_count_against_each_other() {
+    let mut service = long_ten_under_margined();
+    let collateral = Some(dec!(10000));
+    assert!(matches!(
+        service
+            .reserve(
+                order("s1", "XYZ-PERP", Side::Sell, dec!(6)),
+                collateral,
+                &marks()
+            )
+            .expect("decision"),
+        MarginDecision::Reserved { .. }
+    ));
+    assert!(matches!(
+        service
+            .reserve(
+                order("s2", "XYZ-PERP", Side::Sell, dec!(6)),
+                collateral,
+                &marks()
+            )
+            .expect("decision"),
+        MarginDecision::Rejected {
+            reason: MarginRejection::InsufficientMargin { .. }
+        }
+    ));
+    // Exactly the rest (4) still fits.
+    assert!(matches!(
+        service
+            .reserve(
+                order("s3", "XYZ-PERP", Side::Sell, dec!(4)),
+                collateral,
+                &marks()
+            )
+            .expect("decision"),
+        MarginDecision::Reserved { .. }
+    ));
 }
