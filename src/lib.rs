@@ -1,7 +1,8 @@
 //! # margin-rs
 //!
-//! Risk and margin engine for the Xynthex market making lab, usable
-//! standalone.
+//! Risk and margin engine for market making and trading systems, with
+//! exact decimal arithmetic throughout. Usable standalone or as the
+//! accounting and risk layer of a market making stack.
 //!
 //! ## Status
 //!
@@ -23,7 +24,7 @@
 //! - [`scenarios`]: spot inventory stress (hypothetical fills such as
 //!   hedges, price gaps and liquidation spread).
 //! - [`initial_margin`] and [`rules`]: versioned initial and maintenance
-//!   margin rules. The first is `xynthex-linear-im/1` for linear USDC
+//!   margin rules. The first is `linear-im/1` for linear USDC
 //!   futures and perpetuals; every requirement carries its rule id and a per
 //!   position breakdown.
 //! - [`factors`] and [`covariance`]: factor exposures with explicit units
@@ -45,7 +46,8 @@
 //!
 //! - Edition 2024, MSRV 1.85; CI checks both the latest stable and the MSRV.
 //! - Small default dependency set; the crate never depends on
-//!   market-maker-rs or tessera-rl (they depend on it).
+//!   market-maker-rs. Planned integration: market-maker-rs does not depend
+//!   on margin-rs yet.
 //! - No binary floating point arithmetic: the `clippy::float_arithmetic`
 //!   lint is denied crate wide. Money, prices and quantities are
 //!   [`Decimal`]s; every operation is checked and exact, and the few

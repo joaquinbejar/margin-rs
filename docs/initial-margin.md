@@ -17,23 +17,23 @@
   - `InvalidInput` for a non-positive multiplier or mark, or a duplicate instrument;
   - `Arithmetic` for an amount that cannot be represented.
 
-## `xynthex-linear-im/1`
+## `linear-im/1`
 
 | | |
 |---|---|
-| Rule | `rules::TieredLinearIm::xynthex_v1(usdc, scale)` |
+| Rule | `rules::TieredLinearIm::linear_v1(usdc, scale)` |
 | Products | Linear USDC futures and perpetuals (`ProductKind::LinearFuture`, `LinearPerpetual`) |
-| Primary specification | Xynthex `docs/design/economics.md` section 11.2, at commit `2b6a97330ef056673c97f3b1a48da4e62cdb67f3` (gitlab.taunais.com/capitaldelta/xynthex; the file last changed in `84727a8014172c3bea6c6de2a47d5b6715122ace`) |
+| Specification | This document: the crate's own rule for linear futures and perpetuals |
 | Formula | `im = 10 % * |Qc| * M * mark`, `mm = 5 % * |Qc| * M * mark` |
 | Units | `Qc` in contracts, `M` in underlying units per contract, `mark` in USDC per underlying unit; amounts in USDC at the given scale |
 | Rounding | Each position rounded up once to the USDC scale; totals are exact sums |
-| Not covered | Spot (cash margined) and options (their own formula in the same section): `UnsupportedInstrument` |
+| Not covered | Spot (cash margined) and options (a different formula): `UnsupportedInstrument` |
 
 The rule is the tier table `[0, inf)` with rates 0.10 and 0.05.
 
-The identifier names exactly these rates. Section 11.2 calls 10 % and 5 % defaults, so a Xynthex run configured with other rates is a different rule. It must be built with `TieredLinearIm::new` and given its own `RuleId` or version, never `xynthex-linear-im/1`.
+The identifier names exactly these rates. A venue configured with other rates is a different rule. It must be built with `TieredLinearIm::new` and given its own `RuleId` or version, never `linear-im/1`.
 
-Rounding up to the USDC scale is this crate's choice: section 11.2 does not state how Xynthex rounds. If Xynthex pins a different rounding, that is a new version of the rule.
+Rounding each position up once to the USDC scale, with totals as exact sums, is part of the rule. A different rounding is a new version of the rule.
 
 ## Tier tables
 

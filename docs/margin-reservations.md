@@ -1,6 +1,6 @@
 # Margin reservations for pending orders (M3-03C)
 
-`margin_reservations::MarginReservationService<M: InitialMarginModel>` serves one account at one venue under one margin rule, for example `xynthex-linear-im/1`.
+`margin_reservations::MarginReservationService<M: InitialMarginModel>` serves one account at one venue under one margin rule, for example `linear-im/1`.
 
 ## Requirement
 
@@ -14,7 +14,7 @@ The requirement is recomputed from state on every call, never accumulated, so it
 
 | Call | Effect |
 |---|---|
-| `reserve(order, collateral, marks)` | Accepted if the total requirement with the order is within `collateral`, or if it is risk-reducing as defined in Xynthex economics §11.2 E3. That means the opposite side to the position, with a size of at most `|position|` minus the reducing orders already resting, so it can neither flip nor extend the position. A risk-reducing order is accepted even when the account is under-margined. Otherwise the order is `Rejected` with a reason and nothing changes. The `reserved` amount is accounting against the collateral passed in, not a ledger reservation |
+| `reserve(order, collateral, marks)` | Accepted if the total requirement with the order is within `collateral`, or if it is risk-reducing. That means the opposite side to the position, with a size of at most `|position|` minus the reducing orders already resting, so it can neither flip nor extend the position. A risk-reducing order is accepted even when the account is under-margined. Otherwise the order is `Rejected` with a reason and nothing changes. The `reserved` amount is accounting against the collateral passed in, not a ledger reservation |
 | `apply_fill(order, execution_id, contracts)` | Idempotent by execution id. Moves the filled contracts from the order to the position |
 | `release_on_effective_cancel(order)` | Closes the order's remaining quantity and returns it. Repeating it returns 0 |
 
@@ -45,7 +45,7 @@ A real execution is never lost, so `apply_fill` handles these cases instead of r
 
 Spot reservations therefore reduce what margin can use, and the margin hold reduces what spot orders can use. **Either order of admission is safe**, and no unit of cash is reserved twice. The tests `margin_first_blocks_the_same_cash_for_spot` and `spot_first_blocks_the_same_cash_for_margin` cover both orders.
 
-`RiskGate::set_hold` is atomic: if the new amount does not fit, the previous hold stays. A hold id cannot be an order id. Collateral here is cash in the settlement asset, as in Xynthex v1, where XYZ and long options count as zero collateral.
+`RiskGate::set_hold` is atomic: if the new amount does not fit, the previous hold stays. A hold id cannot be an order id. Collateral here is cash in the settlement asset; other assets and long options count as zero collateral.
 
 Fills are idempotent by execution id. Reusing an id with another order or quantity returns `ConflictingEntry` and changes nothing.
 

@@ -1,5 +1,5 @@
 //! Margin reservation fixtures (M3-03C), hand calculated with
-//! `xynthex-linear-im/1` (im = 10 % of |contracts| * M * mark).
+//! `linear-im/1` (im = 10 % of |contracts| * M * mark).
 //!
 //! XYZ-PERP and ABC-PERP: M = 10, mark 2000, so one contract needs 2000.
 
@@ -34,9 +34,9 @@ fn eid(id: &str) -> ExecutionId {
 
 fn service() -> MarginReservationService<TieredLinearIm> {
     let mut service = MarginReservationService::new(
-        TieredLinearIm::xynthex_v1(usdc(), 6).expect("rule"),
+        TieredLinearIm::linear_v1(usdc(), 6).expect("rule"),
         AccountId::new("acct").expect("id"),
-        VenueId::new("xynthex").expect("id"),
+        VenueId::new("venue").expect("id"),
     );
     for id in ["XYZ-PERP", "ABC-PERP"] {
         service
@@ -659,7 +659,7 @@ mod with_gate {
     }
 }
 
-/// M303C-1: risk reducing orders (Xynthex economics 11.2 E3) are accepted
+/// M303C-1: risk reducing orders are accepted
 /// when under margined; flips and aggregate over-reduction are not.
 ///
 /// Long 10 XYZ (20000) with collateral 10000.

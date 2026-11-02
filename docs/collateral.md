@@ -34,13 +34,13 @@ Each line is rounded down once, toward negative infinity. The total is the exact
 
 `valuation::AccountValuation::collateral_equity` (M2-08) is a valuation-side view with one haircut policy for stale marks. `value_collateral` is the margin-side collateral. It adds per-asset eligibility and haircuts, a choice of balance basis, and an explicit reject option. Both treat debts the same way.
 
-## Mapping to Xynthex economics §11.1 (for the integration)
+## Collateral of a derivatives account
 
-Xynthex `docs/design/economics.md` §11.1 (at `2b6a973`) defines `collateral = cash_usdc + sum(upnl of futures and perps) - sum(option marks of short positions)`. In v1, XYZ and long options count as zero collateral.
+A derivatives account typically has `collateral = cash + sum(upnl of futures and perps) - sum(option marks of short positions)`, where long options and non-cash assets may count as zero collateral.
 
 This function covers the cash part of that formula:
 
-- USDC is the reporting asset, with a 0 % haircut.
-- XYZ is not eligible: leave it out of `haircuts`, or give it a 100 % haircut.
+- The cash asset (for example USDC) is the reporting asset, with a 0 % haircut.
+- An asset that must not count is left out of `haircuts`, or given a 100 % haircut.
 
-The futures and perps unrealized PnL and the short option marks come from the derivative positions, which are not in this spot ledger yet. The Xynthex integration adds them to `total`. That step is not part of this PR.
+The unrealized PnL of futures and perps and the short option marks come from the derivative positions, which are not in this spot ledger (see `docs/liquidation.md` and #23). An integration adds them to `total`.

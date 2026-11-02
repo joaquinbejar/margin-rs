@@ -1,6 +1,6 @@
 # Exact arithmetic rule
 
-Every amount in margin-rs is an exact `Decimal`. The rule, from the coordinator, applies to all code and to every new PR:
+Every amount in margin-rs is an exact `Decimal`. The rule applies to all code and to every new PR:
 
 > Any aggregation or product of more than two terms goes through the wide-integer helpers in `src/decimal/mod.rs`, with **one** final conversion, or **one** final rounding. Chaining `add`, `sub` or `mul` over `Decimal` values is not allowed when an intermediate could be unrepresentable while the result is not.
 

@@ -11,8 +11,8 @@ fn usdc() -> Asset {
     Asset::new("USDC").expect("asset")
 }
 
-fn xynthex() -> TieredLinearIm {
-    TieredLinearIm::xynthex_v1(usdc(), 6).expect("rule")
+fn linear() -> TieredLinearIm {
+    TieredLinearIm::linear_v1(usdc(), 6).expect("rule")
 }
 
 fn position(
@@ -35,7 +35,7 @@ fn position(
 fn view(positions: Vec<ExposurePosition>) -> ExposureView {
     ExposureView {
         account: AccountId::new("acct-1").expect("id"),
-        venue: VenueId::new("xynthex").expect("id"),
+        venue: VenueId::new("venue").expect("id"),
         positions,
     }
 }
@@ -63,16 +63,16 @@ fn synthetic_two_tier() -> TieredLinearIm {
     .expect("rule")
 }
 
-/// The Xynthex M2 rule (economics.md 11.2): im = 10 % and mm = 5 % of
+/// The rule `linear-im/1`: im = 10 % and mm = 5 % of
 /// |Qc| * M * mark.
 ///
 /// Long 3 perpetual contracts, M = 10, mark 2000.5: notional 60015,
 /// im 6001.5, mm 3000.75. The short of the same size needs the same.
 #[test]
-fn xynthex_v1_long_and_short() {
-    let rule = xynthex();
-    assert_eq!(rule.rule(), &RuleId::new("xynthex-linear-im", 1));
-    assert_eq!(rule.rule().to_string(), "xynthex-linear-im/1");
+fn linear_v1_long_and_short() {
+    let rule = linear();
+    assert_eq!(rule.rule(), &RuleId::new("linear-im", 1));
+    assert_eq!(rule.rule().to_string(), "linear-im/1");
     for contracts in [dec!(3), dec!(-3)] {
         let requirement = rule
             .requirement(&view(vec![position(
@@ -83,7 +83,7 @@ fn xynthex_v1_long_and_short() {
                 dec!(2000.5),
             )]))
             .expect("requirement");
-        assert_eq!(requirement.rule.to_string(), "xynthex-linear-im/1");
+        assert_eq!(requirement.rule.to_string(), "linear-im/1");
         assert_eq!(requirement.currency, usdc());
         assert_eq!(requirement.initial, dec!(6001.5));
         assert_eq!(requirement.maintenance, dec!(3000.75));
@@ -109,7 +109,7 @@ fn xynthex_v1_long_and_short() {
 /// directions offset.
 #[test]
 fn positions_are_not_netted() {
-    let requirement = xynthex()
+    let requirement = linear()
         .requirement(&view(vec![
             position(
                 "XYZ-FUT-DEC",
@@ -140,7 +140,7 @@ fn positions_are_not_netted() {
 /// 0.000001. Two such positions total 0.000002.
 #[test]
 fn requirements_round_up_per_position() {
-    let requirement = xynthex()
+    let requirement = linear()
         .requirement(&view(vec![
             position(
                 "A-PERP",
@@ -231,7 +231,7 @@ fn tier_boundaries() {
 /// A flat position needs nothing; an empty view needs nothing.
 #[test]
 fn flat_and_empty() {
-    let requirement = xynthex()
+    let requirement = linear()
         .requirement(&view(vec![position(
             "XYZ-PERP",
             ProductKind::LinearPerpetual,
@@ -245,7 +245,7 @@ fn flat_and_empty() {
         (dec!(0), dec!(0))
     );
     assert!(requirement.positions[0].slices.is_empty());
-    let empty = xynthex().requirement(&view(vec![])).expect("requirement");
+    let empty = linear().requirement(&view(vec![])).expect("requirement");
     assert_eq!((empty.initial, empty.maintenance), (dec!(0), dec!(0)));
 }
 
@@ -253,7 +253,7 @@ fn flat_and_empty() {
 /// computed separately and never combined.
 #[test]
 fn no_netting_across_accounts_or_venues() {
-    let rule = xynthex();
+    let rule = linear();
     let long = position(
         "XYZ-PERP",
         ProductKind::LinearPerpetual,
@@ -301,7 +301,7 @@ fn no_netting_across_accounts_or_venues() {
 /// Products and currencies outside the rule fail with typed errors.
 #[test]
 fn unsupported_inputs() {
-    let rule = xynthex();
+    let rule = linear();
     for product in [ProductKind::Spot, ProductKind::Option] {
         assert_eq!(
             rule.requirement(&view(vec![position(
@@ -312,7 +312,7 @@ fn unsupported_inputs() {
                 dec!(100)
             )])),
             Err(MarginError::UnsupportedInstrument {
-                rule: "xynthex-linear-im/1".into(),
+                rule: "linear-im/1".into(),
                 instrument: InstrumentId::new("XYZ").expect("id"),
                 reason: "only linear futures and perpetuals are covered",
             })
@@ -412,13 +412,12 @@ fn tier_table_validation() {
     );
 }
 
-/// The worked numbers of the primary specification (economics.md 11.2,
-/// risk-reducing exception test): an open position with IM 100, halved to
-/// IM 50. Under `xynthex-linear-im/1` that is 10 contracts at M = 1 and
+/// The worked numbers of the risk-reducing exception: an open position with IM 100, halved to
+/// IM 50. Under `linear-im/1` that is 10 contracts at M = 1 and
 /// mark 100 (notional 1000), then 5 contracts.
 #[test]
 fn primary_specification_example() {
-    let rule = xynthex();
+    let rule = linear();
     let im = |contracts| {
         rule.requirement(&view(vec![position(
             "XYZ-PERP",
@@ -442,7 +441,7 @@ fn primary_specification_example() {
 /// notional is 1e-28, and im and mm round up to 0.000001.
 #[test]
 fn intermediate_products_need_not_be_representable() {
-    let rule = xynthex();
+    let rule = linear();
     let big = rule
         .requirement(&view(vec![position(
             "BIG-PERP",
