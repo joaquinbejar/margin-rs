@@ -376,22 +376,6 @@ fn valuation_does_not_change_the_snapshot() {
 }
 
 #[test]
-fn stress_refuses_an_open_derivative() {
-    // Scenarios shock asset marks, not instrument marks: an open derivative
-    // would stay unstressed, so it is refused.
-    let (ledger, marks) = long_gain();
-    assert!(matches!(
-        margin_rs::scenarios::stress(
-            &ledger.snapshot(),
-            &marks,
-            &policy(),
-            &margin_rs::scenarios::Scenario::new("gap"),
-        ),
-        Err(MarginError::UnsupportedInstrument { .. })
-    ));
-}
-
-#[test]
 fn a_settlement_asset_without_a_balance_row_still_counts() {
     // 100 USD, long 2 PERP-T (settled in USDT) at 100 marked at 90: upnl
     // -20 USDT at 1 USD. Equity and collateral are 80, also when a

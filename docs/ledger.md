@@ -164,7 +164,7 @@ Booking, funding, expiry, late fills, ids and mandatory cash follow the linear r
 
 Margin reservations margin and value inverse positions with an inverse rule (`TieredInverseIm`, see `docs/initial-margin.md`). Until the closeout plans cover them, `LiquidationAccount::from_ledger`, `plan_liquidation`, the stress scenarios and the risk gate refuse an open inverse position with `UnsupportedInstrument`, never skipping it.
 
-`valuation::value` and `collateral::value_collateral` value open derivative positions at instrument marks (see `docs/valuation.md`); the stress scenarios do not shock instrument marks and refuse an open derivative with `UnsupportedInstrument`. The risk gate handles spot orders only and refuses a derivative with `UnsupportedInstrument` at every entry point.
+`valuation::value` and `collateral::value_collateral` value open derivative positions at instrument marks (see `docs/valuation.md`); the stress scenarios shock instrument marks and book hypothetical derivative fills with the rules above. The risk gate handles spot orders only and refuses a derivative with `UnsupportedInstrument` at every entry point.
 
 ## Derivative settlements outside the ledger (M3-04, legacy)
 
@@ -180,6 +180,6 @@ This path is kept for derivatives that are not registered in the ledger; registe
 
 ## Limits and non-goals
 
-- Options are not ledger positions. Stress scenarios do not read derivative positions from the ledger yet, and margin reservations and liquidation do not support inverse ones yet.
+- Options are not ledger positions. Stress, margin reservations and liquidation do not support inverse positions yet.
 - The journal and the set of seen execution ids grow without bound for the life of a ledger. Pruning or checkpoints are future work.
 - Reservations are plain holds that a caller creates and releases. M1-05 builds order-level reservations on top: release on fill, reject and effective cancel, and exactly-once adjustment on a partial fill.

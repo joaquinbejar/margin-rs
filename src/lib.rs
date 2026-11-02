@@ -21,8 +21,9 @@
 //!   immutable ledger snapshot, with price source and freshness flags,
 //!   collateral equity that invalid marks cannot raise, and PnL with fees
 //!   counted once.
-//! - [`scenarios`]: spot inventory stress (hypothetical fills such as
-//!   hedges, price gaps and liquidation spread).
+//! - [`scenarios`]: stress of spot inventory and open linear futures and
+//!   perpetuals (hypothetical fills such as hedges, asset and instrument
+//!   shocks, liquidation spread).
 //! - [`initial_margin`] and [`rules`]: versioned initial and maintenance
 //!   margin rules. The first is `linear-im/1` for linear USDC
 //!   futures and perpetuals; every requirement carries its rule id and a per

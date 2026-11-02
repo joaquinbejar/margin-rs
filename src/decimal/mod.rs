@@ -213,6 +213,21 @@ pub(crate) fn sum(values: &[Decimal], operation: &'static str) -> Result<Decimal
     total.to_decimal(common).ok_or_else(error)
 }
 
+/// The sign of the exact sum of `values`, without converting the sum to a
+/// `Decimal`: it need not be representable.
+pub(crate) fn sum_sign(values: &[Decimal], operation: &'static str) -> Result<core::cmp::Ordering> {
+    let error = || MarginError::arithmetic(operation);
+    let common = values.iter().map(Decimal::scale).max().unwrap_or(0);
+    let mut total = Wide::ZERO;
+    for value in values {
+        let (wide, scale) = Wide::from_decimal(*value);
+        total = total
+            .checked_add(wide.align(scale, common).ok_or_else(error)?)
+            .ok_or_else(error)?;
+    }
+    Ok(total.cmp_signed(&Wide::ZERO))
+}
+
 /// Exact `sum(product(term))`, without rounding: intermediate products and
 /// partial sums stay in wide integers and only the result must be
 /// representable.

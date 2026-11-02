@@ -23,6 +23,9 @@ Each row is a site that chained operations before this PR.
 | Site | Before | After | Test |
 |---|---|---|---|
 | `scenarios::stress`, stressed price | `price * (1 + shock)`, then `* (1 ± spread)` | one `product` | `stressed_price_is_one_exact_product` (7e28 × 1.5 × 0.5) |
+| `scenarios::stress`, stressed instrument mark (#31) | new | `mark * (1 + shock) * (1 ± spread)` as one `product` | `test_stress_instrument_mark_is_one_exact_product` (7e28 × 1.5 × 0.5) |
+| `scenarios::stress`, `1 + shock` (#31) | converted to a `Decimal` before the product | `price * side + price * shock * side`, one `sum_products`, for instrument and asset marks | `test_stress_instrument_shock_beyond_the_decimal_range_is_one_exact_value`, `..._asset_...`, `..._debt_...` (`1 + MAX` with a 0.5 spread) |
+| `scenarios::stress`, side of the spread (#31) | new | sign of `balance + sum(upnl)` in wide integers (`sum_sign`), never converted | `test_stress_spread_side_follows_collateral_when_a_gain_is_at_a_stale_mark` |
 | `scenarios`, hypothetical fill deltas | balance updated once per delta, so a base fee was applied after the base quantity | all changes per asset in one `sum` | `hypothetical_fill_changes_apply_in_one_step` (MAX − 1 + 2 − 2) |
 | `ledger::book`, deltas per asset | accumulated with `add` | one `sum` per asset | covered by the ledger fixtures. The terms are at most one quantity, one notional and one fee |
 | `Ledger::valuation`, per-asset realized, unrealized, net | running `add` across positions, then `add` and `sub` | one `sum` per figure | ledger fixtures. Signs can be mixed, so order independence matters |
