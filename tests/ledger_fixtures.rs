@@ -3,6 +3,13 @@
 //! Every expected value below is written out by hand from the rules in
 //! `docs/ledger.md`; none is computed by the code under test.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+
 use std::collections::BTreeMap;
 
 use margin_rs::ledger::{Booking, Execution, Ledger, LedgerConfig, Side};
@@ -679,7 +686,7 @@ fn registration_rules() {
     );
 }
 
-/// M104-1: a deposit whose sum rust_decimal would round is rejected and
+/// M104-1: a deposit whose sum `rust_decimal` would round is rejected and
 /// leaves the balance unchanged, in both orders.
 #[test]
 fn deposits_that_would_lose_digits_are_rejected() {
@@ -936,7 +943,7 @@ fn real_execution_can_overdraw() {
     assert!(ledger.reconcile().expect("reconciles").is_clean());
 }
 
-/// set_reservation is atomic: it resizes in one step, shrinking always
+/// `set_reservation` is atomic: it resizes in one step, shrinking always
 /// works even on an overdrawn balance, and an uncovered increase changes
 /// nothing.
 #[test]

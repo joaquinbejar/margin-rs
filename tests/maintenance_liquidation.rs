@@ -8,6 +8,13 @@
 //! 0.047n. After it, collateral = cash - 50 - 1.047n and
 //! mm = 47.5 - 4.75n.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+
 use std::collections::BTreeMap;
 
 use margin_rs::initial_margin::{
@@ -260,7 +267,10 @@ mod maintenance {
         .expect("assess");
         assert_eq!(leaves.state, AccountState::Healthy);
         assert!(leaves.is_transition());
-        assert!(leaves.reasons.is_empty());
+        assert_eq!(
+            leaves.reasons,
+            [] as [margin_rs::maintenance::StateReason; 0]
+        );
     }
 
     #[test]
@@ -410,7 +420,10 @@ mod plan {
             &policy(CloseoutTarget::Maintenance),
         );
         assert_eq!(none.outcome, CloseoutOutcome::LiquidityExhausted);
-        assert!(none.reductions.is_empty());
+        assert_eq!(
+            none.reductions,
+            [] as [margin_rs::liquidation::ForcedReduction; 0]
+        );
         assert_eq!(none.unfilled, BTreeMap::from([(iid("BTC-PERP"), dec!(10))]));
         assert_eq!(none.deficit, dec!(7.5));
         assert_eq!(none.after, none.before);
@@ -431,7 +444,10 @@ mod plan {
         assert_eq!(plan.outcome, CloseoutOutcome::FlatWithDeficit);
         assert_eq!(plan.reductions[0].contracts, dec!(10));
         assert_eq!(plan.reductions[0].released_basis, dec!(1000));
-        assert!(plan.after.positions.is_empty());
+        assert_eq!(
+            plan.after.positions,
+            [] as [margin_rs::liquidation::PlanPosition; 0]
+        );
         assert_eq!(plan.after.cash, dec!(-150.35));
         assert_eq!(plan.debt, dec!(150.35));
         assert_eq!(plan.deficit, dec!(150.35));
@@ -473,8 +489,11 @@ mod plan {
             &policy(CloseoutTarget::Maintenance),
         );
         assert_eq!(plan.outcome, CloseoutOutcome::AlreadyMet);
-        assert!(plan.cancels.is_empty());
-        assert!(plan.reductions.is_empty());
+        assert_eq!(plan.cancels, [] as [margin_rs::OrderId; 0]);
+        assert_eq!(
+            plan.reductions,
+            [] as [margin_rs::liquidation::ForcedReduction; 0]
+        );
         assert_eq!(plan.intents().expect("intents"), vec![]);
         assert_eq!(plan.after, plan.before);
     }
@@ -495,7 +514,10 @@ mod plan {
         assert_eq!(sizes, vec![(0, dec!(4)), (1, dec!(6))]);
         // 4 at 94 releases 400; the last 6 release the remaining 600.
         assert_eq!(plan.reductions[1].released_basis, dec!(600));
-        assert!(plan.after.positions.is_empty());
+        assert_eq!(
+            plan.after.positions,
+            [] as [margin_rs::liquidation::PlanPosition; 0]
+        );
         assert_eq!(
             plan.intents().expect("intents")[2],
             CloseoutIntent::Reduce {
@@ -698,7 +720,7 @@ mod review {
         bids(&[(dec!(0.000000000000000001), contracts)])
     }
 
-    /// C1: closing Decimal::MAX contracts with a step of 2 used to compute
+    /// C1: closing `Decimal::MAX` contracts with a step of 2 used to compute
     /// ceil(MAX / 2) * 2 and overflow; the last count is the cap.
     #[test]
     fn step_two_closes_decimal_max() {
@@ -712,10 +734,13 @@ mod review {
         );
         assert_eq!(plan.outcome, CloseoutOutcome::TargetMet);
         assert_eq!(plan.reductions[0].contracts, Decimal::MAX);
-        assert!(plan.after.positions.is_empty());
+        assert_eq!(
+            plan.after.positions,
+            [] as [margin_rs::liquidation::PlanPosition; 0]
+        );
     }
 
-    /// C1: a step of 0.5 on Decimal::MAX contracts has more grid points
+    /// C1: a step of 0.5 on `Decimal::MAX` contracts has more grid points
     /// than a Decimal can count, and bisection midpoints above MAX / 2.
     /// Notional 79228162514.264338 (basis equal, so upnl 0), mm 5 %; with
     /// cash 2e9 the plan must close about MAX - 4e28 contracts, the
@@ -1018,6 +1043,6 @@ mod ledger_fixtures {
             ledger.book_settlement(&unknown),
             Err(MarginError::UnknownAsset { .. })
         ));
-        assert!(ledger.settlement_journal().is_empty());
+        assert_eq!(ledger.settlement_journal(), []);
     }
 }

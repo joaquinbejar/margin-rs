@@ -1,5 +1,12 @@
 //! Portfolio covariance fixtures (M3-02), hand calculated.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+
 use margin_rs::covariance::{ValidatedCovariance, portfolio_variance};
 use margin_rs::factors::{Factor, FactorExposure, FactorKind};
 use margin_rs::{Asset, Decimal, FactorId, MarginError};
@@ -298,7 +305,7 @@ fn psd_check_is_exact_at_any_scale() {
     ));
 }
 
-/// M302-C1: from_correlation builds rho * sigma_i * sigma_j as one exact
+/// M302-C1: `from_correlation` builds rho * `sigma_i` * `sigma_j` as one exact
 /// product. rho = 0.123456789012345 times sigma 1e-14 needs 29 digits, but
 /// times sigma 1e14 as well it is rho itself.
 #[test]
@@ -333,7 +340,7 @@ fn netting_is_exact_in_any_order() {
 }
 
 /// n2: arithmetic failures while building or validating a matrix are
-/// reported as InvalidCovariance. sigma 1e15 squared is 1e30 > MAX.
+/// reported as `InvalidCovariance`. sigma 1e15 squared is 1e30 > MAX.
 #[test]
 fn unrepresentable_covariance_is_invalid() {
     assert_eq!(

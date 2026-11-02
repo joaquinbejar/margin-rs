@@ -34,7 +34,7 @@ use std::collections::BTreeMap;
 
 use rust_decimal::Decimal;
 
-use crate::decimal::{Rounding, add, sub, sum, sum_terms_round};
+use crate::decimal::{Rounding, add, neg, sub, sum, sum_terms_round};
 use crate::error::{MarginError, Result};
 use crate::ids::Asset;
 use crate::ledger::LedgerSnapshot;
@@ -148,6 +148,10 @@ pub struct CollateralValue {
 ///   asset, a haircut is outside `[0, 1]`, or `haircut + extra` exceeds 1.
 /// - [`MarginError::InvalidCollateralMark`] under [`StalePolicy::Reject`].
 /// - [`MarginError::Arithmetic`] if a value cannot be represented.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one pass that validates every mark, haircut and conversion before it values anything; splitting it would separate the checks from the values they guard"
+)]
 pub fn value_collateral(
     snapshot: &LedgerSnapshot,
     marks: &MarkSet,
@@ -237,7 +241,7 @@ pub fn value_collateral(
                     Some(h) => Some(vec![
                         amount,
                         p,
-                        sum(&[Decimal::ONE, -h, -extra], "1 - h - extra")?,
+                        sum(&[Decimal::ONE, neg(h), neg(extra)], "1 - h - extra")?,
                     ]),
                     None => Some(Vec::new()),
                 },
@@ -300,6 +304,12 @@ fn floor(terms: &[&[Decimal]], scale: u32) -> Result<Decimal> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;

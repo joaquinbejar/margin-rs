@@ -48,10 +48,13 @@
 //! - Small default dependency set; the crate never depends on
 //!   market-maker-rs. Planned integration: market-maker-rs does not depend
 //!   on margin-rs yet.
-//! - No binary floating point arithmetic: the `clippy::float_arithmetic`
-//!   lint is denied crate wide. Money, prices and quantities are
-//!   [`Decimal`]s; every operation is checked and exact, and the few
-//!   rounding steps are explicit (see [`decimal`]).
+//! - No binary floating point arithmetic (`clippy::float_arithmetic`).
+//!   Money, prices and quantities are [`Decimal`]s; every operation is
+//!   checked and exact, and the few rounding steps are explicit (see
+//!   [`decimal`]).
+//! - No panics and no unchecked arithmetic in library code: `unwrap`,
+//!   `expect`, `panic!`, unchecked indexing and arithmetic with side effects
+//!   are lint errors, with documented `#[expect]` exceptions only.
 //! - No `unsafe` code.
 //!
 //! ## Example

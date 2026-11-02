@@ -1,5 +1,12 @@
 //! Initial margin fixtures (M3-03B), hand calculated.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+
 use margin_rs::initial_margin::{
     ExposurePosition, ExposureView, InitialMarginModel, ProductKind, RuleId, TierSlice,
 };
@@ -244,7 +251,10 @@ fn flat_and_empty() {
         (requirement.initial, requirement.maintenance),
         (dec!(0), dec!(0))
     );
-    assert!(requirement.positions[0].slices.is_empty());
+    assert_eq!(
+        requirement.positions[0].slices,
+        [] as [margin_rs::initial_margin::TierSlice; 0]
+    );
     let empty = linear().requirement(&view(vec![])).expect("requirement");
     assert_eq!((empty.initial, empty.maintenance), (dec!(0), dec!(0)));
 }

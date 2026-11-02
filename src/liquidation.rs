@@ -101,7 +101,7 @@ use rust_decimal::Decimal;
 
 use crate::decimal::grid::{ContractGrid, GridIndex};
 use crate::decimal::{
-    MAX_SCALE, Rounding, add, check_scale, mul_div_round, sub, sum, sum_products,
+    MAX_SCALE, Rounding, add, check_scale, mul_div_round, neg, sub, sum, sum_products,
 };
 use crate::error::{MarginError, Result};
 use crate::ids::{AccountId, Asset, ExecutionId, InstrumentId, OrderId, VenueId};
@@ -323,7 +323,9 @@ impl LiquidationPlan {
             entry.2 = reduction.price;
         }
         for instrument in order {
-            let (side, contracts, limit_price) = &fills[instrument];
+            let (side, contracts, limit_price) = fills
+                .get(instrument)
+                .ok_or_else(|| MarginError::invalid_input("plan", "reduction not grouped"))?;
             intents.push(CloseoutIntent::Reduce {
                 instrument: instrument.clone(),
                 side: *side,
@@ -345,6 +347,21 @@ struct Open {
 struct State {
     cash: Decimal,
     positions: Vec<Open>,
+}
+
+impl State {
+    /// The position at `index`, which the planner found in this state.
+    fn open(&self, index: usize) -> Result<&Open> {
+        self.positions
+            .get(index)
+            .ok_or_else(|| MarginError::invalid_input("view", "position not found"))
+    }
+
+    fn open_mut(&mut self, index: usize) -> Result<&mut Open> {
+        self.positions
+            .get_mut(index)
+            .ok_or_else(|| MarginError::invalid_input("view", "position not found"))
+    }
 }
 
 struct Planner<'a, M> {
@@ -388,7 +405,7 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
                 "Qc * M * mark",
             )?;
             terms.push(value);
-            terms.push(-open.basis);
+            terms.push(neg(open.basis));
             positions.push(PlanPosition {
                 instrument: open.exposure.instrument.clone(),
                 contracts: open.exposure.contracts,
@@ -427,8 +444,8 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
         sum(
             &[
                 summary.collateral,
-                -self.target_margin(summary),
-                -summary.cash,
+                neg(self.target_margin(summary)),
+                neg(summary.cash),
             ],
             "excess - cash",
         )
@@ -444,7 +461,7 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
         level: usize,
         offer: &LiquidityLevel,
     ) -> Result<(State, ForcedReduction, AccountSummary)> {
-        let exposure = &state.positions[index].exposure;
+        let exposure = &state.open(index)?.exposure;
         let size = exposure.contracts.abs();
         let grid = ContractGrid::new(self.policy.contract_step, offer.contracts.min(size))?;
         let at = |k: GridIndex| -> Result<(State, ForcedReduction, AccountSummary)> {
@@ -471,7 +488,7 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
         let mut ends = vec![GridIndex::ZERO, last];
         for floor in self.model.notional_breakpoints(exposure) {
             let numerator = sum_products(
-                &[&[size, exposure.multiplier, exposure.mark], &[-floor]],
+                &[&[size, exposure.multiplier, exposure.mark], &[neg(floor)]],
                 "|Qc| * M * mark - floor",
             )?;
             let k = grid.floor_index_of(numerator, &[exposure.multiplier, exposure.mark])?;
@@ -487,7 +504,9 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
         // excess) can peak: bisect to the two grid points around it.
         let mut candidates = ends.clone();
         for pair in ends.windows(2) {
-            let (mut low, mut high) = (pair[0], pair[1]);
+            let &[mut low, mut high] = pair else {
+                continue;
+            };
             let low_sign = self.gap(&summary_at(low)?)? >= Decimal::ZERO;
             let high_sign = self.gap(&summary_at(high)?)? >= Decimal::ZERO;
             if low_sign == high_sign {
@@ -544,9 +563,9 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
         contracts: Decimal,
     ) -> Result<(State, ForcedReduction)> {
         let scale = self.scale;
-        let open = &state.positions[index];
-        let position = open.exposure.contracts;
-        let size = position.abs();
+        let open = state.open(index)?;
+        let held = open.exposure.contracts;
+        let held_abs = held.abs();
         let notional = mul_div_round(
             &[price, contracts, open.exposure.multiplier],
             &[],
@@ -554,17 +573,17 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
             Rounding::HalfEven,
             "p * n * M",
         )?;
-        let (side, fill_cash, contracts_after) = if position > Decimal::ZERO {
-            (Side::Sell, notional, sub(position, contracts, "Qc - n")?)
+        let (side, fill_cash, contracts_after) = if held > Decimal::ZERO {
+            (Side::Sell, notional, sub(held, contracts, "Qc - n")?)
         } else {
-            (Side::Buy, -notional, add(position, contracts, "Qc + n")?)
+            (Side::Buy, neg(notional), add(held, contracts, "Qc + n")?)
         };
-        let released_basis = if contracts == size {
+        let released_basis = if contracts == held_abs {
             open.basis
         } else {
             mul_div_round(
                 &[open.basis, contracts],
-                &[size],
+                &[held_abs],
                 scale,
                 Rounding::HalfEven,
                 "basis * n / |Qc|",
@@ -584,8 +603,11 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
             "fee",
         )?;
         let mut next = state.clone();
-        next.cash = sum(&[state.cash, realized_pnl, -fee], "cash + realized - fee")?;
-        let updated = &mut next.positions[index];
+        next.cash = sum(
+            &[state.cash, realized_pnl, neg(fee)],
+            "cash + realized - fee",
+        )?;
+        let updated = next.open_mut(index)?;
         updated.exposure.contracts = contracts_after;
         updated.basis = sub(open.basis, released_basis, "basis - released")?;
         let reduction = ForcedReduction {
@@ -667,12 +689,10 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
             }
             // Best level first: highest bid to sell a long, lowest ask to
             // buy back a short.
-            let ordered = levels.windows(2).all(|w| {
-                if *contracts > Decimal::ZERO {
-                    w[0].price >= w[1].price
-                } else {
-                    w[0].price <= w[1].price
-                }
+            let ordered = levels.windows(2).all(|w| match w {
+                [first, second] if *contracts > Decimal::ZERO => first.price >= second.price,
+                [first, second] => first.price <= second.price,
+                _ => true,
             });
             if !ordered {
                 return Err(MarginError::invalid_input(
@@ -704,6 +724,10 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
 ///   [`requirement`](crate::initial_margin::InitialMarginModel::requirement)
 ///   on the view.
 /// - [`MarginError::Arithmetic`] if an amount cannot be represented.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the staged closeout reads as one sequence: validate, cancel, reduce level by level, report the residual"
+)]
 pub fn plan_liquidation<M: PiecewiseLinearMargin>(
     model: &M,
     account: &LiquidationAccount,
@@ -753,7 +777,7 @@ pub fn plan_liquidation<M: PiecewiseLinearMargin>(
             cancels,
             reductions,
             before: before.clone(),
-            debt: (-after.cash).max(Decimal::ZERO),
+            debt: neg(after.cash).max(Decimal::ZERO),
             after,
             unfilled,
             outcome,
@@ -788,12 +812,12 @@ pub fn plan_liquidation<M: PiecewiseLinearMargin>(
             .iter()
             .position(|p| &p.exposure.instrument == instrument)
             .ok_or_else(|| MarginError::invalid_input("view", "position not found"))?;
-        let levels = liquidity.get(instrument).map(Vec::as_slice).unwrap_or(&[]);
+        let levels = liquidity.get(instrument).map_or(&[][..], Vec::as_slice);
         for (level, available) in levels.iter().enumerate() {
             if planner.met(&current) {
                 break 'instruments;
             }
-            let size = state.positions[index].exposure.contracts.abs();
+            let size = state.open(index)?.exposure.contracts.abs();
             if size.is_zero() {
                 break;
             }
@@ -806,7 +830,7 @@ pub fn plan_liquidation<M: PiecewiseLinearMargin>(
         if planner.met(&current) {
             break;
         }
-        let left = state.positions[index].exposure.contracts.abs();
+        let left = state.open(index)?.exposure.contracts.abs();
         if !left.is_zero() {
             unfilled.insert(instrument.clone(), left);
         }

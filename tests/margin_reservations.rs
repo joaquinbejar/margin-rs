@@ -3,6 +3,13 @@
 //!
 //! XYZ-PERP and ABC-PERP: M = 10, mark 2000, so one contract needs 2000.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+
 use std::collections::BTreeMap;
 
 use margin_rs::initial_margin::ProductKind;
@@ -510,7 +517,7 @@ mod with_gate {
         );
     }
 
-    /// C3: reserve_with_gate is atomic. If the hold cannot be set (here
+    /// C3: `reserve_with_gate` is atomic. If the hold cannot be set (here
     /// its id collides with an order id of the gate), neither the service
     /// nor the gate changes and the order id stays unused.
     #[test]

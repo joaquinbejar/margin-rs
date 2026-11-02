@@ -3,6 +3,13 @@
 //! Expected values are written out by hand from the rules in
 //! `docs/risk-gate.md`.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+
 use margin_rs::ledger::{Booking, Execution, Ledger, Side};
 use margin_rs::risk::{
     ExecutionAnomaly, FillReport, HaltReason, InstrumentLimits, OrderRequest, OrderState,
@@ -1007,8 +1014,8 @@ fn no_fragmentation_exceeds_the_reservation() {
         state % bound
     };
     for case in 0..400 {
-        let price = Decimal::new(1 + next(99_999) as i64, 2);
-        let lots = 1 + next(60) as i64;
+        let price = Decimal::new(1 + i64::try_from(next(99_999)).unwrap(), 2);
+        let lots = 1 + i64::try_from(next(60)).unwrap();
         let rate = if case % 2 == 0 { dec!(0) } else { dec!(0.001) };
         let limits = InstrumentLimits {
             max_fee_rate: rate,
@@ -1030,7 +1037,7 @@ fn no_fragmentation_exceeds_the_reservation() {
         let mut done = 0_i64;
         let mut n = 0;
         while done < lots {
-            let k = 1 + next((lots - done) as u64) as i64;
+            let k = 1 + i64::try_from(next(u64::try_from(lots - done).unwrap())).unwrap();
             done += k;
             n += 1;
             let quantity = Decimal::new(k, 8);
@@ -1093,10 +1100,14 @@ fn anomaly_and_overdraft_are_both_recorded() {
             HaltReason::AccountingBreach,
         ]
     );
-    assert_eq!(gate.order(&oid("o1")).map(|o| o.remaining()), Some(dec!(0)));
+    assert_eq!(
+        gate.order(&oid("o1"))
+            .map(margin_rs::risk::OrderRecord::remaining),
+        Some(dec!(0))
+    );
     gate.resume();
     assert_eq!(gate.halted(), None);
-    assert!(gate.halt_reasons().is_empty());
+    assert_eq!(gate.halt_reasons(), []);
 }
 
 /// Issue #16: an internal halt withdraws quotes like `trip()`.
@@ -1129,7 +1140,10 @@ fn internal_halt_withdraws_the_other_live_orders() {
             &report(fill("e1", Side::Buy, dec!(100), dec!(3)), dec!(3)),
         )
         .expect("booked");
-    assert!(!outcome.anomalies.is_empty());
+    assert_ne!(
+        outcome.anomalies,
+        [] as [margin_rs::risk::ExecutionAnomaly; 0]
+    );
     assert_eq!(outcome.withdraw, vec![oid("o2"), oid("o3")]);
     for id in ["o2", "o3"] {
         assert_eq!(
@@ -1161,7 +1175,7 @@ fn internal_halt_withdraws_the_other_live_orders() {
         )
         .expect("booked");
     assert!(raced.is_clean());
-    assert!(raced.withdraw.is_empty());
+    assert_eq!(raced.withdraw, [] as [margin_rs::OrderId; 0]);
     assert_eq!(balance(&gate, "USDC"), (dec!(9601), dec!(0), dec!(9601)));
 
     // A second internal halt while halted has nothing left to withdraw.
@@ -1178,7 +1192,7 @@ fn internal_halt_withdraws_the_other_live_orders() {
             price: dec!(109),
         }]
     );
-    assert!(worse.withdraw.is_empty());
+    assert_eq!(worse.withdraw, [] as [margin_rs::OrderId; 0]);
     assert_eq!(gate.trip(HaltReason::Manual), Vec::<OrderId>::new());
     assert_eq!(gate.on_cancel_confirmed(&oid("o2")), Ok(dec!(0)));
     assert_eq!(gate.on_cancel_confirmed(&oid("o3")), Ok(dec!(0)));
@@ -1236,5 +1250,5 @@ fn overdraft_halt_withdraws_and_duplicates_do_not() {
 
     let again = gate.on_fill(&oid("o1"), &report(e1, dec!(1))).expect("dup");
     assert!(!again.booking.is_new());
-    assert!(again.withdraw.is_empty());
+    assert_eq!(again.withdraw, [] as [margin_rs::OrderId; 0]);
 }

@@ -1,5 +1,12 @@
 //! Integration tests for the public error boundary.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+
 use margin_rs::{MarginError, Result};
 
 fn checked_add(a: u8, b: u8) -> Result<u8> {

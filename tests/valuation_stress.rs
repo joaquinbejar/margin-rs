@@ -1,5 +1,12 @@
 //! Account valuation and stress fixtures (M2-08), hand calculated.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+
 use margin_rs::OrderId;
 use margin_rs::ledger::{Execution, Fee, Ledger, Side};
 use margin_rs::risk::{FillReport, InstrumentLimits, OrderRequest, RiskGate};

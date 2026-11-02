@@ -98,7 +98,7 @@ pub use decision::{
     ExecutionAnomaly, FillReport, HaltReason, OrderPurpose, OrderRequest, RiskDecision, RiskReason,
 };
 
-use crate::decimal::{Rounding, add, check_scale, mul, mul_div_round, sub, sum, sum_products};
+use crate::decimal::{Rounding, add, check_scale, mul, mul_div_round, neg, sub, sum, sum_products};
 use crate::error::{MarginError, Result};
 use crate::ids::{Asset, InstrumentId, OrderId, ReservationId, TransferId};
 use crate::instrument::{Instrument, SpotInstrument};
@@ -300,8 +300,11 @@ impl OrderRecord {
     /// Quantity still open: zero once filled, and never negative, even
     /// after an overfill (where `filled > quantity`).
     #[must_use]
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "quantity and filled are non-negative and on the instrument's quantity scale (the gate checks the quantity at admission and the ledger checks every fill before it is counted), so their difference is exact and cannot overflow"
+    )]
     pub fn remaining(&self) -> Decimal {
-        // Both are small exact quantities, so the difference cannot overflow.
         (self.quantity - self.filled).max(Decimal::ZERO)
     }
 
@@ -634,7 +637,8 @@ impl RiskGate {
             return;
         }
         if let Some(max_age_ms) = limits.max_data_age_ms {
-            let age_ms = now_ms - at;
+            // `at <= now_ms` here: a later mark returned above.
+            let age_ms = now_ms.abs_diff(at);
             if age_ms > max_age_ms {
                 reasons.push(RiskReason::StaleMarketData { age_ms, max_age_ms });
             }
@@ -701,8 +705,11 @@ impl RiskGate {
         let headroom = |bound: Decimal| -> Result<Decimal> {
             // bound - worst case, in one exact step.
             let room = match request.side {
-                Side::Buy => sum(&[bound, -position, -open_buys], "limit - worst case")?,
-                Side::Sell => sum(&[bound, -open_sells, position], "limit - worst case")?,
+                Side::Buy => sum(
+                    &[bound, neg(position), neg(open_buys)],
+                    "limit - worst case",
+                )?,
+                Side::Sell => sum(&[bound, neg(open_sells), position], "limit - worst case")?,
             };
             floor(room)
         };
@@ -804,7 +811,12 @@ impl RiskGate {
                 // Bound 2, exact: (1 + rate) * (lot cost + h) + fee ulp,
                 // where h is the largest error of the ledger's notional
                 // rounding. A fill of k lots debits at most k times this.
-                let half_ulp = Decimal::new(5, scale + 1);
+                let half_ulp = Decimal::new(
+                    5,
+                    scale
+                        .checked_add(1)
+                        .ok_or(MarginError::arithmetic("half ulp scale"))?,
+                );
                 let h = match self.ledger.config().rounding {
                     Rounding::HalfEven | Rounding::HalfAwayFromZero => half_ulp,
                     Rounding::TowardZero => Decimal::ZERO,

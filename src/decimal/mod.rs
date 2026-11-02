@@ -51,13 +51,28 @@ pub enum Rounding {
     AwayFromZero,
 }
 
+/// `-x`, exactly: the sign flipped, as `Decimal`'s own negation does. It
+/// never overflows and does no arithmetic.
+#[must_use]
+pub(crate) fn neg(x: Decimal) -> Decimal {
+    let mut negated = x;
+    negated.set_sign_negative(x.is_sign_positive());
+    negated
+}
+
 /// Exact sum. Fails if the exact result cannot be represented.
 pub(crate) fn add(a: Decimal, b: Decimal, operation: &'static str) -> Result<Decimal> {
+    combine(a, b, false, operation)
+}
+
+/// Exact `a + b`, or `a - b` with `negate_b`.
+fn combine(a: Decimal, b: Decimal, negate_b: bool, operation: &'static str) -> Result<Decimal> {
     let (wa, sa) = Wide::from_decimal(a);
     let (wb, sb) = Wide::from_decimal(b);
+    let wb = if negate_b { wb.negated() } else { wb };
     let scale = sa.max(sb);
-    wa.scale_up(scale - sa)
-        .zip(wb.scale_up(scale - sb))
+    wa.align(sa, scale)
+        .zip(wb.align(sb, scale))
         .and_then(|(x, y)| x.checked_add(y))
         .and_then(|sum| sum.to_decimal(scale))
         .ok_or(MarginError::arithmetic(operation))
@@ -65,8 +80,8 @@ pub(crate) fn add(a: Decimal, b: Decimal, operation: &'static str) -> Result<Dec
 
 /// Exact difference. Fails if the exact result cannot be represented.
 pub(crate) fn sub(a: Decimal, b: Decimal, operation: &'static str) -> Result<Decimal> {
-    // Negation is exact for every Decimal.
-    add(a, -b, operation)
+    // Negation is exact in wide integers.
+    combine(a, b, true, operation)
 }
 
 /// Exact product. Fails if the exact result cannot be represented (more
@@ -118,7 +133,10 @@ pub(crate) fn sum_products_round(
     operation: &'static str,
 ) -> Result<Decimal> {
     let terms: Vec<[Decimal; 2]> = terms.iter().map(|(a, b)| [*a, *b]).collect();
-    let terms: Vec<&[Decimal]> = terms.iter().map(|t| t.as_slice()).collect();
+    let terms: Vec<&[Decimal]> = terms
+        .iter()
+        .map(<[rust_decimal::Decimal; 2]>::as_slice)
+        .collect();
     sum_terms_round(&terms, scale, rounding, operation)
 }
 
@@ -140,7 +158,7 @@ pub(crate) fn sum_terms_round(
     let common = products.iter().map(|(_, s)| *s).max().unwrap_or(0);
     let mut sum = Wide::ZERO;
     for (product, product_scale) in products {
-        let aligned = product.scale_up(common - product_scale).ok_or_else(error)?;
+        let aligned = product.align(product_scale, common).ok_or_else(error)?;
         sum = sum.checked_add(aligned).ok_or_else(error)?;
     }
     let denominator = Wide::new(false, U768::pow10(common).ok_or_else(error)?);
@@ -157,7 +175,7 @@ pub(crate) fn sum(values: &[Decimal], operation: &'static str) -> Result<Decimal
     for value in values {
         let (wide, scale) = Wide::from_decimal(*value);
         total = total
-            .checked_add(wide.scale_up(common - scale).ok_or_else(error)?)
+            .checked_add(wide.align(scale, common).ok_or_else(error)?)
             .ok_or_else(error)?;
     }
     total.to_decimal(common).ok_or_else(error)
@@ -176,7 +194,7 @@ pub(crate) fn sum_products(terms: &[&[Decimal]], operation: &'static str) -> Res
     let mut total = Wide::ZERO;
     for (value, scale) in products {
         total = total
-            .checked_add(value.scale_up(common - scale).ok_or_else(error)?)
+            .checked_add(value.align(scale, common).ok_or_else(error)?)
             .ok_or_else(error)?;
     }
     total.to_decimal(common).ok_or_else(error)
@@ -205,28 +223,33 @@ pub(crate) fn quadratic_form_round(
         for value in values {
             let (wide, s) = Wide::from_decimal(*value);
             total = total
-                .checked_add(wide.scale_up(common - s).ok_or_else(error)?)
+                .checked_add(wide.align(s, common).ok_or_else(error)?)
                 .ok_or_else(error)?;
         }
         nets.push((total, common));
     }
     // sum_ij net_i * net_j * c_ij, aligned to a common scale.
-    let mut terms = Vec::with_capacity(nets.len() * nets.len());
+    let mut terms = Vec::new();
     for (i, (ni, si)) in nets.iter().enumerate() {
         for (j, (nj, sj)) in nets.iter().enumerate() {
-            let (c, sc) = Wide::from_decimal(matrix[i][j]);
+            let entry = matrix.get(i).and_then(|row| row.get(j)).ok_or_else(error)?;
+            let (c, sc) = Wide::from_decimal(*entry);
             let value = ni
                 .checked_mul(*nj)
                 .and_then(|v| v.checked_mul(c))
                 .ok_or_else(error)?;
-            terms.push((value, si + sj + sc));
+            let term_scale = si
+                .checked_add(*sj)
+                .and_then(|s| s.checked_add(sc))
+                .ok_or_else(error)?;
+            terms.push((value, term_scale));
         }
     }
     let common = terms.iter().map(|(_, s)| *s).max().unwrap_or(0);
     let mut total = Wide::ZERO;
     for (value, s) in terms {
         total = total
-            .checked_add(value.scale_up(common - s).ok_or_else(error)?)
+            .checked_add(value.align(s, common).ok_or_else(error)?)
             .ok_or_else(error)?;
     }
     let denominator = Wide::new(false, U768::pow10(common).ok_or_else(error)?);
@@ -247,8 +270,8 @@ pub(crate) fn compare_products(
     let (l, ls) = wide_product(left).ok_or_else(error)?;
     let (r, rs) = wide_product(right).ok_or_else(error)?;
     let common = ls.max(rs);
-    let l = l.scale_up(common - ls).ok_or_else(error)?;
-    let r = r.scale_up(common - rs).ok_or_else(error)?;
+    let l = l.align(ls, common).ok_or_else(error)?;
+    let r = r.align(rs, common).ok_or_else(error)?;
     Ok(l.cmp_signed(&r))
 }
 
@@ -259,7 +282,7 @@ fn wide_product(values: &[Decimal]) -> Option<(Wide, u32)> {
     for value in values {
         let (mantissa, value_scale) = Wide::from_decimal(*value);
         product = product.checked_mul(mantissa)?;
-        scale += value_scale;
+        scale = scale.checked_add(value_scale)?;
     }
     Some((product, scale))
 }
@@ -329,6 +352,12 @@ pub(crate) fn check_configured_scale(scale: u32, field: &'static str) -> Result<
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
@@ -404,7 +433,7 @@ mod tests {
         assert_eq!(r(dec!(-2.1), Rounding::AwayFromZero), Ok(dec!(-3)));
     }
 
-    /// M104-1: a sum that rust_decimal rounds (and whose inverse
+    /// M104-1: a sum that `rust_decimal` rounds (and whose inverse
     /// subtraction rounds back) is rejected, in both orders and signs.
     #[test]
     fn sums_rounded_by_rust_decimal_are_rejected_in_both_orders_and_signs() {
@@ -677,6 +706,7 @@ mod tests {
 
     #[test]
     fn exact_sums_and_product_comparisons() {
+        use core::cmp::Ordering;
         // MAX + 0.1 - MAX: the partial sum is not representable, the net is.
         let (q, nets) = quadratic_form_round(
             &[vec![Decimal::MAX, dec!(0.1), Decimal::MIN]],
@@ -697,7 +727,6 @@ mod tests {
         )
         .expect("exact");
         assert_eq!((q, nets), (dec!(0), vec![None]));
-        use core::cmp::Ordering;
         // 1e-16 * 1e-16 = 1e-32 is not a Decimal, but compares exactly.
         let tiny = Decimal::new(1, 16);
         assert_eq!(
@@ -723,6 +752,7 @@ mod tests {
     }
 
     /// Wide results agree with i128 arithmetic where i128 suffices.
+    #[allow(clippy::many_single_char_names)]
     #[test]
     fn mul_div_round_matches_i128_reference() {
         let mut state = 0x0123_4567_89AB_CDEF_u64;
