@@ -83,10 +83,16 @@ pub struct LedgerSnapshot {
     pub balances: BTreeMap<Asset, BalanceSnapshot>,
     /// Position per instrument, for every registered instrument.
     pub positions: BTreeMap<InstrumentId, PositionSnapshot>,
-    /// Cumulative fees per asset; negative when rebates exceed fees.
+    /// Cumulative fees per asset, derivative settlement fees included;
+    /// negative when rebates exceed fees.
     pub fees_paid: BTreeMap<Asset, Decimal>,
+    /// Cumulative realized PnL paid by derivative settlements, per asset,
+    /// gross of fees.
+    pub settled_pnl: BTreeMap<Asset, Decimal>,
     /// Open reservations.
     pub reservations: BTreeMap<ReservationId, (Asset, Decimal)>,
     /// Number of executions booked.
     pub executions_booked: u64,
+    /// Number of derivative settlements booked.
+    pub settlements_booked: u64,
 }
