@@ -1096,14 +1096,6 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
 type Book = BTreeMap<InstrumentId, (MarginInstrument, Decimal)>;
 
 /// The product and contract of a future or perpetual; `None` for spot.
-/// Exhaustive, so a new kind of instrument must be decided here.
 fn derivative_terms(instrument: &Instrument) -> Option<(ProductKind, DerivativeContract)> {
-    let product = match instrument {
-        Instrument::Spot(_) => return None,
-        Instrument::LinearFuture(_) => ProductKind::LinearFuture,
-        Instrument::LinearPerpetual(_) => ProductKind::LinearPerpetual,
-        Instrument::InverseFuture(_) => ProductKind::InverseFuture,
-        Instrument::InversePerpetual(_) => ProductKind::InversePerpetual,
-    };
-    Some((product, instrument.derivative()?))
+    Some((instrument.derivative_product()?, instrument.derivative()?))
 }

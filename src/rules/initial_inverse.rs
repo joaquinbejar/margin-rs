@@ -31,8 +31,8 @@ use rust_decimal::Decimal;
 use crate::error::{MarginError, Result};
 use crate::ids::Asset;
 use crate::initial_margin::{
-    ExposurePosition, ExposureView, InitialMarginModel, MarginRequirement, PositionRequirement,
-    RuleId, check_size,
+    ExposurePosition, ExposureView, InitialMarginModel, MarginRequirement, PiecewiseLinearMargin,
+    PositionRequirement, RuleId, check_size,
 };
 use crate::rules::{MarginTier, tiers};
 
@@ -134,6 +134,19 @@ impl TieredInverseIm {
             initial: tiered.initial,
             maintenance: tiered.maintenance,
         })
+    }
+}
+
+/// The tier floors above 0, in the base. Rates never decrease from one
+/// tier to the next, so each margin is convex in the notional, which at a
+/// fixed mark is linear in the contracts.
+impl PiecewiseLinearMargin for TieredInverseIm {
+    fn cash_scale(&self) -> u32 {
+        self.scale
+    }
+
+    fn notional_breakpoints(&self, _position: &ExposurePosition) -> Vec<Decimal> {
+        self.tiers.iter().skip(1).map(|tier| tier.floor).collect()
     }
 }
 

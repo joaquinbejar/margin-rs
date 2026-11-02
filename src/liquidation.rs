@@ -1,9 +1,10 @@
 //! Staged closeout plan for an account below its margin threshold.
 //!
-//! [`plan_liquidation`] simulates one closeout of an account's linear
-//! futures and perpetuals against supplied scenario liquidity, under one
-//! [`PiecewiseLinearMargin`] rule (any
-//! [`TieredLinearIm`](crate::rules::TieredLinearIm)), and returns a
+//! [`plan_liquidation`] simulates one closeout of an account's linear or
+//! inverse futures and perpetuals against supplied scenario liquidity,
+//! under one [`PiecewiseLinearMargin`] rule (any
+//! [`TieredLinearIm`](crate::rules::TieredLinearIm) or
+//! [`TieredInverseIm`](crate::rules::TieredInverseIm)), and returns a
 //! [`LiquidationPlan`]. It is a pure function: it books nothing and changes
 //! no state. There is no live liquidator.
 //!
@@ -75,6 +76,17 @@
 //! - cash changes by `realized PnL - fee`, booked in full even when it
 //!   leaves cash negative.
 //!
+//! An inverse position (contract value `CV`, settled in the base, which is
+//! then the plan's currency) uses its value in the base instead:
+//!
+//! - `basis` is the signed value at entry prices (a long is positive);
+//! - unrealized PnL: `basis - round_half_even(Qc * CV / mark, c)`;
+//! - a reduction of `n` at `p` has the signed fill value
+//!   `+round_half_even(n * CV / p, c)` when selling and the negative when
+//!   buying (in [`ForcedReduction::fill_cash`]); it releases the basis as
+//!   above; its realized PnL is `released - fill value`;
+//! - its fee is `trunc(fee_rate * n * CV / p, c)`, in the base.
+//!
 //! Marks stay those of the [`ExposureView`] for the whole plan: the
 //! scenario's prices for the closeout are the liquidity levels.
 //!
@@ -85,6 +97,10 @@
 //! `excess(n) = collateral(n) - margin(n)` is concave: collateral is linear
 //! and, by the [`PiecewiseLinearMargin`] contract, the margin is a convex
 //! piecewise linear function of the notional, which falls linearly in `n`.
+//! This holds for inverse positions too: their PnL is convex in the price,
+//! but within a level the price is fixed, so the fill value `n * CV / p`,
+//! the fee and the remaining notional `(|Qc| - n) * CV / mark` are all
+//! linear in `n`.
 //! So `g(n) = min(cash(n), excess(n))` is concave and the counts that meet
 //! the target (`g(n) >= 0`) form an interval `[a, b]`, which need not
 //! reach the end of the level: closing more can push cash below zero.
@@ -102,6 +118,13 @@
 //!    the smallest candidate that does, and takes `a`: a count that meets
 //!    the target and whose predecessor on the grid does not.
 //!
+//! Rounding makes these functions step by single quanta (half-even fill
+//! values and released basis, a truncated fee), so concavity holds only up
+//! to those steps. The search is checked against an exhaustive oracle that
+//! tries every count (`tests/closeout_oracle.rs`: linear and inverse, one
+//! to three levels, one and two tiers, with and without fees, long and
+//! short, cash swept across the target), and agrees with it on every case.
+//!
 //! Counts live on the grid of [`LiquidationPolicy::contract_step`],
 //! indexed in wide integers, so no product of a step count or bisection
 //! midpoint can overflow.
@@ -118,10 +141,10 @@ use crate::direction::Dir;
 use crate::error::{MarginError, Result};
 use crate::ids::{AccountId, Asset, ExecutionId, InstrumentId, OrderId, VenueId};
 use crate::initial_margin::{
-    ExposurePosition, ExposureView, MarginRequirement, PiecewiseLinearMargin, ProductKind, RuleId,
-    check_size,
+    ExposurePosition, ExposureView, MarginRequirement, PiecewiseLinearMargin, RuleId, check_size,
 };
-use crate::instrument::{ContractSize, Instrument};
+use crate::instrument::ContractSize;
+use crate::ledger::derivative::{market_value, unrealized_pnl};
 use crate::ledger::{Action, DerivativeSettlement, Execution, LedgerSnapshot};
 
 /// When the closeout stops.
@@ -178,8 +201,10 @@ impl LiquidationAccount {
     /// `marks` (per unit of the underlying, in `currency`), with no resting
     /// orders: set [`LiquidationAccount::resting_orders`] before planning.
     ///
-    /// - Positions: every open linear future and perpetual, with its
-    ///   contracts, the multiplier of the ledger's instrument and its mark;
+    /// - Positions: every open future and perpetual, linear or inverse,
+    ///   with its contracts, the contract size of the ledger's instrument
+    ///   and its mark (for an inverse one, the plan's currency is the
+    ///   base);
     ///   the instrument definitions of the snapshot are authoritative and
     ///   marks never change them.
     /// - Basis: each position's cost basis.
@@ -241,39 +266,33 @@ impl LiquidationAccount {
             if position.quantity.is_zero() {
                 continue;
             }
-            let (product, terms) = match snapshot.instruments.get(id) {
-                Some(Instrument::Spot(_)) => continue,
-                Some(Instrument::LinearFuture(future)) => {
-                    if future.expiry_ms() <= as_of_ms {
-                        return Err(MarginError::ExpiredUnsettled {
-                            instrument: id.clone(),
-                            expiry_ms: future.expiry_ms(),
-                            as_of_ms,
-                        });
-                    }
-                    (ProductKind::LinearFuture, future.terms())
-                }
-                Some(Instrument::LinearPerpetual(perpetual)) => {
-                    (ProductKind::LinearPerpetual, perpetual.terms())
-                }
-                Some(Instrument::InverseFuture(_) | Instrument::InversePerpetual(_)) => {
-                    return Err(MarginError::UnsupportedInstrument {
-                        rule: model.rule().to_string(),
+            let instrument =
+                snapshot
+                    .instruments
+                    .get(id)
+                    .ok_or_else(|| MarginError::UnknownInstrument {
                         instrument: id.clone(),
-                        reason: "inverse futures and perpetuals are not planned yet",
-                    });
-                }
-                None => {
-                    return Err(MarginError::UnknownInstrument {
-                        instrument: id.clone(),
-                    });
-                }
+                    })?;
+            let (Some(product), Some(contract)) =
+                (instrument.derivative_product(), instrument.derivative())
+            else {
+                // Spot holdings are not part of the plan.
+                continue;
             };
-            if terms.settlement() != currency {
+            if let Some(expiry_ms) = contract.expiry_ms
+                && expiry_ms <= as_of_ms
+            {
+                return Err(MarginError::ExpiredUnsettled {
+                    instrument: id.clone(),
+                    expiry_ms,
+                    as_of_ms,
+                });
+            }
+            if contract.settlement != *currency {
                 return Err(MarginError::CurrencyMismatch {
                     field: "settlement",
                     expected: currency.clone(),
-                    found: terms.settlement().clone(),
+                    found: contract.settlement.clone(),
                 });
             }
             let mark = *marks.get(id).ok_or_else(|| MarginError::MissingMark {
@@ -291,7 +310,7 @@ impl LiquidationAccount {
                 product,
                 settlement: currency.clone(),
                 contracts: position.quantity,
-                size: ContractSize::Multiplier(terms.multiplier()),
+                size: contract.size,
                 mark,
             });
             basis.insert(id.clone(), position.cost_basis);
@@ -326,11 +345,14 @@ pub struct ForcedReduction {
     pub price: Decimal,
     /// Contracts closed, positive.
     pub contracts: Decimal,
-    /// Signed fill cash: positive when selling.
+    /// Signed fill cash, positive when selling: `p * n * M` for a linear
+    /// position; for an inverse one, the fill value `n * CV / p` in the
+    /// base, with the same sign.
     pub fill_cash: Decimal,
     /// Part of the basis released.
     pub released_basis: Decimal,
-    /// `fill_cash - released_basis`, gross of the fee.
+    /// Gross of the fee: `fill_cash - released_basis` for a linear
+    /// position, `released_basis - fill_cash` for an inverse one.
     pub realized_pnl: Decimal,
     /// Fee.
     pub fee: Decimal,
@@ -577,24 +599,30 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
             if open.exposure.contracts.is_zero() {
                 continue;
             }
-            let value = mul_div_round(
-                &[
-                    open.exposure.contracts,
-                    multiplier(&open.exposure)?,
-                    open.exposure.mark,
-                ],
-                &[],
+            let size = open.exposure.size;
+            let value = market_value(
+                open.exposure.contracts,
+                size,
+                open.exposure.mark,
                 self.scale,
-                Rounding::HalfEven,
-                "Qc * M * mark",
             )?;
-            terms.push(value);
-            terms.push(neg(open.basis));
+            // upnl: value - basis (linear), basis - value (inverse), summed
+            // with the cash in one exact step.
+            match size {
+                ContractSize::Multiplier(_) => {
+                    terms.push(value);
+                    terms.push(neg(open.basis));
+                }
+                ContractSize::ContractValue(_) => {
+                    terms.push(open.basis);
+                    terms.push(neg(value));
+                }
+            }
             positions.push(PlanPosition {
                 instrument: open.exposure.instrument.clone(),
                 contracts: open.exposure.contracts,
                 basis: open.basis,
-                unrealized_pnl: sub(value, open.basis, "value - basis")?,
+                unrealized_pnl: unrealized_pnl(size, value, open.basis)?,
             });
         }
         Ok(AccountSummary {
@@ -647,7 +675,6 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
     ) -> Result<(State, ForcedReduction, AccountSummary)> {
         let exposure = &state.open(index)?.exposure;
         let size = exposure.contracts.abs();
-        let m = multiplier(exposure)?;
         let grid = ContractGrid::new(self.policy.contract_step, offer.contracts.min(size))?;
         let at = |k: GridIndex| -> Result<(State, ForcedReduction, AccountSummary)> {
             let n = grid.contracts(k)?;
@@ -668,15 +695,28 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
         }
 
         // Segment ends: no fill, the grid points around each breakpoint
-        // (where the notional crosses a floor: n = |Qc| - floor / (M * mark)),
-        // and the whole level.
+        // (where the notional crosses a floor: n = |Qc| - floor / (M * mark)
+        // for a linear position, n = |Qc| - floor * mark / CV for an inverse
+        // one), and the whole level.
         let mut ends = vec![GridIndex::ZERO, last];
         for floor in self.model.notional_breakpoints(exposure) {
-            let numerator = sum_products(
-                &[&[size, m, exposure.mark], &[neg(floor)]],
-                "|Qc| * M * mark - floor",
-            )?;
-            let k = grid.floor_index_of(numerator, &[m, exposure.mark])?;
+            let (numerator, denominators) = match exposure.size {
+                ContractSize::Multiplier(m) => (
+                    sum_products(
+                        &[&[size, m, exposure.mark], &[neg(floor)]],
+                        "|Qc| * M * mark - floor",
+                    )?,
+                    vec![m, exposure.mark],
+                ),
+                ContractSize::ContractValue(cv) => (
+                    sum_products(
+                        &[&[size, cv], &[neg(floor), exposure.mark]],
+                        "|Qc| * CV - floor * mark",
+                    )?,
+                    vec![cv],
+                ),
+            };
+            let k = grid.floor_index_of(numerator, &denominators)?;
             ends.push(k);
             if let Some(next) = grid.next(k) {
                 ends.push(next);
@@ -749,16 +789,11 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
     ) -> Result<(State, ForcedReduction)> {
         let scale = self.scale;
         let open = state.open(index)?;
-        let m = multiplier(&open.exposure)?;
+        let contract = open.exposure.size;
         let held = open.exposure.contracts;
         let held_abs = held.abs();
-        let notional = mul_div_round(
-            &[price, contracts, m],
-            &[],
-            scale,
-            Rounding::HalfEven,
-            "p * n * M",
-        )?;
+        // rhe(p * n * M), or rhe(n * CV / p) in the base.
+        let notional = market_value(contracts, contract, price, scale)?;
         let (side, fill_cash, contracts_after) = if held > Decimal::ZERO {
             (Action::Sell, notional, sub(held, contracts, "Qc - n")?)
         } else {
@@ -775,14 +810,24 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
                 "basis * n / |Qc|",
             )?
         };
-        let realized_pnl = sub(fill_cash, released_basis, "fill cash - released")?;
-        let fee = mul_div_round(
-            &[self.policy.fee_rate, price, contracts, m],
-            &[],
-            scale,
-            Rounding::TowardZero,
-            "fee",
-        )?;
+        // Linear: fill cash - released; inverse: released - fill value.
+        let realized_pnl = unrealized_pnl(contract, fill_cash, released_basis)?;
+        let fee = match contract {
+            ContractSize::Multiplier(m) => mul_div_round(
+                &[self.policy.fee_rate, price, contracts, m],
+                &[],
+                scale,
+                Rounding::TowardZero,
+                "fee",
+            )?,
+            ContractSize::ContractValue(cv) => mul_div_round(
+                &[self.policy.fee_rate, contracts, cv],
+                &[price],
+                scale,
+                Rounding::TowardZero,
+                "fee",
+            )?,
+        };
         let mut next = state.clone();
         next.cash = sum(
             &[state.cash, realized_pnl, neg(fee)],
@@ -819,13 +864,6 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
         }
         let account = self.account;
         for position in &account.view.positions {
-            if position.product.is_inverse() {
-                return Err(MarginError::UnsupportedInstrument {
-                    rule: self.model.rule().to_string(),
-                    instrument: position.instrument.clone(),
-                    reason: "inverse futures and perpetuals are not planned yet",
-                });
-            }
             check_size(position.product, position.size)?;
         }
         check_scale(account.cash, self.scale, "cash")?;
@@ -1042,16 +1080,4 @@ pub fn plan_liquidation<M: PiecewiseLinearMargin>(
         unfilled,
         outcome,
     )
-}
-
-/// The multiplier of a linear position; the plan covers linear positions
-/// only ([`plan_liquidation`] refuses the others before planning).
-fn multiplier(exposure: &ExposurePosition) -> Result<Decimal> {
-    match exposure.size {
-        ContractSize::Multiplier(m) => Ok(m),
-        ContractSize::ContractValue(_) => Err(MarginError::invalid_input(
-            "size",
-            "the plan covers linear positions only",
-        )),
-    }
 }

@@ -497,6 +497,19 @@ impl Instrument {
         }
     }
 
+    /// The margin product of a derivative; `None` for spot. Exhaustive, so
+    /// a new kind of instrument must be decided here.
+    pub(crate) fn derivative_product(&self) -> Option<crate::initial_margin::ProductKind> {
+        use crate::initial_margin::ProductKind;
+        match self {
+            Self::Spot(_) => None,
+            Self::LinearFuture(_) => Some(ProductKind::LinearFuture),
+            Self::LinearPerpetual(_) => Some(ProductKind::LinearPerpetual),
+            Self::InverseFuture(_) => Some(ProductKind::InverseFuture),
+            Self::InversePerpetual(_) => Some(ProductKind::InversePerpetual),
+        }
+    }
+
     /// The derivative contract: settlement asset, contract size and grids;
     /// `None` for spot.
     pub(crate) fn derivative(&self) -> Option<DerivativeContract> {

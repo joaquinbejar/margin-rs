@@ -20,6 +20,15 @@ follows [Semantic Versioning](https://semver.org/).
   above the bound or in another asset is still booked from the free
   balance, and an overdraft halts the gate.
 
+- **Closeout of inverse futures and perpetuals** (#26, part C):
+  `plan_liquidation` closes inverse positions under `TieredInverseIm`
+  (which now implements `PiecewiseLinearMargin`): fill value
+  `rhe(n * CV / p)` in the base, realized `released - fill value`, fee
+  `trunc(fee_rate * n * CV / p)`. `LiquidationAccount::from_ledger` reads
+  inverse positions and the booked plan leaves exactly `plan.after`. The
+  closeout search is checked against an exhaustive oracle on 6400 linear
+  and inverse cases (`tests/closeout_oracle.rs`).
+
 - **Margin for inverse futures and perpetuals** (#26, part B):
   `ProductKind::InverseFuture` / `ProductKind::InversePerpetual` and the
   rule `TieredInverseIm` (`inverse-im/1`: 10 % / 5 % of the notional

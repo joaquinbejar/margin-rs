@@ -107,6 +107,17 @@ Each open position needs a non-zero `basis` with the sign of the position.
 
 Marks stay those of the `ExposureView` for the whole plan. The scenario prices for the closeout are the liquidity levels.
 
+An **inverse** position (contract value `CV` in quote units, settled in the base, which is then the plan's currency, under `TieredInverseIm`) uses its value in the base:
+
+| Figure | Formula |
+|---|---|
+| basis | signed value in the base at entry prices (a long is positive) |
+| unrealized PnL | `basis - round_half_even(Qc * CV / mark, c)` |
+| fill value, `n` at `p` | `+round_half_even(n * CV / p, c)` when selling, negative when buying (`ForcedReduction::fill_cash`) |
+| released basis | as above |
+| realized PnL | `released - fill value` |
+| fee | `trunc(fee_rate * n * CV / p, c)`, in the base |
+
 ### Search within a level
 
 On one level, let `n` be the number of contracts closed.
@@ -130,6 +141,10 @@ The plan finds `a` exactly, up to the rounding of single cash quanta, in three s
 2. If none of these points meets the target, no count on the level does, and the plan takes the whole level.
 3. Otherwise it bisects between 0, which does not meet the target, and the smallest candidate that does. The result is a count that meets the target while the count one grid step below it does not.
 
+The same holds for inverse positions. Their PnL is convex in the **price**, but within a level the price is fixed, so the fill value `n * CV / p`, the fee and the remaining notional `(|Qc| - n) * CV / mark` are linear in `n`. Only the breakpoint conversion changes: a floor is crossed at `n = |Qc| - floor * mark / CV`.
+
+Rounding makes these functions step by single quanta (half-even values and released basis, a truncated fee), so concavity holds only up to those steps. `tests/closeout_oracle.rs` checks the search against an exhaustive oracle that tries every count on the grid. It covers 6400 cases, linear and inverse, with one to three levels, one and two tiers, fees of 0 and 0.3 %, long and short positions, and cash swept across the target; the plan matches the oracle on every one.
+
 Counts sit on the `contract_step` grid. Grid indices are wide integers, so `k * step`, `ceil(available / step)` and the bisection midpoints never overflow, even for `Decimal::MAX` contracts with a step of 0.5. Near the limits of `Decimal`, a fractional count with too many digits is rounded down to the scale of the cap.
 
 ## Ledger round trip
@@ -137,7 +152,7 @@ Counts sit on the `contract_step` grid. Grid indices are wide integers, so `k * 
 When the futures and perpetuals are held in the margin-rs `Ledger`:
 
 1. `LiquidationAccount::from_ledger(model, snapshot, account, venue, currency, marks, as_of_ms)` builds the account. The caller sets `resting_orders` afterwards.
-   - **Positions.** Every open linear future and perpetual, with its contracts, the multiplier of the ledger's instrument and its instrument mark. The snapshot's instrument definitions are authoritative; marks never change them.
+   - **Positions.** Every open future and perpetual, linear or inverse, with its contracts, the contract size of the ledger's instrument (multiplier or contract value) and its instrument mark. An inverse plan's currency is the base asset. The snapshot's instrument definitions are authoritative; marks never change them.
    - **Basis.** Each position's cost basis. A basis of zero (an entry notional rounded to zero) is valid; a non zero basis must have the sign of the position.
    - **Cash.** The **total** balance of `currency`, reservations included: a closeout is not limited to the available part.
    - **Left out.** Spot holdings, in `currency` or any other asset, are not part of the plan. Flat and settled derivatives take no part.
@@ -150,7 +165,8 @@ The ledger books a derivative fill with the cash conventions above, so the booke
 - the fixture below (sell 3 at 94: cash 71.859, 7 contracts, basis 700);
 - a closeout into debt (cash -150.35, `overdrafts` equal to `plan.debt`);
 - half-quantum rounding at 2 decimals, long and short, with a partial close (released `rhe(100 / 3) = 33.33`) followed by a full close (the rest of the basis);
-- a basis of zero.
+- a basis of zero;
+- inverse closeouts in `tests/inverse_closeout.rs`, long and short (a long of 100 BTC-INV at 50000 marked at 45000 closes 30 at 44900 and 3 at 44500, leaving 67 contracts with basis 0.134 and cash 0.02240652 BTC).
 
 ## Ledger postings for positions outside the ledger
 
