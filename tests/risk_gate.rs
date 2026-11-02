@@ -9,7 +9,8 @@ use margin_rs::risk::{
     RiskDecision, RiskGate, RiskReason,
 };
 use margin_rs::{
-    Asset, Decimal, ExecutionId, InstrumentId, MarginError, OrderId, SpotInstrument, TransferId,
+    Asset, Decimal, ExecutionId, InstrumentId, MarginError, OrderId, ReservationId, SpotInstrument,
+    TransferId,
 };
 use rust_decimal_macros::dec;
 use std::collections::BTreeMap;
@@ -1096,4 +1097,144 @@ fn anomaly_and_overdraft_are_both_recorded() {
     gate.resume();
     assert_eq!(gate.halted(), None);
     assert!(gate.halt_reasons().is_empty());
+}
+
+/// Issue #16: an internal halt withdraws quotes like `trip()`.
+///
+/// 10000 USDC and 5 BTC. o1 buys 2 at 100, o2 buys 1 at 99 (accepted by the
+/// venue), o3 sells 1 at 110. An overfill of o1 halts the gate: o1 is
+/// filled, so the other live orders o2 and o3 are withdrawn and keep their
+/// reservations until each cancel is confirmed.
+#[test]
+fn internal_halt_withdraws_the_other_live_orders() {
+    let mut gate = gate(dec!(10000), dec!(5), InstrumentLimits::default());
+    for request in [
+        buy("o1", dec!(100), dec!(2)),
+        buy("o2", dec!(99), dec!(1)),
+        sell("o3", dec!(110), dec!(1)),
+    ] {
+        assert!(!gate.submit(&request, 0).is_rejected());
+    }
+    gate.on_venue_accepted(&oid("o2")).expect("accepted");
+    let held = |gate: &RiskGate, id: &str| {
+        gate.ledger()
+            .reservation(&ReservationId::new(id).expect("id"))
+            .map(|(asset, amount)| (asset.clone(), amount))
+    };
+    let (o2_held, o3_held) = (held(&gate, "o2"), held(&gate, "o3"));
+    assert!(o2_held.is_some() && o3_held.is_some());
+    let outcome = gate
+        .on_fill(
+            &oid("o1"),
+            &report(fill("e1", Side::Buy, dec!(100), dec!(3)), dec!(3)),
+        )
+        .expect("booked");
+    assert!(!outcome.anomalies.is_empty());
+    assert_eq!(outcome.withdraw, vec![oid("o2"), oid("o3")]);
+    for id in ["o2", "o3"] {
+        assert_eq!(
+            gate.order(&oid(id)).map(|o| o.state),
+            Some(OrderState::CancelPending)
+        );
+    }
+    assert_eq!(
+        gate.order(&oid("o1")).map(|o| o.state),
+        Some(OrderState::Filled)
+    );
+    // Reservations stay until the cancels are confirmed.
+    assert_eq!((held(&gate, "o2"), held(&gate, "o3")), (o2_held, o3_held));
+    assert_eq!(balance(&gate, "BTC"), (dec!(8), dec!(1), dec!(7)));
+    assert_eq!(
+        gate.submit(&buy("o4", dec!(100), dec!(1)), 0),
+        RiskDecision::Rejected {
+            reasons: vec![RiskReason::Halted {
+                reason: gate.halted().expect("halted"),
+            }]
+        }
+    );
+
+    // A fill racing the cancel is booked normally and withdraws nothing.
+    let raced = gate
+        .on_fill(
+            &oid("o2"),
+            &report(fill("e2", Side::Buy, dec!(99), dec!(1)), dec!(1)),
+        )
+        .expect("booked");
+    assert!(raced.is_clean());
+    assert!(raced.withdraw.is_empty());
+    assert_eq!(balance(&gate, "USDC"), (dec!(9601), dec!(0), dec!(9601)));
+
+    // A second internal halt while halted has nothing left to withdraw.
+    let worse = gate
+        .on_fill(
+            &oid("o3"),
+            &report(fill("e3", Side::Sell, dec!(109), dec!(1)), dec!(1)),
+        )
+        .expect("booked");
+    assert_eq!(
+        worse.anomalies,
+        vec![ExecutionAnomaly::WorsePrice {
+            limit: dec!(110),
+            price: dec!(109),
+        }]
+    );
+    assert!(worse.withdraw.is_empty());
+    assert_eq!(gate.trip(HaltReason::Manual), Vec::<OrderId>::new());
+    assert_eq!(gate.on_cancel_confirmed(&oid("o2")), Ok(dec!(0)));
+    assert_eq!(gate.on_cancel_confirmed(&oid("o3")), Ok(dec!(0)));
+    assert!(gate.ledger().reconcile().expect("reconciles").is_clean());
+}
+
+/// A partly filled order whose fill halts the gate is itself withdrawn,
+/// with the reservation of its remaining quantity kept.
+#[test]
+fn internal_halt_withdraws_the_partly_filled_order() {
+    let mut gate = gate_fixture_worse_price();
+    let outcome = gate
+        .on_fill(
+            &oid("o1"),
+            &report(fill("e1", Side::Buy, dec!(100.01), dec!(1)), dec!(1)),
+        )
+        .expect("booked");
+    assert_eq!(outcome.withdraw, vec![oid("o1")]);
+    assert_eq!(
+        gate.order(&oid("o1")).map(|o| o.state),
+        Some(OrderState::CancelPending)
+    );
+    assert_eq!(
+        balance(&gate, "USDC"),
+        (dec!(899.99), dec!(100), dec!(799.99))
+    );
+    assert_eq!(gate.on_cancel_confirmed(&oid("o1")), Ok(dec!(100)));
+    assert_eq!(
+        balance(&gate, "USDC"),
+        (dec!(899.99), dec!(0), dec!(899.99))
+    );
+}
+
+/// An overdraft halts the gate and withdraws the live orders; the duplicate
+/// of the same fill withdraws nothing.
+///
+/// 100 USDC and 1 BTC. o1 buys 1 at 100, o2 sells 1 at 200. A 1 USDC fee on
+/// o1's fill overdraws USDC by 1: o2 is withdrawn.
+#[test]
+fn overdraft_halt_withdraws_and_duplicates_do_not() {
+    let mut gate = gate(dec!(100), dec!(1), InstrumentLimits::default());
+    gate.submit(&buy("o1", dec!(100), dec!(1)), 0);
+    gate.submit(&sell("o2", dec!(200), dec!(1)), 0);
+    let e1 = fill("e1", Side::Buy, dec!(100), dec!(1)).with_fee(asset("USDC"), dec!(1));
+    let outcome = gate
+        .on_fill(&oid("o1"), &report(e1.clone(), dec!(1)))
+        .expect("booked");
+    assert_eq!(gate.halted(), Some(HaltReason::AccountingBreach));
+    assert_eq!(outcome.withdraw, vec![oid("o2")]);
+    assert_eq!(
+        gate.order(&oid("o2")).map(|o| o.state),
+        Some(OrderState::CancelPending)
+    );
+    assert_eq!(balance(&gate, "BTC"), (dec!(2), dec!(1), dec!(1)));
+
+    let again = gate.on_fill(&oid("o1"), &report(e1, dec!(1))).expect("dup");
+    assert!(!again.booking.is_new());
+    assert!(again.withdraw.is_empty());
 }
