@@ -56,7 +56,7 @@ The position limits apply to the worst-case position on the order's side:
 
 ## Reservations
 
-Every approved order gets `ReservationTerms`, fixed at admission and stored in its `OrderRecord`. Later `set_limits` calls never change the reservation of a live order, so lowering `max_fee_rate` or changing `fee_asset` cannot release budget a live order may still need (M105-3).
+Every approved order gets `ReservationTerms`, fixed at admission and stored in its `OrderRecord`. Later `set_limits` calls never change the reservation of a live order, so lowering `max_fee_rate` or changing `fee_asset` cannot release budget a live order may still need.
 
 An order reserves the asset it pays: quote for a buy, base for a sell. `InstrumentLimits::fee_asset` (`FeeAsset::Quote` by default, or `FeeAsset::Base`) says where the venue charges fees. A fee in the asset the order pays is reserved. A fee in the asset the order receives is netted: the ledger books the credit and the fee of a fill in one exact sum per asset, so the fill pays its own fee and never draws on balance held for other orders.
 
