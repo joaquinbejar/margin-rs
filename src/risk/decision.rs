@@ -142,6 +142,21 @@ pub enum HaltReason {
     },
 }
 
+impl HaltReason {
+    /// How severe the halt is, for choosing what to report when several
+    /// apply: an accounting breach (the account is overdrawn) is the most
+    /// severe (3), then an execution anomaly (2), then external halts:
+    /// manual, circuit breaker and data disconnect (1).
+    #[must_use]
+    pub fn severity(&self) -> u8 {
+        match self {
+            Self::AccountingBreach => 3,
+            Self::ExecutionAnomaly { .. } => 2,
+            Self::Manual | Self::CircuitBreaker | Self::DataDisconnect => 1,
+        }
+    }
+}
+
 /// One reason behind a reduction or a rejection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]

@@ -110,7 +110,8 @@ A repeated report (same execution id and content) returns a `Duplicate` booking 
 ## Circuit breaker and quote withdrawal
 
 - **`trip(reason)`.** Activates the halt. Every later `submit` is rejected with `Halted { reason }`. Every live order without a cancel pending moves to `CancelPending`, and their ids are returned. The caller sends exactly those cancels; that is the quote withdrawal. Reservations stay until each cancel is confirmed, and fills that race the cancels are booked normally. Tripping again while halted returns no orders and keeps the first reason.
-- **`resume()`.** Lifts the halt.
+- **`resume()`.** Lifts the halt and clears every recorded reason.
+- **Several reasons.** Every reason is recorded in `halt_reasons()`, in order. `halted()` reports the most severe by `HaltReason::severity`: `AccountingBreach` (3), then `ExecutionAnomaly` (2), then the external halts (1). Among equal severities it reports the first. A fill that is both an anomaly and an overdraft therefore records both and reports the breach.
 - **Sources of `HaltReason`:**
   - `Manual`: an operator.
   - `CircuitBreaker`: an external breaker. The market-maker-rs adapter calls `trip(CircuitBreaker)` when `CircuitBreaker::is_trading_allowed()` turns false.

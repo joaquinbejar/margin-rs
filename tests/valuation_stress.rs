@@ -1,6 +1,8 @@
 //! Account valuation and stress fixtures (M2-08), hand calculated.
 
+use margin_rs::OrderId;
 use margin_rs::ledger::{Execution, Fee, Ledger, Side};
+use margin_rs::risk::{FillReport, InstrumentLimits, OrderRequest, RiskGate};
 use margin_rs::scenarios::{HypotheticalFill, Scenario, stress};
 use margin_rs::valuation::{
     InvalidMarkPolicy, Mark, MarkSet, MarkStatus, PriceSource, ValuationPolicy, value,
@@ -593,4 +595,71 @@ fn scenario_validation() {
             max_scale: 2,
         })
     );
+}
+
+/// A debt created by a real fill through the gate (an overfilled sell) is
+/// valued as a debt.
+///
+/// 1000 USDC and 1 BTC; sell 1 at 100, filled 2: USDC 1200, BTC -1. At a
+/// fresh BTC mark of 100, equity and collateral are 1200 - 100 = 1100. At a
+/// stale mark, equity is 1100 (flagged) and collateral is unknown.
+#[test]
+fn gate_overdraft_is_valued_as_a_debt() {
+    let mut gate = RiskGate::new(long_two_btc_free());
+    gate.set_limits(&pair(), InstrumentLimits::default())
+        .expect("limits");
+    let id = OrderId::new("s1").expect("id");
+    let order = OrderRequest::new(id.clone(), pair(), Side::Sell, dec!(100), dec!(1));
+    assert!(!gate.submit(&order, 0).is_rejected());
+    let outcome = gate
+        .on_fill(
+            &id,
+            &FillReport::new(exec("f1", Side::Sell, dec!(100), dec!(2)), dec!(2)),
+        )
+        .expect("a real fill is booked");
+    assert_eq!(
+        outcome.shortfalls,
+        BTreeMap::from([(asset("BTC"), dec!(1))])
+    );
+    let snapshot = gate.ledger().snapshot();
+
+    let fresh = value(&snapshot, &btc_at(dec!(100), 5000), &policy()).expect("value");
+    assert_eq!(fresh.equity, Some(dec!(1100)));
+    assert_eq!(fresh.collateral_equity, Some(dec!(1100)));
+    assert_eq!(
+        fresh.assets[&asset("BTC")].collateral_value,
+        Some(dec!(-100))
+    );
+
+    let stale = value(&snapshot, &btc_at(dec!(100), 1000), &policy()).expect("value");
+    assert_eq!(stale.equity, Some(dec!(1100)));
+    assert_eq!(stale.collateral_equity, None);
+    assert_eq!(
+        stale.flags[&asset("BTC")],
+        MarkStatus::Stale { age_ms: 4000 }
+    );
+}
+
+/// 1000 USDC and 1 BTC deposited, no trades.
+fn long_two_btc_free() -> Ledger {
+    let mut ledger = Ledger::default();
+    for (code, scale) in [("USDC", 6), ("BTC", 8), ("BNB", 8)] {
+        ledger.register_asset(asset(code), scale).expect("register");
+    }
+    ledger
+        .register_instrument(
+            SpotInstrument::new(pair(), asset("BTC"), asset("USDC"), 2, 8).expect("spot"),
+        )
+        .expect("register");
+    ledger
+        .deposit(
+            TransferId::new("d1").expect("id"),
+            asset("USDC"),
+            dec!(1000),
+        )
+        .expect("deposit");
+    ledger
+        .deposit(TransferId::new("d2").expect("id"), asset("BTC"), dec!(1))
+        .expect("deposit");
+    ledger
 }

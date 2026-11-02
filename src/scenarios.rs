@@ -28,8 +28,9 @@
 //! asset scale).
 //!
 //! The stressed snapshot is then valued with [`value`] under the same
-//! policy, so invalid marks stay invalid and keep counting nothing toward
-//! collateral.
+//! policy, so invalid marks stay invalid: a held asset with an invalid mark
+//! adds nothing to collateral, and a debt with one makes collateral unknown
+//! (or, under the stale haircut policy, counts at `price * (1 + haircut)`).
 
 use std::collections::BTreeMap;
 
