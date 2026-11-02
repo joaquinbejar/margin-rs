@@ -10,8 +10,9 @@ follows [Semantic Versioning](https://semver.org/).
 
 - Lints: clippy pedantic is on, and `unwrap_used`, `expect_used`, `panic`,
   `unreachable`, `todo`, `unimplemented` and `indexing_slicing` are denied;
-  `arithmetic_side_effects` and `float_arithmetic` warn, and `make lint`
-  runs with `-D warnings`. `unsafe_code` is denied and `missing_docs` warns.
+  `arithmetic_side_effects` warns, and `make lint` runs with `-D warnings`.
+  `unsafe_code` stays forbidden, and `missing_docs` and
+  `clippy::float_arithmetic` stay denied.
   Library code has no `unwrap`, `expect`, `panic!`, unchecked indexing or
   unchecked arithmetic left; the few exceptions are `#[expect]`s with a
   reason. Test code opts out of the panic and indexing lints.
