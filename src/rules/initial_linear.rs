@@ -39,7 +39,7 @@ use std::collections::BTreeSet;
 
 use rust_decimal::Decimal;
 
-use crate::decimal::{Rounding, add, check_configured_scale, mul, sub, sum_terms_round};
+use crate::decimal::{Rounding, add, check_configured_scale, product, sub, sum_terms_round};
 use crate::error::{MarginError, Result};
 use crate::ids::Asset;
 use crate::initial_margin::{
@@ -177,9 +177,10 @@ impl TieredLinearIm {
         if position.mark <= Decimal::ZERO {
             return Err(MarginError::invalid_input("mark", "must be positive"));
         }
-        let notional = mul(
-            mul(position.contracts.abs(), position.multiplier, "|Qc| * M")?,
-            position.mark,
+        // One exact product: intermediate |Qc| * M may not be representable
+        // even when the notional is.
+        let notional = product(
+            &[position.contracts.abs(), position.multiplier, position.mark],
             "|Qc| * M * mark",
         )?;
 

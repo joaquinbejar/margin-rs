@@ -362,7 +362,7 @@ fn unsupported_inputs() {
             dec!(10),
             dec!(10)
         )])),
-        Err(MarginError::arithmetic("|Qc| * M"))
+        Err(MarginError::arithmetic("|Qc| * M * mark"))
     );
 }
 
@@ -432,4 +432,43 @@ fn primary_specification_example() {
     };
     assert_eq!(im(dec!(10)), dec!(100));
     assert_eq!(im(dec!(5)), dec!(50));
+}
+
+/// M303B-C1: only the full notional must be representable.
+///
+/// Qc = MAX, M = 2, mark = 0.1: |Qc| * M overflows but the notional is
+/// MAX / 5 = 15845632502852867518708790067, im 1584563250285286751870879006.7.
+/// Qc = 0.1, M = 1e-28, mark = 10: 0.1 * 1e-28 needs 29 digits, but the
+/// notional is 1e-28, and im and mm round up to 0.000001.
+#[test]
+fn intermediate_products_need_not_be_representable() {
+    let rule = xynthex();
+    let big = rule
+        .requirement(&view(vec![position(
+            "BIG-PERP",
+            ProductKind::LinearPerpetual,
+            Decimal::MAX,
+            dec!(2),
+            dec!(0.1),
+        )]))
+        .expect("representable notional");
+    assert_eq!(
+        big.positions[0].notional,
+        dec!(15845632502852867518708790067)
+    );
+    assert_eq!(big.initial, dec!(1584563250285286751870879006.7));
+    let tiny = rule
+        .requirement(&view(vec![position(
+            "TINY-PERP",
+            ProductKind::LinearPerpetual,
+            dec!(0.1),
+            Decimal::new(1, 28),
+            dec!(10),
+        )]))
+        .expect("representable notional");
+    assert_eq!(tiny.positions[0].notional, Decimal::new(1, 28));
+    assert_eq!(
+        (tiny.initial, tiny.maintenance),
+        (dec!(0.000001), dec!(0.000001))
+    );
 }
