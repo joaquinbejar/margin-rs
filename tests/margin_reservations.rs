@@ -529,3 +529,54 @@ mod with_gate {
         assert_eq!(gate.hold(&hold()), dec!(100));
     }
 }
+
+/// M303C-1: an order that does not raise the requirement is accepted even
+/// when the account is under margined; one that raises it is not.
+///
+/// Long 10 XYZ (20000) with collateral 10000. Sell 5: worst case
+/// max(10, 5) = 10, requirement unchanged, accepted. Sell 25 on top would
+/// make the worst case |10 - 30| = 20 (40000): rejected.
+#[test]
+fn reducing_orders_are_accepted_when_under_margined() {
+    let mut service = service();
+    service
+        .reserve(
+            order("b", "XYZ-PERP", Side::Buy, dec!(10)),
+            Some(dec!(100000)),
+            &marks(),
+        )
+        .expect("decision");
+    service
+        .apply_fill(&oid("b"), eid("f"), dec!(10))
+        .expect("fill");
+    let collateral = Some(dec!(10000));
+    assert_eq!(
+        service
+            .reserve(
+                order("s1", "XYZ-PERP", Side::Sell, dec!(5)),
+                collateral,
+                &marks()
+            )
+            .expect("decision"),
+        MarginDecision::Reserved {
+            required: dec!(20000),
+            reserved: dec!(0),
+        }
+    );
+    assert_eq!(
+        service
+            .reserve(
+                order("s2", "XYZ-PERP", Side::Sell, dec!(25)),
+                collateral,
+                &marks()
+            )
+            .expect("decision"),
+        MarginDecision::Rejected {
+            reason: MarginRejection::InsufficientMargin {
+                required: dec!(40000),
+                collateral: dec!(10000),
+                shortfall: dec!(30000),
+            },
+        }
+    );
+}

@@ -42,9 +42,11 @@
 //!
 //! # Lifecycle
 //!
-//! - [`MarginReservationService::reserve`] accepts an order only if the
-//!   requirement with it stays within collateral; otherwise it is rejected
-//!   with the requirement, the collateral and the shortfall. Orders are
+//! - [`MarginReservationService::reserve`] accepts an order if the
+//!   requirement with it stays within collateral, or if it does not raise
+//!   the requirement at all (a risk reducing order, accepted even when the
+//!   account is under margined); otherwise it is rejected with the
+//!   requirement, the collateral and the shortfall. Orders are
 //!   decided one at a time against the requirement of everything already
 //!   accepted, so two orders can never use the same capital.
 //! - [`MarginReservationService::apply_fill`] is idempotent by execution
@@ -123,7 +125,9 @@ pub enum MarginRejection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarginDecision {
     /// Accepted; `reserved` is the increase of the account requirement due
-    /// to this order at the time it was accepted.
+    /// to this order at the time it was accepted. It is accounting against
+    /// the collateral passed in, not a ledger reservation (see
+    /// [`MarginReservationService::reserve_with_gate`] for that).
     Reserved {
         /// Account requirement with the order.
         required: Decimal,
@@ -347,7 +351,10 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
             }
             Err(error) => return Err(error),
         };
-        if after.total > collateral {
+        // An order that does not raise the requirement (a risk reducing
+        // order) is accepted whatever the collateral, even when the account
+        // is already under margined.
+        if after.total > collateral && after.total > before.total {
             return reject(MarginRejection::InsufficientMargin {
                 required: after.total,
                 collateral,
@@ -476,7 +483,9 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
         let collateral = add(available, gate.hold(hold), "available + hold")?;
         let decision = self.reserve(order, Some(collateral), marks)?;
         if let MarginDecision::Reserved { required, .. } = &decision {
-            gate.set_hold(hold, currency, *required)?;
+            // A risk reducing order may be accepted while the requirement
+            // exceeds the cash; the hold then takes all of it.
+            gate.set_hold(hold, currency, (*required).min(collateral))?;
         }
         Ok(decision)
     }

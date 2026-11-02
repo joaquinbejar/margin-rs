@@ -14,7 +14,7 @@ The requirement is recomputed from state on every call, never accumulated, so it
 
 | Call | Effect |
 |---|---|
-| `reserve(order, collateral, marks)` | Accepted only if the total requirement with the order is within `collateral`. Otherwise `Rejected` with a reason, and nothing changes |
+| `reserve(order, collateral, marks)` | Accepted if the total requirement with the order is within `collateral`, or if the order does not raise the requirement at all. The second case is a risk-reducing order, which is accepted even when the account is under-margined. Otherwise the order is `Rejected` with a reason and nothing changes. The `reserved` amount is accounting against the collateral passed in, not a ledger reservation |
 | `apply_fill(order, execution_id, contracts)` | Idempotent by execution id. Moves the filled contracts from the order to the position |
 | `release_on_effective_cancel(order)` | Closes the order's remaining quantity and returns it. Repeating it returns 0 |
 
