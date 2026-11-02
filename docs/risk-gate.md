@@ -83,7 +83,7 @@ The lifecycle changes the reservation as follows:
 
 ### Fill reports: a real execution is never lost
 
-`on_fill(order_id, &FillReport)` takes the execution and the order's cumulative filled quantity after it (FIX `CumQty`). It returns a `FillOutcome { booking, anomalies, shortfalls }`.
+`on_fill(order_id, &FillReport)` takes the execution and the order's cumulative filled quantity after it (FIX `CumQty`). It returns a `FillOutcome { booking, anomalies, shortfalls, withdraw }`.
 
 **Rejected, with nothing changed.** Only reports that cannot be causally true are rejected:
 
@@ -110,6 +110,10 @@ A repeated report (same execution id and content) returns a `Duplicate` booking 
 ## Circuit breaker and quote withdrawal
 
 - **`trip(reason)`.** Activates the halt. Every later `submit` is rejected with `Halted { reason }`. Every live order without a cancel pending moves to `CancelPending`, and their ids are returned. The caller sends exactly those cancels; that is the quote withdrawal. Reservations stay until each cancel is confirmed, and fills that race the cancels are booked normally. Tripping again while halted returns no orders and keeps the first reason.
+- **Internal halts withdraw quotes too (#16).** When `on_fill` halts the gate (an execution anomaly or an accounting breach), it withdraws quotes exactly as `trip()` does. Every live order without a cancel pending moves to `CancelPending`, and `FillOutcome::withdraw` lists their ids. The caller sends exactly those cancels, so no live order is left without a pending cancel.
+  - The order that halted the gate is updated first. If the fill completed it, it is `Filled` and needs no cancel. If it was a partial fill, for example a worse price on part of the order, the order is withdrawn with the rest.
+  - Reservations stay until each cancel is confirmed, and fills that race the cancels are booked normally.
+  - `withdraw` is empty for a clean fill, for a duplicate, and for a second internal halt while every live order already has a cancel pending.
 - **`resume()`.** Lifts the halt and clears every recorded reason.
 - **Several reasons.** Every reason is recorded in `halt_reasons()`, in order. `halted()` reports the most severe by `HaltReason::severity`: `AccountingBreach` (3), then `ExecutionAnomaly` (2), then the external halts (1). Among equal severities it reports the first. A fill that is both an anomaly and an overdraft therefore records both and reports the breach.
 - **Sources of `HaltReason`:**
@@ -132,7 +136,7 @@ The market-maker-rs integration is a separate PR in market-maker-rs (M1-05-INT).
 | `CircuitBreaker` back to `Active` | `resume()` |
 | `ExecutionReport` `Accepted` | `on_venue_accepted` |
 | `ExecutionReport` `Rejected` | `on_venue_rejected` |
-| `ExecutionReport` `PartialFill` / `Fill` | `on_fill(order_id, &FillReport { execution, cumulative_quantity })`. The execution is mapped as in `docs/ledger.md`; `cumulative_quantity` comes from `ExecutionReport::cumulative_quantity` |
+| `ExecutionReport` `PartialFill` / `Fill` | `on_fill(order_id, &FillReport { execution, cumulative_quantity })`. The execution is mapped as in `docs/ledger.md`; `cumulative_quantity` comes from `ExecutionReport::cumulative_quantity`. Then send cancels for every order in `FillOutcome::withdraw` |
 | `ExecutionReport` `Canceled` | `on_cancel_confirmed` |
 | `ExecutionReport` `CancelRejected` (already filled) | nothing to do: the fill already ended the order and released the reservation |
 | A fill report arriving after `Canceled` | `on_fill` as usual; it is booked as a late fill |

@@ -84,7 +84,9 @@
 //! normally. [`RiskGate::resume`] lifts the halt. The gate trips itself with
 //! [`HaltReason::AccountingBreach`] when a real fill overdraws the account
 //! and with [`HaltReason::ExecutionAnomaly`] when a real fill does not match
-//! its order; in both cases the fill is booked, never lost.
+//! its order; in both cases the fill is booked, never lost, and the quotes
+//! are withdrawn exactly as by [`RiskGate::trip`]: the orders to cancel are
+//! returned in [`FillOutcome::withdraw`].
 
 mod decision;
 
@@ -317,6 +319,12 @@ pub struct FillOutcome {
     pub anomalies: Vec<ExecutionAnomaly>,
     /// Assets the fill overdrew, with the shortfall; the gate halted.
     pub shortfalls: BTreeMap<Asset, Decimal>,
+    /// Orders whose cancel the caller must send because this fill halted
+    /// the gate: every live order that had no cancel pending, now
+    /// [`OrderState::CancelPending`] (as returned by [`RiskGate::trip`]).
+    /// Empty when the fill did not halt the gate, for a duplicate, and when
+    /// every live order already had a cancel pending.
+    pub withdraw: Vec<OrderId>,
 }
 
 impl FillOutcome {
@@ -1039,6 +1047,7 @@ impl RiskGate {
                 booking: self.ledger.book_execution(execution)?,
                 anomalies: Vec::new(),
                 shortfalls: BTreeMap::new(),
+                withdraw: Vec::new(),
             });
         }
         let order = self
@@ -1122,10 +1131,19 @@ impl RiskGate {
                 record.state = OrderState::Filled;
             }
         }
+        // An internal halt withdraws quotes like trip(), after the order's
+        // own update, so a filled order is not cancelled and a partly filled
+        // one is.
+        let withdraw = if anomalies.is_empty() && booked.shortfalls.is_empty() {
+            Vec::new()
+        } else {
+            self.withdraw_live()
+        };
         Ok(FillOutcome {
             booking: booked.booking,
             anomalies,
             shortfalls: booked.shortfalls,
+            withdraw,
         })
     }
 
@@ -1140,6 +1158,13 @@ impl RiskGate {
     /// most severe one.
     pub fn trip(&mut self, reason: HaltReason) -> Vec<OrderId> {
         self.record_halt(reason);
+        self.withdraw_live()
+    }
+
+    /// Moves every live order without a cancel pending to cancel pending
+    /// and returns them, in order id order. Reservations stay until each
+    /// cancel is confirmed.
+    fn withdraw_live(&mut self) -> Vec<OrderId> {
         let to_cancel: Vec<OrderId> = self
             .orders
             .values()
