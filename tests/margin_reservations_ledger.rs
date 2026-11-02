@@ -28,8 +28,8 @@ use margin_rs::margin_reservations::{
 use margin_rs::risk::RiskGate;
 use margin_rs::rules::TieredLinearIm;
 use margin_rs::{
-    AccountId, Asset, Decimal, ExecutionId, InstrumentId, MarginError, OrderId, ReservationId,
-    SpotInstrument, TransferId, VenueId,
+    AccountId, Asset, ContractSize, Decimal, ExecutionId, InstrumentId, MarginError, OrderId,
+    ReservationId, SpotInstrument, TransferId, VenueId,
 };
 use rust_decimal_macros::dec;
 
@@ -93,7 +93,7 @@ fn instrument() -> MarginInstrument {
     MarginInstrument {
         product: ProductKind::LinearPerpetual,
         settlement: usdc(),
-        multiplier: dec!(10),
+        size: ContractSize::Multiplier(dec!(10)),
     }
 }
 
@@ -984,10 +984,10 @@ fn the_registry_is_checked_against_the_ledger() {
         (
             "XYZ-PERP",
             MarginInstrument {
-                multiplier: dec!(5),
+                size: ContractSize::Multiplier(dec!(5)),
                 ..instrument()
             },
-            MarginError::invalid_input("multiplier", "differs from the ledger instrument"),
+            MarginError::invalid_input("size", "differs from the ledger instrument"),
         ),
         (
             "XYZ-PERP",
@@ -1012,10 +1012,7 @@ fn the_registry_is_checked_against_the_ledger() {
         (
             "BTC-USDC",
             instrument(),
-            MarginError::invalid_input(
-                "instrument",
-                "is not a linear future or perpetual in the ledger",
-            ),
+            MarginError::invalid_input("instrument", "is not a future or perpetual in the ledger"),
         ),
         (
             "NOPE-PERP",

@@ -77,7 +77,9 @@ The new remaining quantity, the requirement (positions read from the ledger, whi
 
 The hold after a fill is `min(required, max(available + own hold, 0))`, as on admission: a real fill is never refused for lack of cash, and an uncovered requirement shows as `hold < required`. `sync_hold` keeps its stricter contract and reports an uncovered requirement as an error.
 
-**Registry.** Every registered instrument must be a linear future or perpetual of the ledger with the same product, settlement asset and multiplier (`UnknownInstrument`, `InvalidInput` or `CurrencyMismatch` otherwise).
+**Registry.** Every registered instrument must be a future or perpetual of the ledger with the same product, settlement asset and contract size (`UnknownInstrument`, `InvalidInput` or `CurrencyMismatch` otherwise). `MarginInstrument::size` is a `ContractSize`: a multiplier for a linear product, a contract value for an inverse one.
+
+**Inverse contracts.** With an inverse rule (`TieredInverseIm`, settled in the base), the service margins inverse futures and perpetuals the same way. Their unrealized PnL in collateral is `basis - rhe(Q * CV / mark)`, the mark being in the quote currency of `CV` per unit of the base.
 
 **Explicit modes.** On the ledger, `reserve`, `requirement` and `apply_fill` are `WrongReservationMode`, and so is `apply_booked_fill` on a service with its own positions.
 

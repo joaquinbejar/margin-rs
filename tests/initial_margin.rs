@@ -11,7 +11,7 @@ use margin_rs::initial_margin::{
     ExposurePosition, ExposureView, InitialMarginModel, ProductKind, RuleId, TierSlice,
 };
 use margin_rs::rules::{MarginTier, TieredLinearIm};
-use margin_rs::{AccountId, Asset, Decimal, InstrumentId, MarginError, VenueId};
+use margin_rs::{AccountId, Asset, ContractSize, Decimal, InstrumentId, MarginError, VenueId};
 use rust_decimal_macros::dec;
 
 fn usdc() -> Asset {
@@ -34,7 +34,7 @@ fn position(
         product,
         settlement: usdc(),
         contracts,
-        multiplier,
+        size: ContractSize::Multiplier(multiplier),
         mark,
     }
 }
@@ -96,12 +96,12 @@ fn linear_v1_long_and_short() {
         assert_eq!(requirement.maintenance, dec!(3000.75));
         let line = &requirement.positions[0];
         assert_eq!(line.contracts, contracts);
-        assert_eq!(line.notional, dec!(60015));
+        assert_eq!(line.notional, Some(dec!(60015)));
         assert_eq!(
             line.slices,
             vec![TierSlice {
                 tier: 0,
-                notional: dec!(60015),
+                notional: Some(dec!(60015)),
                 initial_rate: dec!(0.10),
                 maintenance_rate: dec!(0.05),
             }]
@@ -199,7 +199,7 @@ fn tier_boundaries() {
             )]))
             .expect("requirement");
         let line = &requirement.positions[0];
-        assert_eq!(line.notional, notional);
+        assert_eq!(line.notional, Some(notional));
         assert_eq!(line.slices.len(), slices, "{notional}");
         assert_eq!(requirement.initial, initial, "{notional}");
         assert_eq!(requirement.maintenance, maintenance, "{notional}");
@@ -221,13 +221,13 @@ fn tier_boundaries() {
         vec![
             TierSlice {
                 tier: 0,
-                notional: dec!(50000),
+                notional: Some(dec!(50000)),
                 initial_rate: dec!(0.05),
                 maintenance_rate: dec!(0.025),
             },
             TierSlice {
                 tier: 1,
-                notional: dec!(30000),
+                notional: Some(dec!(30000)),
                 initial_rate: dec!(0.10),
                 maintenance_rate: dec!(0.05),
             },
@@ -308,6 +308,30 @@ fn no_netting_across_accounts_or_venues() {
     );
 }
 
+/// A notional beyond `Decimal::MAX` does not block a representable
+/// margin: MAX contracts at M = 2 and mark 1 have notional 2 * MAX
+/// (reported as None), im 0.2 * MAX and mm 0.1 * MAX.
+#[test]
+fn a_notional_beyond_max_does_not_block_the_margin() {
+    let requirement = linear()
+        .requirement(&view(vec![position(
+            "BIG-PERP",
+            ProductKind::LinearPerpetual,
+            Decimal::MAX,
+            dec!(2),
+            dec!(1),
+        )]))
+        .expect("representable margin");
+    let line = &requirement.positions[0];
+    assert_eq!(line.notional, None);
+    assert_eq!(line.slices[0].notional, None);
+    assert_eq!(requirement.initial, dec!(15845632502852867518708790067));
+    assert_eq!(
+        requirement.maintenance,
+        dec!(7922816251426433759354395033.5)
+    );
+}
+
 /// Products and currencies outside the rule fail with typed errors.
 #[test]
 fn unsupported_inputs() {
@@ -372,7 +396,7 @@ fn unsupported_inputs() {
             dec!(10),
             dec!(10)
         )])),
-        Err(MarginError::arithmetic("|Qc| * M * mark"))
+        Err(MarginError::arithmetic("initial margin"))
     );
 }
 
@@ -463,7 +487,7 @@ fn intermediate_products_need_not_be_representable() {
         .expect("representable notional");
     assert_eq!(
         big.positions[0].notional,
-        dec!(15845632502852867518708790067)
+        Some(dec!(15845632502852867518708790067))
     );
     assert_eq!(big.initial, dec!(1584563250285286751870879006.7));
     let tiny = rule
@@ -475,7 +499,7 @@ fn intermediate_products_need_not_be_representable() {
             dec!(10),
         )]))
         .expect("representable notional");
-    assert_eq!(tiny.positions[0].notional, Decimal::new(1, 28));
+    assert_eq!(tiny.positions[0].notional, Some(Decimal::new(1, 28)));
     assert_eq!(
         (tiny.initial, tiny.maintenance),
         (dec!(0.000001), dec!(0.000001))

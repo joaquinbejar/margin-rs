@@ -8,6 +8,16 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Margin for inverse futures and perpetuals** (#26, part B):
+  `ProductKind::InverseFuture` / `ProductKind::InversePerpetual` and the
+  rule `TieredInverseIm` (`inverse-im/1`: 10 % / 5 % of the notional
+  `|Qc| * CV / mark` in the base; tier tables with floors in the base).
+  Tiers are compared exactly by cross products and each margin is one
+  exact sum over the denominator `mark`, rounded up once; the linear rule
+  computes its margins the same way, so a notional out of range no longer
+  blocks a representable margin. Margin reservations margin and value
+  inverse positions (own or on the ledger).
+
 - **Inverse futures and perpetuals in the ledger** (#26, part A):
   `InverseTerms` (settlement in the base asset, contract value `CV` in
   quote units), `InverseFuture`, `InversePerpetual`, the
@@ -87,6 +97,13 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** `ExposurePosition::multiplier` and
+  `MarginInstrument::multiplier` are replaced by `size: ContractSize`,
+  validated against the product. `PositionRequirement::notional` and
+  `TierSlice::notional` are `Option<Decimal>` (informational, `None` when
+  they do not fit). An unrepresentable margin is reported as
+  `Arithmetic { operation: "initial margin" }` (or maintenance) instead of
+  failing on the notional.
 - **Breaking:** `PositionSnapshot::multiplier` and `DerivativeFill::multiplier`
   are replaced by `size: ContractSize`, and `Instrument::multiplier` by
   `Instrument::contract_size`; `DerivativeFill` has the new fields

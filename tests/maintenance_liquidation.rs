@@ -29,8 +29,8 @@ use margin_rs::maintenance::{AccountState, CollateralView, StateReason, assess};
 use margin_rs::rules::{MarginTier, TieredLinearIm};
 use margin_rs::valuation::{MarkSet, ValuationPolicy, value};
 use margin_rs::{
-    AccountId, Asset, Decimal, ExecutionId, InstrumentId, MarginError, OrderId, SpotInstrument,
-    TransferId, VenueId,
+    AccountId, Asset, ContractSize, Decimal, ExecutionId, InstrumentId, MarginError, OrderId,
+    SpotInstrument, TransferId, VenueId,
 };
 use rust_decimal_macros::dec;
 
@@ -70,7 +70,7 @@ fn perp(id: &str, contracts: Decimal, mark: Decimal) -> ExposurePosition {
         product: ProductKind::LinearPerpetual,
         settlement: usdc(),
         contracts,
-        multiplier: Decimal::ONE,
+        size: ContractSize::Multiplier(Decimal::ONE),
         mark,
     }
 }
