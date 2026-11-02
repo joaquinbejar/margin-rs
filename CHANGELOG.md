@@ -22,9 +22,11 @@ follows [Semantic Versioning](https://semver.org/).
   `MarginError::UnsupportedAction { field, action }`, before any change:
   `Ledger::book_execution*` and `RiskGate::on_fill` (before the duplicate
   check), `MarginReservationService::reserve` (before the order id is used)
-  and `scenarios::stress`. `RiskGate::submit` rejects it as
-  `RiskReason::InvalidOrder` with nothing reserved. Matches inside the
-  crate stay exhaustive.
+  `scenarios::stress` and `LiquidationPlan::intents` (every reduction, since
+  plan fields are public). `RiskGate::submit` checks it first and rejects it
+  as `RiskReason::InvalidOrder` without recording anything: the id is not
+  consumed and an existing record under it is untouched. Every other
+  rejection is still recorded. Matches inside the crate stay exhaustive.
 - **MSRV 1.88** (required by `financial_types` 0.3).
 - `financial_types::Side` (long or short), `OptionStyle` and
   `UnderlyingAssetType` are not adopted: positions are signed, and margin-rs

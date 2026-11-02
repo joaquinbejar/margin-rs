@@ -522,10 +522,18 @@ impl RiskGate {
     /// so a repeated id is always rejected with
     /// [`RiskReason::DuplicateOrderId`] and never reserves twice.
     ///
-    /// A side that is not `Buy` or `Sell` (for example `Action::Other`) is
-    /// an invalid order: [`RiskReason::InvalidOrder`] with
-    /// [`MarginError::UnsupportedAction`], and nothing is reserved.
+    /// One exception: a side that is not `Buy` or `Sell` (for example
+    /// `Action::Other`) is checked first, before the duplicate check, and
+    /// rejected with [`RiskReason::InvalidOrder`] carrying
+    /// [`MarginError::UnsupportedAction`]. Nothing is recorded: the id is not
+    /// consumed, an existing record under it is untouched, and nothing is
+    /// reserved. Every other rejection keeps the contract above.
     pub fn submit(&mut self, request: &OrderRequest, now_ms: u64) -> RiskDecision {
+        if let Err(error) = Dir::from_action(request.side, "order side") {
+            return RiskDecision::Rejected {
+                reasons: vec![RiskReason::InvalidOrder { error }],
+            };
+        }
         if self.orders.contains_key(&request.id) {
             return RiskDecision::Rejected {
                 reasons: vec![RiskReason::DuplicateOrderId],
@@ -1210,7 +1218,6 @@ impl RiskGate {
 }
 
 fn validate_order(request: &OrderRequest, spot: &SpotInstrument) -> Result<()> {
-    Dir::from_action(request.side, "order side")?;
     if request.price <= Decimal::ZERO {
         return Err(MarginError::invalid_input("price", "must be positive"));
     }

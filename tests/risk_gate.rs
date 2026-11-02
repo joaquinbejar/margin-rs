@@ -1299,6 +1299,33 @@ fn test_submit_other_action_is_rejected_without_reservation() {
     );
     assert_eq!(gate.ledger().snapshot(), before);
     assert_eq!(balance(&gate, "USDC"), (dec!(1000), dec!(0), dec!(1000)));
+    // Nothing recorded: the id is free and a buy under it is admitted.
+    assert!(gate.order(&oid("x")).is_none());
+    assert!(!gate.submit(&buy("x", dec!(100), dec!(1)), 0).is_rejected());
+}
+
+/// `Other` on an id that already exists is the unsupported action, not a
+/// duplicate, and the existing record is untouched.
+#[test]
+fn test_submit_other_action_on_existing_id_leaves_the_record() {
+    let mut gate = gate(dec!(1000), dec!(0), InstrumentLimits::default());
+    assert!(!gate.submit(&buy("o1", dec!(100), dec!(1)), 0).is_rejected());
+    let record = gate.order(&oid("o1")).cloned();
+    let before = gate.ledger().snapshot();
+    let other = OrderRequest::new(oid("o1"), pair(), Action::Other, dec!(100), dec!(1));
+    assert_eq!(
+        gate.submit(&other, 0),
+        RiskDecision::Rejected {
+            reasons: vec![RiskReason::InvalidOrder {
+                error: MarginError::UnsupportedAction {
+                    field: "order side",
+                    action: Action::Other,
+                },
+            }],
+        }
+    );
+    assert_eq!(gate.order(&oid("o1")).cloned(), record);
+    assert_eq!(gate.ledger().snapshot(), before);
 }
 
 /// `on_fill` refuses an `Other` execution first: before the duplicate check

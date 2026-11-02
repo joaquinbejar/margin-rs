@@ -1046,3 +1046,28 @@ mod ledger_fixtures {
         assert_eq!(ledger.settlement_journal(), []);
     }
 }
+
+/// A caller-built `Other` reduction is refused by `intents`, wherever it is
+/// in the plan: every reduction is checked before any intent is built.
+#[test]
+fn test_intents_caller_built_other_reduction_is_unsupported() {
+    let base = plan(
+        &long_btc(dec!(200)),
+        &bids(&[(dec!(94), dec!(4)), (dec!(93), dec!(100))]),
+        &policy(CloseoutTarget::Flat),
+    );
+    assert_eq!(base.reductions.len(), 2);
+    for index in 0..base.reductions.len() {
+        let mut tampered = base.clone();
+        tampered.reductions[index].side = Action::Other;
+        assert_eq!(
+            tampered.intents(),
+            Err(MarginError::UnsupportedAction {
+                field: "reduction side",
+                action: Action::Other,
+            }),
+            "reduction {index}"
+        );
+    }
+    assert!(base.intents().is_ok());
+}

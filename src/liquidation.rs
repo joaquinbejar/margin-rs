@@ -103,6 +103,7 @@ use crate::decimal::grid::{ContractGrid, GridIndex};
 use crate::decimal::{
     MAX_SCALE, Rounding, add, check_scale, mul_div_round, neg, sub, sum, sum_products,
 };
+use crate::direction::Dir;
 use crate::error::{MarginError, Result};
 use crate::ids::{AccountId, Asset, ExecutionId, InstrumentId, OrderId, VenueId};
 use crate::initial_margin::{
@@ -300,9 +301,16 @@ impl LiquidationPlan {
     ///
     /// # Errors
     ///
-    /// [`MarginError::Arithmetic`] if a sum cannot be represented (it is
-    /// at most the position the plan started from).
+    /// - [`MarginError::UnsupportedAction`] if a reduction's side is not
+    ///   `Buy` or `Sell`. Plans built by [`plan_liquidation`] never have one,
+    ///   but the fields are public; every reduction is checked before any
+    ///   intent is built.
+    /// - [`MarginError::Arithmetic`] if a sum cannot be represented (it is
+    ///   at most the position the plan started from).
     pub fn intents(&self) -> Result<Vec<CloseoutIntent>> {
+        for reduction in &self.reductions {
+            Dir::from_action(reduction.side, "reduction side")?;
+        }
         let mut intents: Vec<CloseoutIntent> = self
             .cancels
             .iter()
