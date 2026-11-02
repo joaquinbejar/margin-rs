@@ -64,7 +64,9 @@ rounding, and no partial sum that can overflow while the result does not.
 
 ### Valuation and stress
 - **Mark to market** in one reporting asset with price source and freshness
-  flags; collateral equity that invalid marks can never raise.
+  flags; collateral equity that invalid marks can never raise. Open futures
+  and perpetuals are valued at instrument marks, and collateral counts
+  `cash + sum(upnl)` per settlement asset as one net amount.
 - **PnL attribution** into realized, unrealized and fees, counted once.
 - **Spot inventory stress**: hypothetical fills (hedges), price gaps and a
   liquidation spread.

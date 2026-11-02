@@ -8,6 +8,21 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Valuation and collateral of open futures and perpetuals** (#23, part
+  B): instrument marks (`MarkSet::instruments`, `MarkSet::with_instrument`;
+  per unit of the underlying in the settlement asset). `valuation::value`
+  values each open derivative at `upnl = rhe(Q * M * mark) - basis`
+  (`AccountValuation::derivatives`, `DerivativeValue`), adds it to equity
+  and to the attribution's unrealized PnL, and counts `cash + sum(upnl)`
+  per settlement asset as one net amount in collateral equity; stale or
+  future instrument marks are flagged (`AccountValuation::instrument_flags`)
+  and never add collateral (a gain is excluded, a loss makes it unknown).
+  `collateral::value_collateral` applies the same net per asset
+  (`CollateralLine::unrealized_pnl`, `CollateralValue::instrument_flags`,
+  `MarginError::InvalidInstrumentMark` under `StalePolicy::Reject`).
+  `maintenance::CollateralView::from_valuation` builds the maintenance view
+  from a valuation.
+
 - **Linear futures and perpetuals in the ledger** (#23, part A):
   `LinearTerms`, `LinearFuture`, `LinearPerpetual` and the
   `Instrument::LinearFuture` / `Instrument::LinearPerpetual` variants. A
@@ -56,10 +71,16 @@ follows [Semantic Versioning](https://semver.org/).
   (quantity * multiplier)`: the price per unit of the underlying for a
   derivative. `LedgerSnapshot` has the new fields `funding` and
   `settled_instruments`. Code that builds these structs must set them.
-- `valuation::value` and the stress scenarios refuse an open derivative
-  position with `UnsupportedInstrument` (its unrealized PnL needs
-  instrument marks, part B); flat ones, their realized PnL and funding are
-  valued. The risk gate refuses derivatives with `UnsupportedInstrument` in
+- **Breaking:** `MarkSet` has the new field `instruments`,
+  `AccountValuation` the new fields `derivatives` and `instrument_flags`,
+  `CollateralLine` the new field `unrealized_pnl` and `CollateralValue` the
+  new field `instrument_flags`. `valuation::value` and
+  `collateral::value_collateral` need an instrument mark for every open
+  derivative (`MissingMark` otherwise, never zero); `AssetValue::collateral_value`
+  and `CollateralLine::balance` include the unrealized PnL counted for the
+  asset. The stress scenarios refuse an open derivative with
+  `UnsupportedInstrument` (they shock asset marks only).
+- The risk gate refuses derivatives with `UnsupportedInstrument` in
   `set_limits`, `on_market_data` and `submit` (as `RiskReason::InvalidOrder`).
 - `book_settlement` is kept for derivatives that are not registered in the
   ledger (legacy; documented, not deprecated in code).

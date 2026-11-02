@@ -29,6 +29,13 @@
 //! the exact sum of the lines, `None` when any line is unknown. An invalid
 //! mark therefore only ever lowers collateral or makes it unknown; it
 //! cannot increase spendable collateral.
+//!
+//! The balance of an asset includes the unrealized PnL of the open linear
+//! futures and perpetuals settled in it (`cash + sum(upnl)`, one net
+//! amount, valued at their instrument marks as in [`crate::valuation`]):
+//! the table applies to that net. A gain at an invalid instrument mark is
+//! excluded, a loss at one makes the line unknown, and
+//! [`StalePolicy::Reject`] refuses either.
 
 use std::collections::BTreeMap;
 
@@ -37,8 +44,12 @@ use rust_decimal::Decimal;
 use crate::decimal::{Rounding, add, neg, sub, sum, sum_terms_round};
 use crate::error::{MarginError, Result};
 use crate::ids::Asset;
+use crate::ids::InstrumentId;
 use crate::ledger::LedgerSnapshot;
-use crate::valuation::{Mark, MarkSet, MarkStatus, ValuationPolicy, pricing, validate};
+use crate::valuation::{
+    Mark, MarkSet, MarkStatus, ValuationPolicy, collateral_upnl, derivative_values, net_with_upnl,
+    pricing, validate,
+};
 
 /// Which balance counts as collateral.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -110,8 +121,15 @@ impl CollateralPolicy {
 /// Collateral contribution of one asset.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollateralLine {
-    /// Balance on the policy's basis.
+    /// Balance on the policy's basis, plus the unrealized PnL counted for
+    /// the linear futures and perpetuals settled in this asset.
     pub balance: Decimal,
+    /// Unrealized PnL of the open derivatives settled in this asset that
+    /// the line counts (gains at an invalid instrument mark excluded), as a
+    /// report. `None` when a loss is at an invalid mark (the line `value`
+    /// is then `None` too), or when this sum alone does not fit a `Decimal`
+    /// (the line is still valued: `balance` is the exact net).
+    pub unrealized_pnl: Option<Decimal>,
     /// Mark used, if any.
     pub mark: Option<Mark>,
     /// Status of the mark.
@@ -133,6 +151,9 @@ pub struct CollateralValue {
     pub lines: BTreeMap<Asset, CollateralLine>,
     /// Assets with a non zero balance whose mark is not valid.
     pub flags: BTreeMap<Asset, MarkStatus>,
+    /// Open derivatives whose instrument mark is not valid: their gains
+    /// count nothing and their losses make the line unknown.
+    pub instrument_flags: BTreeMap<InstrumentId, MarkStatus>,
     /// Exact sum of the lines; `None` when a line is unknown.
     pub total: Option<Decimal>,
 }
@@ -147,6 +168,12 @@ pub struct CollateralValue {
 /// - [`MarginError::InvalidInput`] if the mark set prices the reporting
 ///   asset, a haircut is outside `[0, 1]`, or `haircut + extra` exceeds 1.
 /// - [`MarginError::InvalidCollateralMark`] under [`StalePolicy::Reject`].
+/// - [`MarginError::InvalidInstrumentMark`] under [`StalePolicy::Reject`],
+///   for an open derivative with an unrealized PnL at a stale or future
+///   instrument mark.
+/// - [`MarginError::MissingMark`], [`MarginError::InvalidInput`] or
+///   [`MarginError::UnknownInstrument`] for instrument marks, as in
+///   [`crate::valuation::value`].
 /// - [`MarginError::Arithmetic`] if a value cannot be represented.
 #[expect(
     clippy::too_many_lines,
@@ -193,16 +220,49 @@ pub fn value_collateral(
         }
     }
     let pricing = pricing(snapshot, marks, &valuation_policy);
+    let derivatives = derivative_values(snapshot, marks, policy.max_age_ms)?;
+    let mut instrument_flags = BTreeMap::new();
+    for (id, value) in &derivatives {
+        if value.status.is_valid() {
+            continue;
+        }
+        if matches!(policy.stale, StalePolicy::Reject) && !value.unrealized_pnl.is_zero() {
+            return Err(MarginError::InvalidInstrumentMark {
+                instrument: id.clone(),
+            });
+        }
+        instrument_flags.insert(id.clone(), value.status);
+    }
+    let counted_upnl = collateral_upnl(&derivatives);
 
     let mut lines = BTreeMap::new();
     let mut flags = BTreeMap::new();
     let mut line_values = Vec::new();
-    for (asset, balance) in &snapshot.balances {
-        let amount = match policy.basis {
+    // Every asset with a balance row, and every settlement asset of an open
+    // derivative even without one (its balance then counts as zero).
+    let collateral_assets: std::collections::BTreeSet<&Asset> = snapshot
+        .balances
+        .keys()
+        .chain(counted_upnl.keys())
+        .collect();
+    for asset in collateral_assets {
+        let balance = snapshot.balances.get(asset).copied().unwrap_or_default();
+        let held = match policy.basis {
             BalanceBasis::Available => balance.available,
             BalanceBasis::Total => balance.total,
         };
-        if amount.is_zero() {
+        // The cash and the unrealized PnL settled in this asset count as one
+        // net amount; a loss at an invalid instrument mark makes it unknown.
+        let upnl_terms = counted_upnl.get(asset).cloned().unwrap_or(Some(Vec::new()));
+        let known = upnl_terms.is_some();
+        let amount = match &upnl_terms {
+            Some(terms) => net_with_upnl(held, terms)?,
+            None => held,
+        };
+        // The counted unrealized PnL alone, for the report; `None` when the
+        // line is unknown or the sum alone does not fit a Decimal.
+        let unrealized_pnl = upnl_terms.and_then(|terms| sum(&terms, "unrealized pnl").ok());
+        if amount.is_zero() && known {
             continue;
         }
         let status = pricing
@@ -227,6 +287,7 @@ pub fn value_collateral(
         // Factors of the contribution, or None for unknown, or an empty
         // vector for nothing.
         let factors: Option<Vec<Decimal>> = match (status, price, debt) {
+            _ if !known => None,
             (MarkStatus::Valid, Some(p), true) => Some(vec![amount, p]),
             (MarkStatus::Valid, Some(p), false) => match haircut {
                 Some(h) => Some(vec![amount, p, sub(Decimal::ONE, h, "1 - haircut")?]),
@@ -266,6 +327,7 @@ pub fn value_collateral(
             asset.clone(),
             CollateralLine {
                 balance: amount,
+                unrealized_pnl,
                 mark: marks.prices.get(asset).copied(),
                 status,
                 haircut: if debt { None } else { haircut },
@@ -279,6 +341,7 @@ pub fn value_collateral(
         as_of_ms: marks.as_of_ms,
         lines,
         flags,
+        instrument_flags,
         total: total_of(&line_values)?,
     })
 }

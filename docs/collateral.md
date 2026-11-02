@@ -38,9 +38,10 @@ Each line is rounded down once, toward negative infinity. The total is the exact
 
 A derivatives account typically has `collateral = cash + sum(upnl of futures and perps) - sum(option marks of short positions)`, where long options and non-cash assets may count as zero collateral.
 
-This function covers the cash part of that formula:
+This function covers the cash and the futures and perpetuals:
 
 - The cash asset (for example USDC) is the reporting asset, with a 0 % haircut.
 - An asset that must not count is left out of `haircuts`, or given a 100 % haircut.
+- The unrealized PnL of the open linear futures and perpetuals held in the ledger is added to the balance of their settlement asset, as one net amount, at their instrument marks (`MarkSet::instruments`, see `docs/valuation.md`). The asset's haircut and stale policy apply to that net; `CollateralLine::unrealized_pnl` shows what was counted. A gain at a stale or future instrument mark is excluded, a loss at one makes the line unknown, and `StalePolicy::Reject` refuses either with `InvalidInstrumentMark`.
 
-The unrealized PnL of futures and perps and the short option marks come from the derivative positions, which are not in this spot ledger (see `docs/liquidation.md` and #23). An integration adds them to `total`.
+Short option marks are not covered: options are not ledger positions.

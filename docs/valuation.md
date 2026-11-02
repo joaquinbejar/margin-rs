@@ -45,7 +45,25 @@ With `Exclude`, a stale mark above the true price cannot inflate collateral. Wit
   - `fees = sum(fees_paid * price(asset))`.
 - For spot, `equity - net_transfers = realized + unrealized - fees` exactly. Each figure is rounded once, so `rounding_difference` shows the only possible gap. It is zero on grid values.
 
+## Linear futures and perpetuals
+
+An open derivative position is valued at its **instrument mark**, `MarkSet::instruments` (`MarkSet::with_instrument`): the price per unit of the underlying, in the instrument's settlement asset, with the same freshness rules as asset marks.
+
+| Figure | Rule |
+|---|---|
+| unrealized PnL | `upnl = rhe(Q * M * mark) - basis`, rounded once (half-even) to the settlement asset scale, per instrument, listed in `AccountValuation::derivatives` |
+| missing mark | `MissingMark` for an open position (never valued at zero); flat and settled positions need none, and a mark for them is ignored |
+| `equity` | adds `upnl * price(settlement asset)`; a stale or future instrument mark is used and flagged in `AccountValuation::instrument_flags` |
+| `collateral_equity` | `cash + sum(upnl)` per settlement asset, **one net amount**, with the balance rules above applied to the net: a loss nets against the cash, a net debt counts in full |
+| invalid instrument mark | a gain is excluded before netting; a loss makes `collateral_equity` `None` (never offset by cash). Instrument marks are never haircut under `HaircutStale` |
+| attribution | `unrealized` adds `upnl * price(settlement asset)`; realized PnL and funding are already in cash and counted once |
+
+`maintenance::CollateralView::from_valuation` builds the maintenance view from a valuation without recomputing anything: equity and collateral equity on total balances (reservations not deducted), `None` preserved.
+
 ## Stress scenarios
+
+Scenarios shock asset marks, not instrument marks: `stress` refuses an open linear future or perpetual with `UnsupportedInstrument` rather than report it unstressed.
+
 
 `stress` values the snapshot with and without a `Scenario`, applying in this order:
 

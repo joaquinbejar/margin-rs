@@ -207,6 +207,14 @@ pub enum MarginError {
         asset: Asset,
     },
 
+    /// The instrument mark of an open derivative is not valid (stale or
+    /// future) under a collateral policy that rejects invalid marks.
+    #[error("instrument mark of {instrument} is not valid for collateral")]
+    InvalidInstrumentMark {
+        /// Instrument identifier.
+        instrument: InstrumentId,
+    },
+
     /// An open position has no mark price.
     #[error("missing mark price for {instrument}")]
     MissingMark {

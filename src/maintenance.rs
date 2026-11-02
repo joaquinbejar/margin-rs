@@ -33,6 +33,7 @@ use crate::decimal::{neg, sub};
 use crate::error::{MarginError, Result};
 use crate::ids::Asset;
 use crate::initial_margin::{MarginRequirement, RuleId};
+use crate::valuation::AccountValuation;
 
 /// State of an account with respect to its margin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -68,6 +69,34 @@ pub struct CollateralView {
     pub collateral: Option<Decimal>,
     /// Account equity; `None` when unknown.
     pub equity: Option<Decimal>,
+}
+
+impl CollateralView {
+    /// The view of an account valuation, in its reporting asset, without
+    /// recomputing anything: `cash` is the reporting asset's total balance,
+    /// `collateral` the valuation's collateral equity (cash plus the
+    /// unrealized PnL of futures and perpetuals, see
+    /// [`crate::valuation`]) and `equity` its reporting equity, `None`
+    /// preserved, with no new rounding. `cash` is only the reporting asset's
+    /// own balance, not converted equity. Both figures work on total
+    /// balances: reservations are not deducted, so a consumer deducts them
+    /// once, where it applies.
+    ///
+    /// The view carries no mark flags: a consumer that needs them (which
+    /// assets or instruments were valued at an invalid mark) keeps the
+    /// [`AccountValuation`] alongside.
+    #[must_use]
+    pub fn from_valuation(valuation: &AccountValuation) -> Self {
+        Self {
+            currency: valuation.reporting.clone(),
+            cash: valuation
+                .assets
+                .get(&valuation.reporting)
+                .map_or(Decimal::ZERO, |line| line.total),
+            collateral: valuation.collateral_equity,
+            equity: valuation.equity,
+        }
+    }
 }
 
 /// Why an account is not [`AccountState::Healthy`].
