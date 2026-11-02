@@ -634,10 +634,10 @@ fn expired_futures_are_settled_not_liquidated() {
     );
     assert_eq!(
         from_ledger(6, &ledger.snapshot(), &marks, 1000),
-        Err(MarginError::ExecutedAfterExpiry {
+        Err(MarginError::ExpiredUnsettled {
             instrument: iid("BTC-DEC"),
-            executed_at_ms: 1000,
             expiry_ms: 1000,
+            as_of_ms: 1000,
         })
     );
     ledger

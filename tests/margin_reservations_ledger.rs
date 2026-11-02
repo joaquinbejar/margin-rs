@@ -4,7 +4,8 @@
 //! The gate's ledger holds 10000 USDC (6 decimals) and:
 //! - XYZ-PERP and ABC-PERP: perpetuals in USDC, M = 10, mark 2000, so one
 //!   contract needs 2000; both registered with the service;
-//! - OTHER-PERP: perpetual in USDC, M = 1, not registered with the service;
+//! - OTHER-PERP: perpetual in USDC, M = 1, not registered with the service
+//!   (another strategy's position, still margined by the service's hold);
 //! - EUR-PERP: perpetual in EUR, M = 1;
 //! - BTC-USDC: spot.
 
@@ -234,9 +235,118 @@ fn own_and_ledger_positions_agree() {
     gate.ledger().reconcile().expect("reconciles");
 }
 
+/// A derivative the service does not trade is margined and valued like
+/// its own: the hold covers the whole account in USDC.
+///
+/// OTHER-PERP: long 1000 at 100 (M = 1, basis 100000). At mark 100 its
+/// upnl is 0 and its requirement 10000, which takes all the cash.
+#[test]
+fn exposure_outside_the_service_is_margined() {
+    let mut gate = gate();
+    book(
+        &mut gate,
+        &execution("x", "OTHER-PERP", Action::Buy, dec!(100), dec!(1000)),
+    );
+    let mut service = on_ledger();
+    assert_eq!(
+        requirement(&service, &gate),
+        (dec!(10000), dec!(0), dec!(10000))
+    );
+    assert_eq!(
+        reserve(
+            &mut service,
+            &mut gate,
+            order("a", "XYZ-PERP", Action::Buy, dec!(1)),
+            &marks()
+        ),
+        MarginDecision::Rejected {
+            reason: MarginRejection::InsufficientMargin {
+                required: dec!(12000),
+                collateral: dec!(10000),
+                shortfall: dec!(2000),
+            },
+        }
+    );
+    assert_eq!(
+        service.sync_hold(&mut gate, &hold(), &marks()),
+        Ok(dec!(10000))
+    );
+
+    // Mark 110: upnl +10000, requirement 11000. Collateral 0 available +
+    // 10000 held + 10000 = 20000, so 1 XYZ (13000 in all) fits; the hold
+    // takes only the cash.
+    let mut up = marks();
+    up.insert(iid("OTHER-PERP"), dec!(110));
+    assert_eq!(
+        reserve(
+            &mut service,
+            &mut gate,
+            order("g", "XYZ-PERP", Action::Buy, dec!(1)),
+            &up
+        ),
+        MarginDecision::Reserved {
+            required: dec!(13000),
+            reserved: dec!(2000),
+        }
+    );
+    assert_eq!(gate.hold(&hold()), dec!(10000));
+
+    // Mark 90: upnl -10000, requirement 9000; collateral 0. Another XYZ
+    // needs 9000 + 2 XYZ (4000).
+    let mut down = marks();
+    down.insert(iid("OTHER-PERP"), dec!(90));
+    assert_eq!(
+        reserve(
+            &mut service,
+            &mut gate,
+            order("l", "XYZ-PERP", Action::Buy, dec!(1)),
+            &down
+        ),
+        MarginDecision::Rejected {
+            reason: MarginRejection::InsufficientMargin {
+                required: dec!(13000),
+                collateral: dec!(0),
+                shortfall: dec!(13000),
+            },
+        }
+    );
+
+    // A fill of g: the requirement counts OTHER-PERP too.
+    book(
+        &mut gate,
+        &execution("f", "XYZ-PERP", Action::Buy, dec!(2000), dec!(1)),
+    );
+    assert_eq!(
+        service.apply_booked_fill(&mut gate, &oid("g"), &eid("f"), &up),
+        Ok(BookedFill::Applied {
+            contracts: dec!(1),
+            remaining: dec!(0),
+            overfill: None,
+            required: dec!(13000),
+            hold: dec!(10000),
+        })
+    );
+    // sync_hold reports that 12000 (at 100) is not covered by 10000.
+    assert!(matches!(
+        service.sync_hold(&mut gate, &hold(), &marks()),
+        Err(MarginError::InsufficientBalance { .. })
+    ));
+    let mut missing = marks();
+    missing.remove(&iid("OTHER-PERP"));
+    assert_eq!(
+        service.requirement_with_gate(&gate, &missing),
+        Err(MarginError::MissingMark {
+            instrument: iid("OTHER-PERP"),
+        })
+    );
+}
+
 /// A loss on a derivative the service does not trade lowers collateral.
-/// OTHER-PERP: long 10 at 100 (basis 1000), mark 90: upnl -100, so
-/// collateral is 10000 - 100 = 9900 and 5 XYZ (10000) no longer fit.
+/// OTHER-PERP: long 10 at 100 (basis 1000).
+/// - Mark 90: upnl -100, requirement 90; collateral 9900 against 5 XYZ
+///   (10000) + 90.
+/// - Mark 100: upnl 0, requirement 100; collateral 10000 against 10100.
+/// - Mark 90 again, 4 XYZ: 8090 fits in 9900.
 #[test]
 fn a_loss_outside_the_service_lowers_collateral() {
     let mut gate = gate();
@@ -256,13 +366,12 @@ fn a_loss_outside_the_service_lowers_collateral() {
         ),
         MarginDecision::Rejected {
             reason: MarginRejection::InsufficientMargin {
-                required: dec!(10000),
+                required: dec!(10090),
                 collateral: dec!(9900),
-                shortfall: dec!(100),
+                shortfall: dec!(190),
             },
         }
     );
-    // At 100 there is no loss and the same order fits exactly.
     assert_eq!(
         reserve(
             &mut service,
@@ -270,17 +379,33 @@ fn a_loss_outside_the_service_lowers_collateral() {
             order("b", "XYZ-PERP", Action::Buy, dec!(5)),
             &marks()
         ),
-        MarginDecision::Reserved {
-            required: dec!(10000),
-            reserved: dec!(10000),
+        MarginDecision::Rejected {
+            reason: MarginRejection::InsufficientMargin {
+                required: dec!(10100),
+                collateral: dec!(10000),
+                shortfall: dec!(100),
+            },
         }
     );
-    assert_eq!(gate.hold(&hold()), dec!(10000));
+    assert_eq!(
+        reserve(
+            &mut service,
+            &mut gate,
+            order("c", "XYZ-PERP", Action::Buy, dec!(4)),
+            &losing
+        ),
+        MarginDecision::Reserved {
+            required: dec!(8090),
+            reserved: dec!(8000),
+        }
+    );
+    assert_eq!(gate.hold(&hold()), dec!(8090));
 }
 
 /// A gain counts as collateral but is never held: the hold is capped at
-/// the cash. OTHER-PERP long 10 at 100, mark 200: upnl +1000, collateral
-/// 11000; 5 XYZ + 0.5 more would need 11000, accepted, hold 10000.
+/// the cash. OTHER-PERP long 10 at 100, mark 200: upnl +1000, requirement
+/// 200, collateral 11000. 5 XYZ at 2160 need 10800, 11000 in all:
+/// accepted, hold 10000.
 #[test]
 fn a_gain_counts_but_the_hold_takes_only_cash() {
     let mut gate = gate();
@@ -291,8 +416,7 @@ fn a_gain_counts_but_the_hold_takes_only_cash() {
     let mut service = on_ledger();
     let mut winning = marks();
     winning.insert(iid("OTHER-PERP"), dec!(200));
-    winning.insert(iid("XYZ-PERP"), dec!(2200));
-    // 5 XYZ at 2200: 5 * 10 * 2200 * 10 % = 11000.
+    winning.insert(iid("XYZ-PERP"), dec!(2160));
     assert_eq!(
         reserve(
             &mut service,
@@ -302,7 +426,7 @@ fn a_gain_counts_but_the_hold_takes_only_cash() {
         ),
         MarginDecision::Reserved {
             required: dec!(11000),
-            reserved: dec!(11000),
+            reserved: dec!(10800),
         }
     );
     assert_eq!(gate.hold(&hold()), dec!(10000));

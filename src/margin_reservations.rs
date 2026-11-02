@@ -58,14 +58,19 @@
 //!   one atomic step; a fill that is not booked yet is
 //!   [`MarginError::FillNotBooked`] and changes nothing;
 //! - the hold is the service's own [`ReservationId`], fixed at
-//!   construction;
+//!   construction, and covers the whole account in the settlement asset:
+//!   the requirement margins the registered instruments (with their
+//!   orders) and every other open linear future or perpetual of the ledger
+//!   settled in that asset, with the ledger's terms. Use one such service
+//!   per account and settlement asset;
 //! - collateral is `available + own hold + sum(upnl)` in the settlement
 //!   asset, one exact sum, where the unrealized PnL covers **every** open
 //!   linear future or perpetual in the ledger settled in that asset, the
 //!   ones this service does not trade included: a loss on another
 //!   instrument is never left out. Each needs a positive mark;
 //! - every registered instrument must be a linear future or perpetual of
-//!   the ledger with the same settlement asset and multiplier;
+//!   the ledger with the same product, settlement asset and multiplier;
+//!   orders can only be placed on registered instruments;
 //! - the operations of the other mode
 //!   ([`MarginReservationService::reserve`],
 //!   [`MarginReservationService::requirement`],
@@ -103,7 +108,7 @@ use crate::ids::{AccountId, Asset, ExecutionId, InstrumentId, OrderId, Reservati
 use crate::initial_margin::{
     ExposurePosition, ExposureView, InitialMarginModel, MarginRequirement, ProductKind,
 };
-use crate::instrument::{Instrument, PositionKind};
+use crate::instrument::{Instrument, LinearTerms};
 use crate::ledger::{Action, LedgerSnapshot};
 use crate::risk::RiskGate;
 use crate::valuation::net_with_upnl;
@@ -316,58 +321,86 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
         }
     }
 
-    /// Positions of the registered instruments: the service's own, or the
-    /// ledger's, after checking each registered instrument against the
-    /// ledger's definition.
-    fn positions_in(&self, snapshot: &LedgerSnapshot) -> Result<BTreeMap<InstrumentId, Decimal>> {
-        match &self.mode {
-            Mode::Own(positions) => Ok(positions.clone()),
-            Mode::OnLedger(_) => {
-                let mut positions = BTreeMap::new();
-                for (id, registered) in &self.instruments {
-                    let instrument = snapshot.instruments.get(id).ok_or_else(|| {
-                        MarginError::UnknownInstrument {
-                            instrument: id.clone(),
-                        }
-                    })?;
-                    let product = match instrument.kind() {
-                        PositionKind::LinearFuture => ProductKind::LinearFuture,
-                        PositionKind::LinearPerpetual => ProductKind::LinearPerpetual,
-                        PositionKind::Spot => {
-                            return Err(MarginError::invalid_input(
-                                "instrument",
-                                "is not a linear future or perpetual in the ledger",
-                            ));
-                        }
-                    };
-                    if product != registered.product {
-                        return Err(MarginError::invalid_input(
-                            "product",
-                            "differs from the ledger instrument",
-                        ));
-                    }
-                    if instrument.quote() != &registered.settlement {
-                        return Err(MarginError::CurrencyMismatch {
-                            field: "settlement",
-                            expected: instrument.quote().clone(),
-                            found: registered.settlement.clone(),
-                        });
-                    }
-                    if instrument.multiplier() != registered.multiplier {
-                        return Err(MarginError::invalid_input(
-                            "multiplier",
-                            "differs from the ledger instrument",
-                        ));
-                    }
-                    let quantity = snapshot
-                        .positions
-                        .get(id)
-                        .map_or(Decimal::ZERO, |p| p.quantity);
-                    positions.insert(id.clone(), quantity);
-                }
-                Ok(positions)
-            }
+    /// The instruments the requirement covers, with their terms and
+    /// current positions.
+    ///
+    /// - Own positions: the registered instruments.
+    /// - On the ledger: the registered instruments, each checked against
+    ///   the ledger's definition, and every other open linear future or
+    ///   perpetual of the ledger settled in the service's asset, with the
+    ///   ledger's terms: the hold covers the whole account in that asset.
+    fn book_in(&self, snapshot: &LedgerSnapshot) -> Result<Book> {
+        if let Mode::Own(_) = self.mode {
+            return Ok(self.own_book());
         }
+        let quantity = |id: &InstrumentId| {
+            snapshot
+                .positions
+                .get(id)
+                .map_or(Decimal::ZERO, |p| p.quantity)
+        };
+        let mut book = Book::new();
+        for (id, registered) in &self.instruments {
+            let instrument =
+                snapshot
+                    .instruments
+                    .get(id)
+                    .ok_or_else(|| MarginError::UnknownInstrument {
+                        instrument: id.clone(),
+                    })?;
+            let Some((product, terms)) = linear(instrument) else {
+                return Err(MarginError::invalid_input(
+                    "instrument",
+                    "is not a linear future or perpetual in the ledger",
+                ));
+            };
+            if product != registered.product {
+                return Err(MarginError::invalid_input(
+                    "product",
+                    "differs from the ledger instrument",
+                ));
+            }
+            if terms.settlement() != &registered.settlement {
+                return Err(MarginError::CurrencyMismatch {
+                    field: "settlement",
+                    expected: terms.settlement().clone(),
+                    found: registered.settlement.clone(),
+                });
+            }
+            if terms.multiplier() != registered.multiplier {
+                return Err(MarginError::invalid_input(
+                    "multiplier",
+                    "differs from the ledger instrument",
+                ));
+            }
+            book.insert(id.clone(), (registered.clone(), quantity(id)));
+        }
+        let currency = self.settlement()?;
+        for (id, position) in &snapshot.positions {
+            if position.quantity.is_zero() || book.contains_key(id) {
+                continue;
+            }
+            let instrument =
+                snapshot
+                    .instruments
+                    .get(id)
+                    .ok_or_else(|| MarginError::UnknownInstrument {
+                        instrument: id.clone(),
+                    })?;
+            let Some((product, terms)) = linear(instrument) else {
+                continue;
+            };
+            if terms.settlement() != &currency {
+                continue;
+            }
+            let margined = MarginInstrument {
+                product,
+                settlement: currency.clone(),
+                multiplier: terms.multiplier(),
+            };
+            book.insert(id.clone(), (margined, position.quantity));
+        }
+        Ok(book)
     }
 
     /// Registers an instrument the account may trade.
@@ -413,8 +446,9 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
     /// [`MarginError::WrongReservationMode`] on the ledger (use
     /// [`MarginReservationService::requirement_with_gate`]).
     pub fn requirement(&self, marks: &BTreeMap<InstrumentId, Decimal>) -> Result<MarginState> {
-        let positions = self.own_positions("requirement")?;
-        self.state(&self.orders, positions, marks)
+        self.own_positions("requirement")?;
+        let book = self.own_book();
+        self.state(&self.orders, &book, marks)
     }
 
     /// Requirement of positions and live orders at `marks`, with the
@@ -426,24 +460,43 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
     /// As [`MarginReservationService::requirement`], plus, on the ledger,
     /// [`MarginError::UnknownInstrument`], [`MarginError::InvalidInput`] or
     /// [`MarginError::CurrencyMismatch`] for a registered instrument that
-    /// differs from the ledger's.
+    /// differs from the ledger's, and [`MarginError::MissingMark`] for any
+    /// open derivative in the settlement asset without a mark, registered
+    /// or not.
     pub fn requirement_with_gate(
         &self,
         gate: &RiskGate,
         marks: &BTreeMap<InstrumentId, Decimal>,
     ) -> Result<MarginState> {
-        let positions = self.positions_in(&gate.ledger().snapshot())?;
-        self.state(&self.orders, &positions, marks)
+        let book = self.book_in(&gate.ledger().snapshot())?;
+        self.state(&self.orders, &book, marks)
+    }
+
+    /// The book of a service with its own positions.
+    fn own_book(&self) -> Book {
+        let positions = match &self.mode {
+            Mode::Own(positions) => Some(positions),
+            Mode::OnLedger(_) => None,
+        };
+        self.instruments
+            .iter()
+            .map(|(id, terms)| {
+                let position = positions
+                    .and_then(|p| p.get(id).copied())
+                    .unwrap_or_default();
+                (id.clone(), (terms.clone(), position))
+            })
+            .collect()
     }
 
     fn state(
         &self,
         orders: &BTreeMap<OrderId, PendingOrder>,
-        positions: &BTreeMap<InstrumentId, Decimal>,
+        book: &Book,
         marks: &BTreeMap<InstrumentId, Decimal>,
     ) -> Result<MarginState> {
-        let worst = self.view(orders, positions, marks, true)?;
-        let current = self.view(orders, positions, marks, false)?;
+        let worst = self.view(orders, book, marks, true)?;
+        let current = self.view(orders, book, marks, false)?;
         let worst = self.model.requirement(&worst)?;
         let current = self.model.requirement(&current)?;
         let pending = sub(worst.initial, current.initial, "worst - positions")?;
@@ -459,7 +512,7 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
     fn view(
         &self,
         orders: &BTreeMap<OrderId, PendingOrder>,
-        positions_now: &BTreeMap<InstrumentId, Decimal>,
+        book: &Book,
         marks: &BTreeMap<InstrumentId, Decimal>,
         with_orders: bool,
     ) -> Result<ExposureView> {
@@ -477,8 +530,8 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
             }
         }
         let mut positions = Vec::new();
-        for (id, instrument) in &self.instruments {
-            let position = positions_now.get(id).copied().unwrap_or_default();
+        for (id, (instrument, position)) in book {
+            let position = *position;
             let open_buys = sum(buys.get(id).map_or(&[][..], Vec::as_slice), "open buys")?;
             let open_sells = sum(sells.get(id).map_or(&[][..], Vec::as_slice), "open sells")?;
             let long = add(position, open_buys, "position + buys")?;
@@ -530,10 +583,11 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
         collateral: Option<Decimal>,
         marks: &BTreeMap<InstrumentId, Decimal>,
     ) -> Result<MarginDecision> {
-        let positions = self.own_positions("reserve")?;
+        self.own_positions("reserve")?;
         // Refused before the order id is used and before any change.
         Dir::from_action(order.side, "order side")?;
-        let (decision, candidate) = self.decide(&order, collateral, positions, marks)?;
+        let book = self.own_book();
+        let (decision, candidate) = self.decide(&order, collateral, &book, marks)?;
         self.seen_orders.insert(order.id);
         if let Some(orders) = candidate {
             self.orders = orders;
@@ -545,15 +599,10 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
     /// position, and its size is at most `|position|` minus the live
     /// reducing orders already resting on that instrument, so no
     /// combination of fills can flip or extend the position.
-    fn is_risk_reducing(
-        &self,
-        order: &MarginOrder,
-        positions: &BTreeMap<InstrumentId, Decimal>,
-    ) -> Result<bool> {
-        let position = positions
+    fn is_risk_reducing(&self, order: &MarginOrder, book: &Book) -> Result<bool> {
+        let position = book
             .get(&order.instrument)
-            .copied()
-            .unwrap_or_default();
+            .map_or(Decimal::ZERO, |(_, position)| *position);
         let reducing_side = match position.cmp(&Decimal::ZERO) {
             core::cmp::Ordering::Greater => Action::Sell,
             core::cmp::Ordering::Less => Action::Buy,
@@ -581,7 +630,7 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
         &self,
         order: &MarginOrder,
         collateral: Option<Decimal>,
-        positions: &BTreeMap<InstrumentId, Decimal>,
+        book: &Book,
         marks: &BTreeMap<InstrumentId, Decimal>,
     ) -> Result<(MarginDecision, Option<BTreeMap<OrderId, PendingOrder>>)> {
         let reject = |reason| Ok((MarginDecision::Rejected { reason }, None));
@@ -597,7 +646,7 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
         let Some(collateral) = collateral else {
             return reject(MarginRejection::CollateralUnknown);
         };
-        let before = match self.state(&self.orders, positions, marks) {
+        let before = match self.state(&self.orders, book, marks) {
             Ok(state) => state,
             Err(MarginError::MissingMark { instrument }) => {
                 return reject(MarginRejection::MissingMark { instrument });
@@ -612,7 +661,7 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
                 order: order.clone(),
             },
         );
-        let after = match self.state(&with_order, positions, marks) {
+        let after = match self.state(&with_order, book, marks) {
             Ok(state) => state,
             Err(MarginError::MissingMark { instrument }) => {
                 return reject(MarginRejection::MissingMark { instrument });
@@ -621,7 +670,7 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
         };
         // Risk reducing exception: accepted
         // whatever the collateral, even when under margined.
-        if after.total > collateral && !self.is_risk_reducing(order, positions)? {
+        if after.total > collateral && !self.is_risk_reducing(order, book)? {
             return reject(MarginRejection::InsufficientMargin {
                 required: after.total,
                 collateral,
@@ -804,8 +853,8 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
             entry.remaining = remaining;
         }
         let currency = self.settlement()?;
-        let positions = self.positions_in(&snapshot)?;
-        let required = self.state(&orders, &positions, marks)?.total;
+        let book = self.book_in(&snapshot)?;
+        let required = self.state(&orders, &book, marks)?.total;
         let cash = Self::cash_collateral_of(&snapshot, &hold, &currency)?;
         let new_hold = required.min(cash.max(Decimal::ZERO));
         gate.set_hold(&hold, currency, new_hold)?;
@@ -873,7 +922,7 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
         let hold = self.hold_id(hold)?.clone();
         let currency = self.settlement()?;
         let snapshot = gate.ledger().snapshot();
-        let positions = self.positions_in(&snapshot)?;
+        let book = self.book_in(&snapshot)?;
         let (cash, upnl) = self.gate_collateral(&snapshot, &hold, &currency, marks)?;
         // Decide without changing anything, set the hold, and only then
         // commit the order: on any error neither the service nor the gate
@@ -881,7 +930,7 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
         let (decision, candidate) = match upnl {
             Ok(terms) => {
                 let collateral = net_with_upnl(cash, &terms)?;
-                self.decide(&order, Some(collateral), &positions, marks)?
+                self.decide(&order, Some(collateral), &book, marks)?
             }
             Err(instrument) => (
                 MarginDecision::Rejected {
@@ -957,16 +1006,14 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
             if position.quantity.is_zero() {
                 continue;
             }
-            let terms_of = match snapshot.instruments.get(id) {
-                Some(Instrument::Spot(_)) => continue,
-                Some(derivative) => derivative.linear_terms(),
-                None => {
-                    return Err(MarginError::UnknownInstrument {
+            let instrument =
+                snapshot
+                    .instruments
+                    .get(id)
+                    .ok_or_else(|| MarginError::UnknownInstrument {
                         instrument: id.clone(),
-                    });
-                }
-            };
-            let Some(contract) = terms_of else {
+                    })?;
+            let Some((_, contract)) = linear(instrument) else {
                 continue;
             };
             if contract.settlement() != currency {
@@ -1030,6 +1077,21 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
                 pending.remaining
             }
             None => Decimal::ZERO,
+        }
+    }
+}
+
+/// Instruments with their terms and current positions.
+type Book = BTreeMap<InstrumentId, (MarginInstrument, Decimal)>;
+
+/// The product and terms of a linear future or perpetual; `None` for spot.
+/// Exhaustive, so a new kind of instrument must be decided here.
+fn linear(instrument: &Instrument) -> Option<(ProductKind, &LinearTerms)> {
+    match instrument {
+        Instrument::Spot(_) => None,
+        Instrument::LinearFuture(future) => Some((ProductKind::LinearFuture, future.terms())),
+        Instrument::LinearPerpetual(perpetual) => {
+            Some((ProductKind::LinearPerpetual, perpetual.terms()))
         }
     }
 }

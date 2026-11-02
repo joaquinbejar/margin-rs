@@ -206,8 +206,8 @@ impl LiquidationAccount {
     ///   positive.
     /// - [`MarginError::CurrencyMismatch`] for an open derivative settled in
     ///   another asset.
-    /// - [`MarginError::ExecutedAfterExpiry`] for an open future whose
-    ///   expiry is at or before `as_of_ms`.
+    /// - [`MarginError::ExpiredUnsettled`] for an open future whose expiry
+    ///   is at or before `as_of_ms`.
     /// - [`MarginError::MissingMark`] for an open derivative without a mark.
     /// - [`MarginError::PrecisionExceeded`] for a mark with more than 18
     ///   decimals.
@@ -244,10 +244,10 @@ impl LiquidationAccount {
                 Some(Instrument::Spot(_)) => continue,
                 Some(Instrument::LinearFuture(future)) => {
                     if future.expiry_ms() <= as_of_ms {
-                        return Err(MarginError::ExecutedAfterExpiry {
+                        return Err(MarginError::ExpiredUnsettled {
                             instrument: id.clone(),
-                            executed_at_ms: as_of_ms,
                             expiry_ms: future.expiry_ms(),
+                            as_of_ms,
                         });
                     }
                     (ProductKind::LinearFuture, future.terms())

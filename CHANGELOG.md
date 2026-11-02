@@ -12,18 +12,20 @@ follows [Semantic Versioning](https://semver.org/).
   `LiquidationAccount::from_ledger` builds the closeout account from a
   `LedgerSnapshot` (every open future and perpetual in the plan's currency,
   the total cash, the ledger's basis; spot left out; derivatives in another
-  asset, missing or non positive marks and expired futures are errors), and
+  asset, missing or non positive marks and expired unsettled futures are
+  errors), and
   `ForcedReduction::execution` books each forced fill back as a mandatory
   `Execution`, so the booked plan leaves exactly `plan.after`.
   `MarginReservationService::on_ledger` reads positions from the gate's
-  ledger, counts the unrealized PnL of every open derivative in the
-  settlement asset as collateral, uses its own fixed hold, and takes fills
+  ledger, margins and values every open derivative in the settlement asset
+  (registered or not; its hold covers the whole account in that asset),
+  uses its own fixed hold, and takes fills
   already booked (`apply_booked_fill`, which flags overfills and sets the
   hold atomically, returning `BookedFill`; `requirement_with_gate`).
   `RiskGate::book_derivative_execution`, `RiskGate::book_funding` and
   `RiskGate::settle_expiry` post derivative executions, funding and expiries
-  through the gate. New errors: `MarginError::FillNotBooked` and
-  `MarginError::WrongReservationMode`.
+  through the gate. New errors: `MarginError::FillNotBooked`,
+  `MarginError::WrongReservationMode` and `MarginError::ExpiredUnsettled`.
 
 - **Valuation and collateral of open futures and perpetuals** (#23, part
   B): instrument marks (`MarkSet::instruments`, `MarkSet::with_instrument`;
