@@ -279,7 +279,7 @@ fn exposure_validation() {
     assert!(portfolio_variance(&[], &cov, 6).is_err());
 }
 
-/// M302-C1: positive semidefiniteness is decided exactly, even when the
+/// Positive semidefiniteness is decided exactly, even when the
 /// determinant is not a representable Decimal.
 #[test]
 fn psd_check_is_exact_at_any_scale() {
@@ -305,7 +305,7 @@ fn psd_check_is_exact_at_any_scale() {
     ));
 }
 
-/// M302-C1: `from_correlation` builds rho * `sigma_i` * `sigma_j` as one exact
+/// `from_correlation` builds rho * `sigma_i` * `sigma_j` as one exact
 /// product. rho = 0.123456789012345 times sigma 1e-14 needs 29 digits, but
 /// times sigma 1e14 as well it is rho itself.
 #[test]
@@ -321,7 +321,7 @@ fn correlation_products_are_exact() {
     assert_eq!(cov.get(0, 0), Some(Decimal::new(1, 28)));
 }
 
-/// M302-C2: netting is exact and order independent. MAX + 0.1 - MAX on one
+/// Netting is exact and order independent. MAX + 0.1 - MAX on one
 /// factor with variance 1 nets to 0.1, variance 0.01, in every order.
 #[test]
 fn netting_is_exact_in_any_order() {
@@ -355,7 +355,7 @@ fn unrepresentable_covariance_is_invalid() {
     );
 }
 
-/// M302-C3: many exposures net per factor first, so cost is linear in the
+/// Many exposures net per factor first, so cost is linear in the
 /// number of exposures. 100000 exposures of +1 and -1 on two factors plus
 /// one of 1000 on A: net (1000, 0), variance 1000^2 * 0.0004 = 400.
 #[test]

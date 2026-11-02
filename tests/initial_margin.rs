@@ -467,7 +467,7 @@ fn primary_specification_example() {
     assert_eq!(im(dec!(5)), dec!(50));
 }
 
-/// M303B-C1: only the full notional must be representable.
+/// Only the full notional must be representable.
 ///
 /// Qc = MAX, M = 2, mark = 0.1: |Qc| * M overflows but the notional is
 /// MAX / 5 = 15845632502852867518708790067, im 1584563250285286751870879006.7.

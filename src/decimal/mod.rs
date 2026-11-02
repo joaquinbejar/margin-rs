@@ -528,7 +528,7 @@ mod tests {
         assert_eq!(r(dec!(-2.1), Rounding::AwayFromZero), Ok(dec!(-3)));
     }
 
-    /// M104-1: a sum that `rust_decimal` rounds (and whose inverse
+    /// A sum that `rust_decimal` rounds (and whose inverse
     /// subtraction rounds back) is rejected, in both orders and signs.
     #[test]
     fn sums_rounded_by_rust_decimal_are_rejected_in_both_orders_and_signs() {
@@ -642,7 +642,7 @@ mod tests {
         );
     }
 
-    /// M104-2: 3 * 1 / 2000000000000000001 at 18 digits is strictly below
+    /// 3 * 1 / 2000000000000000001 at 18 digits is strictly below
     /// 1.5e-18, so half even gives 1e-18 (rounding the 28 digit quotient
     /// first would give 2e-18). Neighbours of the exact half are checked
     /// too.
@@ -710,7 +710,7 @@ mod tests {
 
     #[test]
     fn exact_sum_of_products() {
-        // M104-3: MAX + 0.1 - MAX at rate 1 is 0.1, not 0.
+        // MAX + 0.1 - MAX at rate 1 is 0.1, not 0.
         assert_eq!(
             sum_products_round(
                 &[

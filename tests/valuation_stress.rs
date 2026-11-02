@@ -411,7 +411,7 @@ fn sell_btc(quantity: Decimal) -> HypotheticalFill {
     }
 }
 
-/// M208-1 / C1: a debt always counts against collateral.
+/// A debt always counts against collateral.
 ///
 /// From the long of 2 BTC (USDC 799.8), a hypothetical sale of 3 BTC at 100
 /// leaves USDC 1099.8 and BTC -1. With a fresh BTC mark of 100, equity and
@@ -454,7 +454,7 @@ fn debts_count_against_collateral_whatever_the_mark() {
     assert_eq!(r.stressed.collateral_equity, Some(dec!(949.8)));
 }
 
-/// M208-1: the reviewer's hedge on another quote asset.
+/// A hedge on another quote asset.
 ///
 /// 1000 USDC; BTC-USDT; BTC mark valid at 100, USDT stale. A hypothetical
 /// buy of 1 BTC at 100 USDT creates a 100 USDT debt: collateral is unknown
@@ -529,7 +529,7 @@ fn overdrawing_fees_and_debt_liquidation() {
     assert_eq!(r.stressed.equity, Some(dec!(998.8)));
 }
 
-/// M208-C2: a closed position needs no base mark for its attribution.
+/// A closed position needs no base mark for its attribution.
 ///
 /// Sell the 2 BTC at 110 without fee: USDC 1019.8, BTC 0, realized 20. No
 /// BTC mark is needed: equity 1019.8, attribution (20, 0, 0.2), clean.

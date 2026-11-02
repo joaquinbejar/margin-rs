@@ -359,7 +359,7 @@ fn rejection_reasons() {
     assert_eq!(total(&service), (dec!(0), dec!(0), dec!(0)));
 }
 
-/// C1: an execution id reused for another order or quantity is a typed
+/// An execution id reused for another order or quantity is a typed
 /// conflict and changes nothing; the identical repeat is a no-op.
 #[test]
 fn conflicting_fill_ids_are_rejected() {
@@ -432,7 +432,7 @@ mod with_gate {
         ReservationId::new("margin:acct").expect("id")
     }
 
-    /// C2, margin first: a margin plan of 6000 becomes a ledger hold, so a
+    /// Margin first: a margin plan of 6000 becomes a ledger hold, so a
     /// spot buy of 5000 then finds only 4000 available.
     #[test]
     fn margin_first_blocks_the_same_cash_for_spot() {
@@ -470,7 +470,7 @@ mod with_gate {
         gate.ledger().reconcile().expect("reconciles");
     }
 
-    /// C2, spot first: a spot buy reserves 5000, so a margin plan of 6000
+    /// Spot first: a spot buy reserves 5000, so a margin plan of 6000
     /// sees 5000 of collateral and is rejected.
     #[test]
     fn spot_first_blocks_the_same_cash_for_margin() {
@@ -518,7 +518,7 @@ mod with_gate {
         );
     }
 
-    /// C3: `reserve_with_gate` is atomic. If the hold cannot be set (here
+    /// `reserve_with_gate` is atomic. If the hold cannot be set (here
     /// its id collides with an order id of the gate), neither the service
     /// nor the gate changes and the order id stays unused.
     #[test]
@@ -667,7 +667,7 @@ mod with_gate {
     }
 }
 
-/// M303C-1: risk reducing orders are accepted
+/// Risk reducing orders are accepted
 /// when under margined; flips and aggregate over-reduction are not.
 ///
 /// Long 10 XYZ (20000) with collateral 10000.
