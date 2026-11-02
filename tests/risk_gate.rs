@@ -1103,7 +1103,7 @@ fn anomaly_and_overdraft_are_both_recorded() {
     assert_eq!(
         gate.order(&oid("o1"))
             .map(margin_rs::risk::OrderRecord::remaining),
-        Some(dec!(0))
+        Some(Ok(dec!(0)))
     );
     gate.resume();
     assert_eq!(gate.halted(), None);
@@ -1251,4 +1251,25 @@ fn overdraft_halt_withdraws_and_duplicates_do_not() {
     let again = gate.on_fill(&oid("o1"), &report(e1, dec!(1))).expect("dup");
     assert!(!again.booking.is_new());
     assert_eq!(again.withdraw, [] as [margin_rs::OrderId; 0]);
+}
+
+/// `OrderRecord` fields are public, so `remaining` cannot assume the gate's
+/// invariants: a difference that cannot be represented is a typed error,
+/// never a panic.
+#[test]
+fn test_remaining_unrepresentable_difference_is_arithmetic_error() {
+    let mut gate = gate(dec!(1000), dec!(0), InstrumentLimits::default());
+    gate.submit(&buy("o1", dec!(100), dec!(1)), 0);
+    let mut record = gate.order(&oid("o1")).expect("record").clone();
+    assert_eq!(record.remaining(), Ok(dec!(1)));
+    record.quantity = Decimal::MAX;
+    record.filled = Decimal::MIN;
+    assert!(matches!(
+        record.remaining(),
+        Err(MarginError::Arithmetic { .. })
+    ));
+    // Overfilled: zero, never negative.
+    record.quantity = dec!(1);
+    record.filled = dec!(2);
+    assert_eq!(record.remaining(), Ok(dec!(0)));
 }

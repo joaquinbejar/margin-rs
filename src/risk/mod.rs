@@ -297,15 +297,19 @@ pub struct OrderRecord {
 }
 
 impl OrderRecord {
-    /// Quantity still open: zero once filled, and never negative, even
-    /// after an overfill (where `filled > quantity`).
-    #[must_use]
-    #[expect(
-        clippy::arithmetic_side_effects,
-        reason = "quantity and filled are non-negative and on the instrument's quantity scale (the gate checks the quantity at admission and the ledger checks every fill before it is counted), so their difference is exact and cannot overflow"
-    )]
-    pub fn remaining(&self) -> Decimal {
-        (self.quantity - self.filled).max(Decimal::ZERO)
+    /// Quantity still open: `quantity - filled`, zero once filled, and never
+    /// negative, even after an overfill (where `filled > quantity`).
+    ///
+    /// # Errors
+    ///
+    /// [`MarginError::Arithmetic`] if `quantity - filled` cannot be
+    /// represented exactly. Records kept by the [`RiskGate`] never fail, but
+    /// the fields are public, so any values can be passed.
+    pub fn remaining(&self) -> Result<Decimal> {
+        if self.filled >= self.quantity {
+            return Ok(Decimal::ZERO);
+        }
+        sub(self.quantity, self.filled, "quantity - filled")
     }
 
     fn reservation_id(&self) -> Result<ReservationId> {
@@ -866,8 +870,8 @@ impl RiskGate {
         let mut sells = Vec::new();
         for order in self.live_orders().filter(|o| &o.instrument == instrument) {
             match order.side {
-                Side::Buy => buys.push(order.remaining()),
-                Side::Sell => sells.push(order.remaining()),
+                Side::Buy => buys.push(order.remaining()?),
+                Side::Sell => sells.push(order.remaining()?),
             }
         }
         Ok((sum(&buys, "open buys")?, sum(&sells, "open sells")?))
@@ -1091,7 +1095,7 @@ impl RiskGate {
             ));
         }
 
-        let remaining = order.remaining();
+        let remaining = order.remaining()?;
         let mut anomalies = Vec::new();
         if order.state == OrderState::Filled {
             anomalies.push(ExecutionAnomaly::FillAfterFilled);

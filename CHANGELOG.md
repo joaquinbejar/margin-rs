@@ -24,4 +24,10 @@ follows [Semantic Versioning](https://semver.org/).
 - Negations of `Decimal` amounts go through an exact sign flip, with no
   arithmetic.
 
-No public signature changes.
+- **Breaking:** `OrderRecord::remaining` returns `Result<Decimal>`. Its
+  fields are public, so a record can hold any values, and a difference
+  that cannot be represented is now `MarginError::Arithmetic` instead of a
+  panic. Records kept by the `RiskGate` never fail; an overfilled record
+  still gives zero.
+
+No other public signature changes.
