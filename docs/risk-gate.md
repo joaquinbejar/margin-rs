@@ -56,16 +56,19 @@ The position limits apply to the worst-case position on the order's side:
 
 ## Reservations
 
-Every approved order gets `ReservationTerms`, fixed at admission and stored in its `OrderRecord`. Later `set_limits` calls never change the reservation of a live order, so lowering `max_fee_rate` cannot release budget a live order may still need (M105-3).
+Every approved order gets `ReservationTerms`, fixed at admission and stored in its `OrderRecord`. Later `set_limits` calls never change the reservation of a live order, so lowering `max_fee_rate` or changing `fee_asset` cannot release budget a live order may still need (M105-3).
+
+An order reserves the asset it pays: quote for a buy, base for a sell. `InstrumentLimits::fee_asset` (`FeeAsset::Quote` by default, or `FeeAsset::Base`) says where the venue charges fees. A fee in the asset the order pays is reserved. A fee in the asset the order receives is netted: the ledger books the credit and the fee of a fill in one exact sum per asset, so the fill pays its own fee and never draws on balance held for other orders.
 
 The reservation for `remaining` is `round_up(remaining / lot * per_lot)` on the asset grid.
 
-- **Sell.** `per_lot = lot` of the base asset, so the reservation is the remaining quantity itself. Spot sell fees are assumed to be charged in the quote asset and paid from the proceeds.
+- **Sell.** With fees in quote, `per_lot = lot` of the base asset, so the reservation is the remaining quantity itself; the fee is paid from the proceeds. With fees in base, `per_lot = lot + round_up(r * lot)` on the base grid, `r = max_fee_rate`, assuming that a fill's fee is at most `r` times its quantity, rounded up to the base grid. A fill of `k` lots is charged at most `round_up(r * k * lot) <= k * round_up(r * lot)`, because rounding up is subadditive. The lot is on the base grid (quantity scale at most the base scale), so this single bound is never above the exact one, `lot * (1 + r) + ulp`.
+  - **Cost on a fine lot.** When the lot is the base grid itself (1e-8 BTC on an 8 digit grid), any positive rate rounds up to one unit per lot, so `per_lot = 2 * lot`: a sell of 2 BTC reserves 4 BTC. That is the worst case of the round up fee model (every one lot fill charged one unit). A venue that rounds its fee to nearest or toward zero needs a fee rounding of its own; that is not modelled yet (#38).
 - **Buy.** `per_lot` bounds the quote that one lot can cost in **any** fill at the limit price or better, however the order is fragmented (M105-1). With `x = price * lot` and `r = max_fee_rate`, it is the smaller of two valid bounds:
   - `round_up(x) + round_up(r * round_up(x))`, on the grid, valid because rounding up is subadditive;
   - `(1 + r) * (x + h) + (one ulp if r > 0)`, exact, where `h` is the largest error of the ledger's notional rounding: half an ulp for the half modes, 0 toward zero, one ulp away from zero.
 
-  The fee assumption is that a fill's fee is at most `r` times its booked notional, rounded up to the quote grid, and charged in the quote asset.
+  With fees in quote, the assumption is that a fill's fee is at most `r` times its booked notional, rounded up to the quote grid. With fees in base, the fee is paid from the base the fill credits, so `r` is 0 here and only the notional is reserved: a fill of `q` with a fee `f <= round_up(r * q) <= q` (because `r < 1` and `q` is on the base grid) changes base by `q - f >= 0` in one booking. `set_limits` therefore refuses fees in base with `max_fee_rate >= 1`.
 - **Why it covers any fragmentation.** A fill of `k` lots debits a grid amount of at most `k * per_lot`. The reservation falls by at least the grid floor of `k * per_lot`, so every fill frees at least what it debits, and no sequence of fills exceeds the reservation. `no_fragmentation_exceeds_the_reservation` checks this on 400 pseudo-random cases with no free balance.
 - **Cost of the guarantee.** When `x` is on the quote grid, for example 100 USDC at a 1e-8 BTC lot, nothing is over-reserved. When `x` is off the grid, a fill of one lot really can cost more than `x`. Example: 150.01 at a 1e-8 lot is 1.5001e-6, booked as 2e-6. The bound reserves for that worst case. Choose the instrument's quantity scale to match the venue's real lot to keep it small.
 - **Affordability.** The affordable quantity is `floor(available / per_lot)` lots. It is exact: for a grid value `available`, the rounded-up reservation fits exactly when the unrounded one does.
@@ -142,9 +145,11 @@ The market-maker-rs integration is a separate PR in market-maker-rs (M1-05-INT).
 | `ExecutionReport` `CancelRejected` (already filled) | nothing to do: the fill already ended the order and released the reservation |
 | A fill report arriving after `Canceled` | `on_fill` as usual; it is booked as a late fill |
 | `BacktestConfig::fee_rate` | `InstrumentLimits::max_fee_rate` (at least the rate actually charged) |
+| The asset the venue charges fees in (quote, or base) | `InstrumentLimits::fee_asset` |
 
 ## Out of scope
 
 - Regulatory or venue margin. This gate enforces balances and configured inventory limits only, and does not replace margin rules.
-- Fees charged in the base or a third asset on sells. The gate assumes the quote asset. A sell fee in another asset is still booked correctly by the ledger, but it is not reserved for.
+- Fees charged in a third asset (neither base nor quote), and fees charged in an asset other than `fee_asset`. They are booked by the ledger as mandatory debits from the free balance, and an overdraft halts the gate (`AccountingBreach`), but they are not reserved for.
+- Margin reservations (`margin_reservations`) margin derivative orders, whose fees are in the settlement asset; they have no spot fee path, and `fee_asset` does not apply to them.
 - Market orders. Requests are limit orders; a market order should be submitted with a protective limit (collar).
