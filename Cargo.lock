@@ -70,11 +70,13 @@ checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 
 [[package]]
 name = "financial_types"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1de75afcddcd00783b9f8b163a976e4da8b3af70d18c92978ff1918c97edcd92"
+checksum = "b2274f1dfce6f8c8a3e56ea42e5dfc4132b5450e1ad4c28d78af386db8b062f3"
 dependencies = [
+ "rust_decimal",
  "serde",
+ "thiserror",
 ]
 
 [[package]]
@@ -437,6 +439,7 @@ checksum = "a0181c14ddd6c7b8b0b0132a5f1ea2f32be0d893cd3ea97b6e3b28886b8a3d1c"
 dependencies = [
  "cfg-if",
  "rustversion",
+ "serde",
  "wasm-bindgen-macro",
  "wasm-bindgen-shared",
 ]

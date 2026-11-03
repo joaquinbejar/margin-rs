@@ -6,6 +6,22 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Feature `instruments` (off by default; enables
+  `financial_types/instruments`): `Instrument::from_spec` and
+  `TryFrom<(&InstrumentSpec, InstrumentScales)>` convert a
+  `financial_types` instrument specification (spot, linear and inverse
+  futures and perpetuals) into an `Instrument`, with explicit
+  `instrument::InstrumentScales` and an exact field mapping. New
+  `MarginError` variants under the feature: `UnsupportedSpec` (options)
+  and `ScaleBelowGrid` (a scale below the digits of the price ticks or the
+  lot). See `docs/instrument-specs.md` (#45).
+
+### Changed
+
+- `financial_types` floor raised to 0.3.1.
+
 ## [0.1.0] - 2026-11-03
 
 First release. It describes the crate as it is; the changes made before

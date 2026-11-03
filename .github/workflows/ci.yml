@@ -29,6 +29,23 @@ jobs:
       - name: Doc
         run: make doc
 
+  features:
+    name: feature sets (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # The library alone is checked without dev-dependencies, whose
+      # features unify into every test build.
+      - name: Library, no default features
+        run: cargo check --locked --no-default-features --lib
+      - name: Library, instruments only
+        run: cargo check --locked --no-default-features --features instruments --lib
+      - name: Tests, no default features
+        run: cargo test --locked --no-default-features
+      - name: Tests, instruments only
+        run: cargo test --locked --no-default-features --features instruments
+
   msrv:
     name: MSRV 1.88
     runs-on: ubuntu-latest

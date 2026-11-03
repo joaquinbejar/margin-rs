@@ -139,6 +139,7 @@ rounding, and no partial sum that can overflow while the result does not.
 | `maintenance` | Account state from the maintenance threshold. |
 | `liquidation` | Staged closeout plan with a certified search, from and back to the ledger, and adapter intents. |
 | `decimal` | Exact wide integer arithmetic and the `Rounding` modes. |
+| `instrument` | Ledger instruments: spot, linear and inverse futures and perpetuals; with the `instruments` feature, `Instrument::from_spec` converts a `financial_types` instrument specification. |
 | `error` | `MarginError` and `Result`: the typed error boundary. |
 
 The detailed contracts are in [`docs/`](docs):
@@ -147,7 +148,8 @@ The detailed contracts are in [`docs/`](docs):
 [initial margin](docs/initial-margin.md), [covariance](docs/covariance.md),
 [collateral](docs/collateral.md),
 [margin reservations](docs/margin-reservations.md),
-[maintenance and liquidation](docs/liquidation.md) and the
+[maintenance and liquidation](docs/liquidation.md),
+[instrument specifications](docs/instrument-specs.md) and the
 [exact arithmetic rule](docs/exact-arithmetic.md).
 
 ## Installation
@@ -158,6 +160,12 @@ Add the crate from crates.io:
 [dependencies]
 margin-rs = "0.1"
 ```
+
+### Feature flags
+
+| Feature | Default | Effect |
+|---|---|---|
+| `instruments` | off | `Instrument::from_spec` and `InstrumentScales`: an exact conversion of a `financial_types` instrument specification (spot, linear and inverse futures and perpetuals) into a ledger instrument, with explicit scales and typed errors (`UnsupportedSpec` for options, `ScaleBelowGrid`). Enables `financial_types/instruments`. |
 
 ## Examples
 
@@ -400,7 +408,7 @@ Repositories by the same author that this project depends on, and repositories t
 
 | Repository | Description |
 |------------|-------------|
-| [financial_types](https://github.com/joaquinbejar/financial_types) · [crates.io](https://crates.io/crates/financial_types) | Core financial type definitions for trading systems; margin-rs uses its `Action` for the order and execution direction. |
+| [financial_types](https://github.com/joaquinbejar/financial_types) · [crates.io](https://crates.io/crates/financial_types) | Core financial type definitions for trading systems; margin-rs uses its `Action` for the order and execution direction and, with the `instruments` feature, its instrument specifications. |
 
 ### Used by
 
