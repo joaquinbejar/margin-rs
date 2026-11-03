@@ -6,8 +6,11 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-First release. It describes the crate as it is; the changes made while it
-was unpublished are not listed one by one.
+## [0.1.0] - 2026-11-03
+
+First release. It describes the crate as it is; the changes made before
+the first release are not listed one by one. The earlier 0.0.1 on
+crates.io only reserved the name.
 
 ### Added
 
@@ -198,3 +201,6 @@ was unpublished are not listed one by one.
 - market-maker-rs uses margin-rs optionally through its `margin` feature,
   pinned by git to an earlier revision; updating it to this release is
   pending.
+
+[Unreleased]: https://github.com/joaquinbejar/margin-rs/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/joaquinbejar/margin-rs/releases/tag/v0.1.0
