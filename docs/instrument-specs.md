@@ -38,7 +38,7 @@ The lot is not the risk minimum either. With `min_quantity` unset, the risk gate
 
 ## Errors
 
-The checks run in this order:
+The checks run in this order, after the identifier goes through `InstrumentId::new`. A validated specification's identifier always passes, because both crates apply the same rule (1 to 64 bytes, printable ASCII without whitespace).
 
 1. `UnsupportedSpec` for an option.
 2. `ScaleBelowGrid`.

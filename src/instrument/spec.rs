@@ -124,7 +124,10 @@ impl Instrument {
     ///
     /// # Errors
     ///
-    /// Checked in this order:
+    /// Checked in this order, after the identifier goes through
+    /// [`InstrumentId::new`] (whose rules a valid specification identifier
+    /// already meets, so its [`MarginError::InvalidInput`] cannot occur
+    /// from a validated specification):
     ///
     /// - [`MarginError::UnsupportedSpec`] for an option;
     /// - [`MarginError::ScaleBelowGrid`] if `scales.price_scale` is below
