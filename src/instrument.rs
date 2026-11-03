@@ -13,12 +13,21 @@
 //!   never inferred.
 //!
 //! Options are not ledger instruments yet.
+//!
+//! With the feature `instruments`, `Instrument::from_spec` converts a
+//! `financial_types` instrument specification into an instrument (see the
+//! `spec` module).
 
 use rust_decimal::Decimal;
 
 use crate::decimal::check_configured_scale;
 use crate::error::{MarginError, Result};
 use crate::ids::{Asset, InstrumentId};
+
+#[cfg(feature = "instruments")]
+pub mod spec;
+#[cfg(feature = "instruments")]
+pub use spec::InstrumentScales;
 
 /// Spot instrument: buying `quantity` at `price` receives `quantity` of the
 /// base asset and pays `price * quantity` of the quote asset.

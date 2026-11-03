@@ -301,6 +301,36 @@ pub enum MarginError {
         /// Value stored in the ledger.
         actual: Decimal,
     },
+
+    /// An instrument specification has no ledger instrument (feature
+    /// `instruments`).
+    #[cfg(feature = "instruments")]
+    #[error("{instrument}: a {margining:?} {kind:?} specification has no ledger instrument")]
+    UnsupportedSpec {
+        /// Instrument identifier.
+        instrument: InstrumentId,
+        /// The kind of contract.
+        kind: financial_types::instrument::ContractKind,
+        /// Its margining.
+        margining: financial_types::instrument::Margining,
+    },
+
+    /// A scale of an instrument has fewer digits than the venue grid of its
+    /// specification (feature `instruments`).
+    #[cfg(feature = "instruments")]
+    #[error("{instrument}: {field} {given} is below the {required} digits of the {grid}")]
+    ScaleBelowGrid {
+        /// Instrument identifier.
+        instrument: InstrumentId,
+        /// `price_scale` or `contract_scale`.
+        field: &'static str,
+        /// The grid: `price ticks` or `lot`.
+        grid: &'static str,
+        /// The scale given.
+        given: u32,
+        /// The digits of the grid, trailing zeros ignored.
+        required: u32,
+    },
 }
 
 impl MarginError {
@@ -314,6 +344,42 @@ impl MarginError {
     #[must_use]
     pub const fn arithmetic(operation: &'static str) -> Self {
         Self::Arithmetic { operation }
+    }
+
+    /// Builds [`MarginError::UnsupportedSpec`].
+    #[cfg(feature = "instruments")]
+    #[cold]
+    #[must_use]
+    pub(crate) fn unsupported_spec(
+        instrument: InstrumentId,
+        kind: financial_types::instrument::ContractKind,
+        margining: financial_types::instrument::Margining,
+    ) -> Self {
+        Self::UnsupportedSpec {
+            instrument,
+            kind,
+            margining,
+        }
+    }
+
+    /// Builds [`MarginError::ScaleBelowGrid`].
+    #[cfg(feature = "instruments")]
+    #[cold]
+    #[must_use]
+    pub(crate) fn scale_below_grid(
+        instrument: InstrumentId,
+        field: &'static str,
+        grid: &'static str,
+        given: u32,
+        required: u32,
+    ) -> Self {
+        Self::ScaleBelowGrid {
+            instrument,
+            field,
+            grid,
+            given,
+            required,
+        }
     }
 }
 

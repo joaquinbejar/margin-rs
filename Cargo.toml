@@ -28,15 +28,20 @@ name = "margin_rs"
 path = "src/lib.rs"
 
 [dependencies]
-financial_types = "0.3"
+financial_types = "0.3.1"
 thiserror = "2.0"
 rust_decimal = { version = "1.43", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 rust_decimal_macros = "1.40"
+# The shared, hand computed instrument fixtures (tests/instrument_fixtures.rs).
+financial_types = { version = "0.3.1", features = ["fixtures"] }
 
 [features]
 default = []
+# Conversion of a `financial_types` instrument specification into an
+# `Instrument` (`Instrument::from_spec`).
+instruments = ["financial_types/instruments"]
 
 # The target lint set is a minimum: lints that were already forbid or deny
 # stay at that level.

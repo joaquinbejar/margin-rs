@@ -62,6 +62,12 @@
 //!   booked plan leaves exactly the planned state.
 //! - [`MarginError`] and [`Result`]: the typed error boundary.
 //!
+//! ## Feature flags
+//!
+//! | Feature | Default | Effect |
+//! |---|---|---|
+//! | `instruments` | off | `Instrument::from_spec` and `instrument::InstrumentScales`: an exact conversion of a `financial_types` instrument specification (spot, linear and inverse futures and perpetuals) into an [`Instrument`], with explicit scales and typed errors (`MarginError::UnsupportedSpec` for options, `MarginError::ScaleBelowGrid`). Enables `financial_types/instruments`. |
+//!
 //! ## Policies
 //!
 //! - Edition 2024, MSRV 1.88; CI checks both the latest stable and the MSRV.
