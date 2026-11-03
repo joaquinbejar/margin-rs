@@ -1,4 +1,6 @@
 [![License](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
+[![Crates.io](https://img.shields.io/crates/v/margin-rs.svg)](https://crates.io/crates/margin-rs)
+[![Downloads](https://img.shields.io/crates/d/margin-rs.svg)](https://crates.io/crates/margin-rs)
 [![CI](https://github.com/joaquinbejar/margin-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/joaquinbejar/margin-rs/actions/workflows/ci.yml)
 [![Stars](https://img.shields.io/github/stars/joaquinbejar/margin-rs.svg)](https://github.com/joaquinbejar/margin-rs/stargazers)
 [![Issues](https://img.shields.io/github/issues/joaquinbejar/margin-rs.svg)](https://github.com/joaquinbejar/margin-rs/issues)
@@ -150,11 +152,11 @@ The detailed contracts are in [`docs/`](docs):
 
 ## Installation
 
-The crate is not yet published on crates.io. Depend on it by git:
+Add the crate from crates.io:
 
 ```toml
 [dependencies]
-margin-rs = { git = "https://github.com/joaquinbejar/margin-rs" }
+margin-rs = "0.1"
 ```
 
 ## Examples
@@ -340,8 +342,8 @@ See [docs/exact-arithmetic.md](docs/exact-arithmetic.md).
 
 ## Status and policies
 
-- Version 0.1, not yet published; the API may change before the first
-  release.
+- Version 0.1.0, published on crates.io. Before 1.0 the API may change
+  in a minor version.
 - Rust edition 2024, MSRV 1.88. CI runs the latest stable and the MSRV.
 - Small dependency set: `financial_types`, `thiserror` and `rust_decimal`
   (without default features). margin-rs never depends on market-maker-rs.
