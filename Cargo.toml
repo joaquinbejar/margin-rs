@@ -61,3 +61,6 @@ indexing_slicing = "deny"
 arithmetic_side_effects = "warn"
 # Money, prices and quantities use exact decimal arithmetic; no binary floats.
 float_arithmetic = "deny"
+
+[package.metadata.docs.rs]
+all-features = true
