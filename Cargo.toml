@@ -1,6 +1,6 @@
 [package]
 name = "margin-rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
@@ -61,3 +61,6 @@ indexing_slicing = "deny"
 arithmetic_side_effects = "warn"
 # Money, prices and quantities use exact decimal arithmetic; no binary floats.
 float_arithmetic = "deny"
+
+[package.metadata.docs.rs]
+all-features = true
