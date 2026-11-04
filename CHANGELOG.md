@@ -6,6 +6,8 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-04
+
 ### Added
 
 - Feature `instruments` (off by default; enables
@@ -218,5 +220,6 @@ crates.io only reserved the name.
   pinned by git to an earlier revision; updating it to this release is
   pending.
 
-[Unreleased]: https://github.com/joaquinbejar/margin-rs/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/joaquinbejar/margin-rs/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/joaquinbejar/margin-rs/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/joaquinbejar/margin-rs/releases/tag/v0.1.0
