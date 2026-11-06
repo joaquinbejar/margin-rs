@@ -12,7 +12,11 @@
 //!   unit of the base; that currency is not an asset of the ledger and is
 //!   never inferred.
 //!
-//! Options are not ledger instruments yet.
+//! - An option is held as signed contracts with a multiplier, like a linear
+//!   contract, but its premium is paid in cash at the fill, like a spot
+//!   trade. Its value comes from outside: the ledger takes premium marks and
+//!   settlement outcomes as inputs and prices nothing (see
+//!   [`OptionInstrument`] and `docs/options.md`).
 //!
 //! With the feature `instruments`, `Instrument::from_spec` converts a
 //! `financial_types` instrument specification into an instrument (see the
@@ -20,7 +24,7 @@
 
 use rust_decimal::Decimal;
 
-use crate::decimal::check_configured_scale;
+use crate::decimal::{check_configured_scale, check_scale, sub};
 use crate::error::{MarginError, Result};
 use crate::ids::{Asset, InstrumentId};
 
@@ -383,6 +387,155 @@ impl LinearPerpetual {
     }
 }
 
+/// The right an option gives its holder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OptionRight {
+    /// The right to buy the underlying at the strike.
+    Call,
+    /// The right to sell the underlying at the strike.
+    Put,
+}
+
+/// When an option may be exercised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExerciseStyle {
+    /// At expiry only.
+    European,
+    /// At any time up to expiry.
+    American,
+}
+
+/// What an exercised option delivers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OptionDelivery {
+    /// The intrinsic value, in the settlement asset.
+    Cash,
+    /// The underlying, against the strike.
+    Physical,
+}
+
+/// How an option's payoff relates to its settlement asset.
+///
+/// Premiums and marks are in the settlement asset per unit of the underlying
+/// in both cases; the strike and the settlement price are in the price asset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OptionMargining {
+    /// Settled in the price asset: an intrinsic value `d` pays `d` per unit
+    /// of the underlying.
+    Linear,
+    /// Settled in the underlying: an intrinsic value `d` at the settlement
+    /// price `P` pays `d / P` per unit of the underlying. Cash only.
+    Inverse,
+}
+
+/// The terms of an option beyond its [`LinearTerms`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptionContract {
+    /// Underlying asset. It need not be registered in the ledger unless the
+    /// option is physically delivered.
+    pub underlying: Asset,
+    /// Strike, in the price asset per unit of the underlying. Positive.
+    pub strike: Decimal,
+    /// Expiry, in milliseconds since the epoch.
+    pub expiry_ms: u64,
+    /// Call or put.
+    pub right: OptionRight,
+    /// European or American.
+    pub exercise: ExerciseStyle,
+    /// Cash or physical.
+    pub delivery: OptionDelivery,
+    /// Linear or inverse.
+    pub margining: OptionMargining,
+}
+
+/// An option on an underlying asset.
+///
+/// The [`LinearTerms`] hold its identifier, its settlement asset (where the
+/// premium and any cash payoff are paid), the multiplier `M` (units of the
+/// underlying per contract), and the scales of the premium and the contracts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptionInstrument {
+    terms: LinearTerms,
+    contract: OptionContract,
+}
+
+impl OptionInstrument {
+    /// Defines an option.
+    ///
+    /// # Errors
+    ///
+    /// [`MarginError::InvalidInput`] if the strike is not positive or finer
+    /// than [`MAX_SCALE`](crate::decimal::MAX_SCALE), if the underlying is
+    /// the settlement asset of a linear option or is not the settlement
+    /// asset of an inverse one, or if an inverse option is physical.
+    pub fn new(terms: LinearTerms, contract: OptionContract) -> Result<Self> {
+        if contract.strike <= Decimal::ZERO {
+            return Err(MarginError::invalid_input("strike", "must be positive"));
+        }
+        check_scale(contract.strike, crate::decimal::MAX_SCALE, "strike")?;
+        let in_underlying = contract.underlying == *terms.settlement();
+        match contract.margining {
+            OptionMargining::Linear if in_underlying => {
+                return Err(MarginError::invalid_input(
+                    "settlement",
+                    "a linear option settles in another asset than its underlying",
+                ));
+            }
+            OptionMargining::Inverse if !in_underlying => {
+                return Err(MarginError::invalid_input(
+                    "settlement",
+                    "an inverse option settles in its underlying",
+                ));
+            }
+            OptionMargining::Linear | OptionMargining::Inverse => {}
+        }
+        if contract.margining == OptionMargining::Inverse
+            && contract.delivery == OptionDelivery::Physical
+        {
+            return Err(MarginError::invalid_input(
+                "delivery",
+                "an inverse option settles in cash only",
+            ));
+        }
+        Ok(Self { terms, contract })
+    }
+
+    /// Identifier, settlement asset, multiplier and scales.
+    #[must_use]
+    pub fn terms(&self) -> &LinearTerms {
+        &self.terms
+    }
+
+    /// Strike, expiry, right, style and delivery.
+    #[must_use]
+    pub fn contract(&self) -> &OptionContract {
+        &self.contract
+    }
+
+    /// The intrinsic value per unit of the underlying at `underlying_price`,
+    /// in the price asset: `max(0, P - K)` for a call, `max(0, K - P)` for a
+    /// put.
+    pub(crate) fn intrinsic(&self, underlying_price: Decimal) -> Result<Decimal> {
+        let strike = self.contract.strike;
+        let value = match self.contract.right {
+            OptionRight::Call => sub(underlying_price, strike, "price - strike")?,
+            OptionRight::Put => sub(strike, underlying_price, "strike - price")?,
+        };
+        Ok(value.max(Decimal::ZERO))
+    }
+
+    /// How far out of the money the option is at `underlying_price`, in the
+    /// price asset: `max(0, K - P)` for a call, `max(0, P - K)` for a put.
+    pub(crate) fn out_of_the_money(&self, underlying_price: Decimal) -> Result<Decimal> {
+        let strike = self.contract.strike;
+        let value = match self.contract.right {
+            OptionRight::Call => sub(strike, underlying_price, "strike - price")?,
+            OptionRight::Put => sub(underlying_price, strike, "price - strike")?,
+        };
+        Ok(value.max(Decimal::ZERO))
+    }
+}
+
 /// What kind of position an instrument holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -397,6 +550,8 @@ pub enum PositionKind {
     InverseFuture,
     /// Contracts of an inverse perpetual.
     InversePerpetual,
+    /// Contracts of an option.
+    Option,
 }
 
 /// An instrument the ledger can book executions for.
@@ -413,6 +568,8 @@ pub enum Instrument {
     InverseFuture(InverseFuture),
     /// Inverse perpetual, with funding in the base asset.
     InversePerpetual(InversePerpetual),
+    /// Option, with its premium paid in cash at the fill.
+    Option(OptionInstrument),
 }
 
 impl Instrument {
@@ -425,12 +582,13 @@ impl Instrument {
             Self::LinearPerpetual(perpetual) => perpetual.terms().id(),
             Self::InverseFuture(future) => future.terms().id(),
             Self::InversePerpetual(perpetual) => perpetual.terms().id(),
+            Self::Option(option) => option.terms().id(),
         }
     }
 
     /// Asset in which positions, cost basis and PnL are measured: the quote
     /// asset of a spot instrument, the settlement asset of a derivative
-    /// (the base asset of an inverse one).
+    /// (the base asset of an inverse one) or an option.
     #[must_use]
     pub fn quote(&self) -> &Asset {
         match self {
@@ -439,6 +597,7 @@ impl Instrument {
             Self::LinearPerpetual(perpetual) => perpetual.terms().settlement(),
             Self::InverseFuture(future) => future.terms().settlement(),
             Self::InversePerpetual(perpetual) => perpetual.terms().settlement(),
+            Self::Option(option) => option.terms().settlement(),
         }
     }
 
@@ -451,12 +610,13 @@ impl Instrument {
             Self::LinearPerpetual(_) => PositionKind::LinearPerpetual,
             Self::InverseFuture(_) => PositionKind::InverseFuture,
             Self::InversePerpetual(_) => PositionKind::InversePerpetual,
+            Self::Option(_) => PositionKind::Option,
         }
     }
 
     /// Size of one unit of position: `Multiplier(1)` for spot, the
-    /// multiplier of a linear derivative, the contract value of an inverse
-    /// one.
+    /// multiplier of a linear derivative or an option, the contract value of
+    /// an inverse derivative.
     #[must_use]
     pub fn contract_size(&self) -> ContractSize {
         match self {
@@ -471,37 +631,57 @@ impl Instrument {
             Self::InversePerpetual(perpetual) => {
                 ContractSize::ContractValue(perpetual.terms().contract_value())
             }
+            Self::Option(option) => ContractSize::Multiplier(option.terms().multiplier()),
         }
     }
 
-    /// The contract terms of a linear derivative; `None` for spot and
-    /// inverse instruments.
+    /// The contract terms of a linear future or perpetual; `None` for spot,
+    /// inverse instruments and options.
     #[must_use]
     pub fn linear_terms(&self) -> Option<&LinearTerms> {
         match self {
             Self::LinearFuture(future) => Some(future.terms()),
             Self::LinearPerpetual(perpetual) => Some(perpetual.terms()),
-            Self::Spot(_) | Self::InverseFuture(_) | Self::InversePerpetual(_) => None,
+            Self::Spot(_)
+            | Self::InverseFuture(_)
+            | Self::InversePerpetual(_)
+            | Self::Option(_) => None,
         }
     }
 
-    /// The contract terms of an inverse derivative; `None` for spot and
-    /// linear instruments.
+    /// The contract terms of an inverse derivative; `None` for spot, linear
+    /// instruments and options.
     #[must_use]
     pub fn inverse_terms(&self) -> Option<&InverseTerms> {
         match self {
             Self::InverseFuture(future) => Some(future.terms()),
             Self::InversePerpetual(perpetual) => Some(perpetual.terms()),
-            Self::Spot(_) | Self::LinearFuture(_) | Self::LinearPerpetual(_) => None,
+            Self::Spot(_) | Self::LinearFuture(_) | Self::LinearPerpetual(_) | Self::Option(_) => {
+                None
+            }
         }
     }
 
-    /// The expiry of a future; `None` for spot and perpetuals.
+    /// The option; `None` for every other instrument.
+    #[must_use]
+    pub fn option_terms(&self) -> Option<&OptionInstrument> {
+        match self {
+            Self::Option(option) => Some(option),
+            Self::Spot(_)
+            | Self::LinearFuture(_)
+            | Self::LinearPerpetual(_)
+            | Self::InverseFuture(_)
+            | Self::InversePerpetual(_) => None,
+        }
+    }
+
+    /// The expiry of a future or an option; `None` for spot and perpetuals.
     #[must_use]
     pub fn expiry_ms(&self) -> Option<u64> {
         match self {
             Self::LinearFuture(future) => Some(future.expiry_ms()),
             Self::InverseFuture(future) => Some(future.expiry_ms()),
+            Self::Option(option) => Some(option.contract().expiry_ms),
             Self::Spot(_) | Self::LinearPerpetual(_) | Self::InversePerpetual(_) => None,
         }
     }
@@ -516,6 +696,7 @@ impl Instrument {
             Self::LinearPerpetual(_) => Some(ProductKind::LinearPerpetual),
             Self::InverseFuture(_) => Some(ProductKind::InverseFuture),
             Self::InversePerpetual(_) => Some(ProductKind::InversePerpetual),
+            Self::Option(_) => Some(ProductKind::Option),
         }
     }
 
@@ -538,6 +719,15 @@ impl Instrument {
                 (
                     terms.settlement(),
                     ContractSize::ContractValue(terms.contract_value()),
+                    terms.price_scale(),
+                    terms.contract_scale(),
+                )
+            }
+            Self::Option(option) => {
+                let terms = option.terms();
+                (
+                    terms.settlement(),
+                    ContractSize::Multiplier(terms.multiplier()),
                     terms.price_scale(),
                     terms.contract_scale(),
                 )
@@ -590,6 +780,12 @@ impl From<InverseFuture> for Instrument {
 impl From<InversePerpetual> for Instrument {
     fn from(perpetual: InversePerpetual) -> Self {
         Self::InversePerpetual(perpetual)
+    }
+}
+
+impl From<OptionInstrument> for Instrument {
+    fn from(option: OptionInstrument) -> Self {
+        Self::Option(option)
     }
 }
 

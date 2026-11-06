@@ -7,7 +7,7 @@
 //! ## Status
 //!
 //! - [`ledger`]: the single accounting authority for one account. Spot
-//!   instruments and linear and inverse futures and perpetuals, available
+//!   instruments, linear and inverse futures and perpetuals and options, available
 //!   and reserved balances per asset, spot positions with signed average
 //!   cost, derivative positions as signed contracts with a basis, funding
 //!   and expiry settlement, fees per asset, idempotent booking by execution
@@ -37,7 +37,8 @@
 //!   margin rules with progressive tiers: `linear-im/1`
 //!   ([`rules::TieredLinearIm`]) for linear futures and perpetuals and
 //!   `inverse-im/1` ([`rules::TieredInverseIm`]) for inverse ones, in the
-//!   base. Every requirement carries its rule id and a per position
+//!   base, and `short-option-im/1` ([`rules::ShortOptionIm`]) for short
+//!   options. Every requirement carries its rule id and a per position
 //!   breakdown.
 //! - [`factors`] and [`covariance`]: factor exposures with explicit units
 //!   and portfolio variance under a validated (symmetric, positive
@@ -60,13 +61,20 @@
 //!   [`liquidation::LiquidationAccount::from_ledger`], and each forced fill
 //!   is booked back with [`liquidation::ForcedReduction::execution`], so the
 //!   booked plan leaves exactly the planned state.
+//! - Options: [`instrument::OptionInstrument`], with the premium paid in cash
+//!   at the fill, settlement by a cash price, a delivery or a lapse
+//!   ([`ledger::Ledger::settle_option`]), valuation at premium marks, and
+//!   `short-option-im/1` ([`rules::ShortOptionIm`]) for the short side. The
+//!   crate prices nothing: marks and outcomes are inputs. Stress and closeout
+//!   plans refuse an open option, and margin reservations block in its
+//!   currency. See `docs/options.md`.
 //! - [`MarginError`] and [`Result`]: the typed error boundary.
 //!
 //! ## Feature flags
 //!
 //! | Feature | Default | Effect |
 //! |---|---|---|
-//! | `instruments` | off | `Instrument::from_spec` and `instrument::InstrumentScales`: an exact conversion of a `financial_types` instrument specification (spot, linear and inverse futures and perpetuals) into an [`Instrument`], with explicit scales and typed errors (`MarginError::UnsupportedSpec` for options, `MarginError::ScaleBelowGrid`). Enables `financial_types/instruments`. |
+//! | `instruments` | off | `Instrument::from_spec` and `instrument::InstrumentScales`: an exact conversion of a `financial_types` instrument specification (spot, linear and inverse futures and perpetuals, options) into an [`Instrument`], with explicit scales and typed errors (`MarginError::ScaleBelowGrid`, `MarginError::UnsupportedSpec` for what is not mapped). Enables `financial_types/instruments`. |
 //!
 //! ## Policies
 //!

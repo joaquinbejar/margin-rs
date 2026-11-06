@@ -28,8 +28,13 @@ use financial_types::Side;
 use financial_types::instrument::fixtures::{self, Case, Expected, Operation};
 use financial_types::instrument::{ContractKind, Margining, MoneyRatio};
 use margin_rs::instrument::InstrumentScales;
-use margin_rs::ledger::{Action, Execution, ExecutionCashflow, ExpirySettlement, Ledger};
-use margin_rs::{Asset, Decimal, ExecutionId, Instrument, InstrumentId, MarginError};
+use margin_rs::ledger::{
+    Action, Execution, ExecutionCashflow, ExpirySettlement, Ledger, OptionOutcome,
+    OptionSettlement, OptionSettlementCashflow,
+};
+use margin_rs::{
+    Asset, Decimal, ExecutionId, Instrument, InstrumentId, MarginError, SpotInstrument,
+};
 use rust_decimal_macros::dec;
 
 /// What the ledger does with a case.
@@ -40,8 +45,9 @@ enum Disposition {
     /// An inverse notional or PnL: booked, and the rounded values plus
     /// their recorded rests equal the exact amount.
     InverseLedger,
-    /// An option: no ledger instrument (`UnsupportedSpec`).
-    OptionUnsupported,
+    /// An option: its premium or expiry booked and equal to the exact
+    /// amount, or a grid check the ledger books on or off the grid.
+    OptionLedger,
     /// A grid check of the specification: the ledger checks digits only and
     /// books the value, on or off the grid.
     GridOnly,
@@ -90,87 +96,87 @@ const TABLE: &[(&str, Disposition)] = &[
     ),
     (
         "option premium long: 1.5 x 1 BTC x 0.0125 = -0.01875 BTC paid | Premium { side: Side::Long, contracts: 1.5, premium: 0.0125 }",
-        OptionUnsupported,
+        OptionLedger,
     ),
     (
         "option premium short: +0.01875 BTC received | Premium { side: Side::Short, contracts: 1.5, premium: 0.0125 }",
-        OptionUnsupported,
+        OptionLedger,
     ),
     (
         "inverse call long, S 110000, K 100000: 2 x 10000 / 110000 = 2/11 BTC | Expiry { side: Side::Long, contracts: 2, settlement_price: 110000 }",
-        OptionUnsupported,
+        OptionLedger,
     ),
     (
         "inverse call short: -2/11 BTC | Expiry { side: Side::Short, contracts: 2, settlement_price: 110000 }",
-        OptionUnsupported,
+        OptionLedger,
     ),
     (
         "inverse call at the money: 0 | Expiry { side: Side::Long, contracts: 2, settlement_price: 100000 }",
-        OptionUnsupported,
+        OptionLedger,
     ),
     (
         "inverse call out of the money: 0 | Expiry { side: Side::Long, contracts: 2, settlement_price: 90000 }",
-        OptionUnsupported,
+        OptionLedger,
     ),
     (
         "inverse put long, S 90000: 2 x 10000 / 90000 = 2/9 BTC | Expiry { side: Side::Long, contracts: 2, settlement_price: 90000 }",
-        OptionUnsupported,
+        OptionLedger,
     ),
     (
         "inverse put out of the money: 0 | Expiry { side: Side::Short, contracts: 2, settlement_price: 110000 }",
-        OptionUnsupported,
+        OptionLedger,
     ),
     (
         "illustrative linear cash call long, S 120, K 100: 3 x 20 = +60 USDT | Expiry { side: Side::Long, contracts: 3, settlement_price: 120 }",
-        OptionUnsupported,
+        OptionLedger,
     ),
     (
         "illustrative physical call long, S 120: +3 BTC, -300 USDT | Expiry { side: Side::Long, contracts: 3, settlement_price: 120 }",
-        OptionUnsupported,
+        OptionLedger,
     ),
     (
         "illustrative physical call short, S 120: -3 BTC, +300 USDT | Expiry { side: Side::Short, contracts: 3, settlement_price: 120 }",
-        OptionUnsupported,
+        OptionLedger,
     ),
     (
         "illustrative physical put long, S 80: -3 BTC, +300 USDT | Expiry { side: Side::Long, contracts: 3, settlement_price: 80 }",
-        OptionUnsupported,
+        OptionLedger,
     ),
     (
         "illustrative physical put short, S 80: +3 BTC, -300 USDT | Expiry { side: Side::Short, contracts: 3, settlement_price: 80 }",
-        OptionUnsupported,
+        OptionLedger,
     ),
     (
         "illustrative physical call out of the money: abandoned | Expiry { side: Side::Long, contracts: 3, settlement_price: 90 }",
-        OptionUnsupported,
+        OptionLedger,
     ),
     (
         "illustrative physical call at the money: abandoned | Expiry { side: Side::Short, contracts: 3, settlement_price: 100 }",
-        OptionUnsupported,
+        OptionLedger,
     ),
     (
         "illustrative physical put out of the money: abandoned | Expiry { side: Side::Long, contracts: 3, settlement_price: 120 }",
-        OptionUnsupported,
+        OptionLedger,
     ),
     (
         "Deribit option premium 0.005: on the 0.0001 band (inclusive) | CheckPrice { price: 0.005 }",
-        OptionUnsupported,
+        OptionLedger,
     ),
     (
         "Deribit option premium 0.0049: on 0.0001 | CheckPrice { price: 0.0049 }",
-        OptionUnsupported,
+        OptionLedger,
     ),
     (
         "Deribit option premium 0.00495: off 0.0001 | CheckPrice { price: 0.00495 }",
-        OptionUnsupported,
+        OptionLedger,
     ),
     (
         "Deribit option premium 0.0051: above 0.005, off 0.0005 | CheckPrice { price: 0.0051 }",
-        OptionUnsupported,
+        OptionLedger,
     ),
     (
         "Deribit option premium 0.0055: on 0.0005 | CheckPrice { price: 0.0055 }",
-        OptionUnsupported,
+        OptionLedger,
     ),
     (
         "Deribit future price 60002.5: on 2.5 | CheckPrice { price: 60002.5 }",
@@ -190,11 +196,11 @@ const TABLE: &[(&str, Disposition)] = &[
     ),
     (
         "Deribit option size 0.15: off 0.1 | CheckLot { contracts: 0.15 }",
-        OptionUnsupported,
+        OptionLedger,
     ),
     (
         "Deribit option size 0.3: on 0.1 | CheckLot { contracts: 0.3 }",
-        OptionUnsupported,
+        OptionLedger,
     ),
     (
         "tie +1/8 at 2 places | Settle { value: Ratio { num: 1, den: 8 }, scale: 2, rule: Floor }",
@@ -270,7 +276,7 @@ const TABLE: &[(&str, Disposition)] = &[
     ),
     (
         "negative premium is refused | Premium { side: Side::Long, contracts: 1, premium: -0.0001 }",
-        OptionUnsupported,
+        OptionLedger,
     ),
     (
         "zero contracts are refused | Notional { contracts: 0, price: 60000 }",
@@ -284,6 +290,10 @@ const TABLE: &[(&str, Disposition)] = &[
 
 fn key(case: &Case) -> String {
     format!("{} | {:?}", case.name, case.operation)
+}
+
+fn iid_of(id: &str) -> InstrumentId {
+    InstrumentId::new(id).unwrap()
 }
 
 fn scales(price_scale: u32, contract_scale: u32) -> InstrumentScales {
@@ -425,19 +435,147 @@ fn run_inverse(case: &Case) {
     }
 }
 
+fn settle(
+    ledger: &mut Ledger,
+    id: &InstrumentId,
+    contracts: Decimal,
+    outcome: OptionOutcome,
+    as_of_ms: u64,
+) -> OptionSettlementCashflow {
+    ledger
+        .settle_option(&OptionSettlement {
+            id: ExecutionId::new("settle").unwrap(),
+            instrument: id.clone(),
+            contracts,
+            outcome,
+            as_of_ms,
+        })
+        .unwrap()
+        .cashflow
+}
+
+fn run_option_expiry(case: &Case, side: Side, contracts: Decimal, settlement_price: Decimal) {
+    let (mut ledger, id) = ledger(case, scales(8, 8));
+    let expiry_ms = case.spec.expiry_ms().unwrap();
+    let (open, _) = sides(side);
+    book(&mut ledger, &id, "open", open, dec!(1), contracts, 1).unwrap();
+    match &case.expected {
+        Expected::Amount { exact, settled } => {
+            let cashflow = settle(
+                &mut ledger,
+                &id,
+                contracts,
+                OptionOutcome::Cash {
+                    price: settlement_price,
+                },
+                expiry_ms,
+            );
+            // The booked cash plus its signed rest is the exact amount.
+            let rest = cashflow.residual.map_or(Q::new(0, 1), |rest| {
+                Q::dec(rest.numerator).div(Q::dec(rest.denominator))
+            });
+            let rest = match side {
+                Side::Long => rest,
+                Side::Short => rest.neg(),
+            };
+            assert_eq!(Q::dec(cashflow.cash).add(rest), q(exact), "{}", case.name);
+            assert_eq!(
+                cashflow.asset.as_str(),
+                exact.asset.as_str(),
+                "{}",
+                case.name
+            );
+            if let Some(settled) = settled {
+                assert_eq!(cashflow.cash, settled.amount, "{}", case.name);
+            }
+        }
+        Expected::Delivery { underlying, cash } => {
+            let spot = iid_of("BTC-USDT");
+            ledger
+                .register_instrument(
+                    SpotInstrument::new(
+                        spot.clone(),
+                        Asset::new("BTC").unwrap(),
+                        Asset::new("USDT").unwrap(),
+                        8,
+                        8,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let cashflow = settle(
+                &mut ledger,
+                &id,
+                contracts,
+                OptionOutcome::Delivery {
+                    spot,
+                    delivery_id: ExecutionId::new("delivery").unwrap(),
+                },
+                expiry_ms,
+            );
+            let deltas = &cashflow.delivery.as_ref().unwrap().deltas;
+            assert_eq!(
+                deltas[&Asset::new(underlying.asset.as_str()).unwrap()],
+                underlying.amount,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                deltas[&Asset::new(cash.asset.as_str()).unwrap()],
+                cash.amount,
+                "{}",
+                case.name
+            );
+        }
+        Expected::Abandoned => {
+            let cashflow = settle(
+                &mut ledger,
+                &id,
+                contracts,
+                OptionOutcome::Lapsed,
+                expiry_ms,
+            );
+            assert_eq!(cashflow.cash, Decimal::ZERO, "{}", case.name);
+        }
+        other => panic!("{}: unexpected result {other:?}", case.name),
+    }
+    assert!(ledger.reconcile().is_ok(), "{}", case.name);
+}
+
 fn run_option(case: &Case) {
     assert_eq!(case.spec.kind(), ContractKind::Option, "{}", case.name);
-    assert!(
-        matches!(
-            Instrument::from_spec(&case.spec, scales(8, 8)),
-            Err(MarginError::UnsupportedSpec {
-                kind: ContractKind::Option,
-                ..
-            })
-        ),
-        "{}",
-        case.name
-    );
+    match &case.operation {
+        Operation::Premium {
+            side,
+            contracts,
+            premium,
+        } => {
+            let (mut ledger, id) = ledger(case, scales(8, 8));
+            let (open, _) = sides(*side);
+            let booked = book(&mut ledger, &id, "open", open, *premium, *contracts, 1);
+            if let Expected::Error(_) = &case.expected {
+                assert!(booked.is_err(), "{}: {booked:?}", case.name);
+                return;
+            }
+            let fill = booked.unwrap();
+            let Expected::Money(money) = &case.expected else {
+                panic!("{}: unexpected result {:?}", case.name, case.expected);
+            };
+            assert_eq!(
+                fill.deltas[&Asset::new(money.asset.as_str()).unwrap()],
+                money.amount,
+                "{}",
+                case.name
+            );
+        }
+        Operation::Expiry {
+            side,
+            contracts,
+            settlement_price,
+        } => run_option_expiry(case, *side, *contracts, *settlement_price),
+        Operation::CheckPrice { .. } | Operation::CheckLot { .. } => run_grid(case),
+        other => panic!("{}: unexpected operation {other:?}", case.name),
+    }
 }
 
 fn run_grid(case: &Case) {
@@ -561,7 +699,7 @@ fn test_shared_fixtures_every_case_has_a_checked_disposition() {
                 assert_eq!(case.spec.margining(), Margining::Inverse, "{key}");
                 run_inverse(case);
             }
-            OptionUnsupported => run_option(case),
+            OptionLedger => run_option(case),
             GridOnly => run_grid(case),
             RatioRoundingOnly => {
                 assert!(matches!(case.operation, Operation::Settle { .. }), "{key}");
@@ -576,7 +714,7 @@ fn test_shared_fixtures_every_case_has_a_checked_disposition() {
     let expected: BTreeMap<Disposition, usize> = [
         (LinearLedger, 3),
         (InverseLedger, 4),
-        (OptionUnsupported, 24),
+        (OptionLedger, 24),
         (GridOnly, 4),
         (RatioRoundingOnly, 15),
         (LedgerRounds, 1),

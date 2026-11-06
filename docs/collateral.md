@@ -45,3 +45,7 @@ This function covers the cash and the futures and perpetuals:
 - The unrealized PnL of the open futures and perpetuals held in the ledger, linear or inverse, is added to the balance of their settlement asset, as one net amount, at their instrument marks (`MarkSet::instruments`, see `docs/valuation.md`). The asset's haircut and stale policy apply to that net; `CollateralLine::unrealized_pnl` shows what was counted. A gain at a stale or future instrument mark is excluded, a loss at one makes the line unknown, and `StalePolicy::Reject` refuses either with `InvalidInstrumentMark`.
 
 Short option marks are not covered: options are not ledger positions.
+
+## Options
+
+A short option deducts its mark from the line of its settlement asset, and a long counts nothing. A short at an invalid mark leaves the line unknown, even at a mark of zero. See `options.md`.

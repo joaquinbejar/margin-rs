@@ -83,6 +83,8 @@ The hold after a fill is `min(required, max(available + own hold, 0))`, as on ad
 
 **Explicit modes.** On the ledger, `reserve`, `requirement` and `apply_fill` are `WrongReservationMode`, and so is `apply_booked_fill` on a service with its own positions.
 
+An open option settled in the service's currency makes the rule fail with `UnsupportedInstrument`, so the service blocks orders in that currency instead of leaving the option out and under reserving. An option settled in another asset does not affect it, and neither does a flat one. See `options.md`.
+
 ## Account in debt
 
 Cash can go negative after a mandatory debit (a fee, a realized loss or a closeout settlement; see `docs/liquidation.md`). Then collateral, which is the available cash plus the current hold, is negative too:

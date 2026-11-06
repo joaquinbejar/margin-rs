@@ -132,7 +132,7 @@ rounding, and no partial sum that can overflow while the result does not.
 | `risk` | `RiskGate`: pretrade gate for spot orders, reservations with fees in quote or base, hard limits, typed decisions, circuit breaker and quote withdrawal; mandatory derivative postings. |
 | `valuation` | Account mark to market in one reporting asset over a `LedgerSnapshot`, PnL attribution, collateral equity. |
 | `scenarios` | Stress of spot inventory and open linear futures and perpetuals. |
-| `initial_margin`, `rules` | `InitialMarginModel`, `PiecewiseLinearMargin`, `TieredLinearIm` (`linear-im/1`) and `TieredInverseIm` (`inverse-im/1`). |
+| `initial_margin`, `rules` | `InitialMarginModel`, `PiecewiseLinearMargin`, `TieredLinearIm` (`linear-im/1`), `TieredInverseIm` (`inverse-im/1`) and `ShortOptionIm` (`short-option-im/1`). |
 | `factors`, `covariance` | Factor exposures with units and portfolio variance. |
 | `collateral` | Collateral value with haircuts and a stale price policy. |
 | `margin_reservations` | Initial margin reserved for pending derivative orders, own positions or on the ledger. |
@@ -165,7 +165,7 @@ margin-rs = "0.1"
 
 | Feature | Default | Effect |
 |---|---|---|
-| `instruments` | off | `Instrument::from_spec` and `InstrumentScales`: an exact conversion of a `financial_types` instrument specification (spot, linear and inverse futures and perpetuals) into a ledger instrument, with explicit scales and typed errors (`UnsupportedSpec` for options, `ScaleBelowGrid`). Enables `financial_types/instruments`. |
+| `instruments` | off | `Instrument::from_spec` and `InstrumentScales`: an exact conversion of a `financial_types` instrument specification (spot, linear and inverse futures and perpetuals, options) into a ledger instrument, with explicit scales and typed errors (`ScaleBelowGrid`, `UnsupportedSpec` for what is not mapped). Enables `financial_types/instruments`. |
 
 ## Examples
 
@@ -291,6 +291,63 @@ fn main() -> margin_rs::Result<()> {
     let plan = plan_liquidation(&rule, &account, &liquidity, &policy)?;
     assert_eq!(plan.outcome, CloseoutOutcome::TargetMet);
     assert_eq!(plan.reductions[0].contracts, Decimal::from(3));
+    Ok(())
+}
+```
+
+### Options
+
+The ledger holds option positions and takes their value as input: premium
+marks, settlement outcomes and the underlying price. The premium moves cash at
+the fill. A short requires margin under `short-option-im/1`; its mark is
+deducted from collateral, not added to the requirement. Stress and closeout
+plans refuse an open option, and margin reservations block in its currency.
+See [docs/options.md](docs/options.md).
+
+```rust
+use margin_rs::instrument::{
+    ExerciseStyle, LinearTerms, OptionContract, OptionDelivery, OptionInstrument, OptionMargining,
+    OptionRight,
+};
+use margin_rs::ledger::{Action, Execution, Ledger, OptionOutcome, OptionSettlement};
+use margin_rs::{Asset, ExecutionId, InstrumentId, TransferId};
+use rust_decimal_macros::dec;
+
+fn main() -> margin_rs::Result<()> {
+    let usdc = Asset::new("USDC")?;
+    let id = InstrumentId::new("BTC-CALL-100")?;
+    let mut ledger = Ledger::default();
+    ledger.register_asset(usdc.clone(), 6)?;
+    ledger.register_instrument(OptionInstrument::new(
+        LinearTerms::new(id.clone(), usdc.clone(), dec!(1), 4, 2)?,
+        OptionContract {
+            underlying: Asset::new("BTC")?,
+            strike: dec!(100),
+            expiry_ms: 1_000,
+            right: OptionRight::Call,
+            exercise: ExerciseStyle::European,
+            delivery: OptionDelivery::Cash,
+            margining: OptionMargining::Linear,
+        },
+    )?)?;
+    ledger.deposit(TransferId::new("d1")?, usdc.clone(), dec!(1000))?;
+
+    // Long 2 at a premium of 10: 20 paid.
+    let fill = Execution::new(ExecutionId::new("e1")?, id.clone(), Action::Buy, dec!(10), dec!(2))
+        .with_executed_at(1);
+    ledger.book_execution_allowing_overdraft(&fill, None)?;
+
+    // Settled at 130: 2 * 30 = 60 received, realized 40.
+    let settled = ledger.settle_option(&OptionSettlement {
+        id: ExecutionId::new("s1")?,
+        instrument: id,
+        contracts: dec!(2),
+        outcome: OptionOutcome::Cash { price: dec!(130) },
+        as_of_ms: 1_000,
+    })?;
+    assert_eq!(settled.cashflow.realized_pnl, dec!(40));
+    assert_eq!(ledger.balance(&usdc).map(|b| b.total), Some(dec!(1040)));
+    ledger.reconcile()?;
     Ok(())
 }
 ```

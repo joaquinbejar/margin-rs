@@ -224,3 +224,7 @@ The account holds 10 BTC-PERP long, `M = 1`, entry 100 (basis 1000), mark 95, wi
 - Insurance fund, loss allocation and auto-deleveraging. The debt and the deficit are left for them, explicitly.
 - Options. The rules cover linear (`TieredLinearIm`) and inverse (`TieredInverseIm`) futures and perpetuals only.
 - Stress of inverse positions (see `docs/valuation.md`).
+
+## Options
+
+An account with an open option gets no plan: `LiquidationAccount::from_ledger` returns `UnsupportedInstrument`. See `options.md`.

@@ -120,9 +120,9 @@ pub struct ExecutionCashflow {
     /// still the exact product rounded once. `None` for a derivative.
     pub notional_exact: Option<Decimal>,
     /// Notional rounded to the quote asset scale; the amount of quote asset
-    /// actually exchanged. Zero for a derivative, which exchanges no
-    /// notional: its cash is in `deltas` and its virtual notional in
-    /// [`ExecutionCashflow::derivative`].
+    /// actually exchanged. Zero for a future or perpetual, which exchanges
+    /// no notional: its cash is in `deltas` and its virtual notional in
+    /// [`ExecutionCashflow::derivative`]. The premium for an option.
     pub notional: Decimal,
     /// `notional - notional_exact`, when `notional_exact` is known.
     pub rounding_residual: Option<Decimal>,
@@ -135,8 +135,8 @@ pub struct ExecutionCashflow {
     pub realized_pnl: Decimal,
     /// Position after the execution.
     pub position_after: PositionSnapshot,
-    /// Details of a future or perpetual fill (linear or inverse); `None` for
-    /// spot.
+    /// Details of a future, perpetual (linear or inverse) or option fill;
+    /// `None` for spot.
     pub derivative: Option<DerivativeFill>,
 }
 

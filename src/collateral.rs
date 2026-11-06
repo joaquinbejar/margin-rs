@@ -122,10 +122,12 @@ impl CollateralPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollateralLine {
     /// Balance on the policy's basis, plus the unrealized PnL counted for
-    /// the futures and perpetuals (linear or inverse) settled in this asset.
+    /// the futures and perpetuals (linear or inverse) settled in this asset,
+    /// minus the marks of the short options settled in it.
     pub balance: Decimal,
     /// Unrealized PnL of the open derivatives settled in this asset that
-    /// the line counts (gains at an invalid instrument mark excluded), as a
+    /// the line counts (gains at an invalid instrument mark excluded), with
+    /// a short option counting its negative market value and a long nothing, as a
     /// report. `None` when a loss is at an invalid mark (the line `value`
     /// is then `None` too), or when this sum alone does not fit a `Decimal`
     /// (the line is still valued: `balance` is the exact net).
@@ -226,7 +228,9 @@ pub fn value_collateral(
         if value.status.is_valid() {
             continue;
         }
-        if matches!(policy.stale, StalePolicy::Reject) && !value.unrealized_pnl.is_zero() {
+        if matches!(policy.stale, StalePolicy::Reject)
+            && (!value.collateral_term().is_zero() || value.unbounded_at_invalid_mark())
+        {
             return Err(MarginError::InvalidInstrumentMark {
                 instrument: id.clone(),
             });
