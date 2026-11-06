@@ -166,6 +166,10 @@ Margin reservations margin and value inverse positions with an inverse rule (`Ti
 
 `valuation::value` and `collateral::value_collateral` value open derivative positions at instrument marks (see `docs/valuation.md`); the stress scenarios shock instrument marks and book hypothetical derivative fills with the rules above. The risk gate handles spot orders only and refuses a derivative with `UnsupportedInstrument` at every entry point.
 
+## Options
+
+Option positions, their premium and their settlement are in `options.md`. In short, an option's premium moves cash at the fill, and `Ledger::settle_option` closes it by a cash price, a delivery as a spot execution at the strike, or a lapse.
+
 ## Derivative settlements outside the ledger (legacy)
 
 This path is kept for derivatives that are not registered in the ledger; registered futures and perpetuals use the rules above. It may be removed later. Futures and perpetual positions held outside the ledger are margined by `initial_margin`, `margin_reservations` and `liquidation`. When such a position is reduced, the cash it moves is booked with `book_settlement(&DerivativeSettlement { id, instrument, asset, realized_pnl, fee })`:

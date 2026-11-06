@@ -118,7 +118,7 @@ use crate::ids::{Asset, InstrumentId, OrderId, ReservationId, TransferId};
 use crate::instrument::{Instrument, SpotInstrument};
 use crate::ledger::{
     Action, Booking, Execution, ExpiryCashflow, ExpirySettlement, FundingCashflow, FundingPayment,
-    Ledger, OverdraftBooking, PostingBooking,
+    Ledger, OptionSettlement, OptionSettlementBooking, OverdraftBooking, PostingBooking,
 };
 
 /// The asset a venue charges the fees of an instrument in, for the risk
@@ -918,6 +918,19 @@ impl RiskGate {
         self.ledger.settle_expiry(settlement)
     }
 
+    /// Closes option contracts by an outcome the caller gives. See
+    /// [`Ledger::settle_option`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Ledger::settle_option`].
+    pub fn settle_option(
+        &mut self,
+        settlement: &OptionSettlement,
+    ) -> Result<OptionSettlementBooking> {
+        self.ledger.settle_option(settlement)
+    }
+
     /// Sets an external hold: a named ledger reservation of exactly
     /// `amount` of `asset`, replacing any previous amount under `id`
     /// (zero removes it). Used to make capital committed elsewhere, such as
@@ -1596,7 +1609,8 @@ impl RiskGate {
                 Instrument::LinearFuture(_)
                 | Instrument::LinearPerpetual(_)
                 | Instrument::InverseFuture(_)
-                | Instrument::InversePerpetual(_),
+                | Instrument::InversePerpetual(_)
+                | Instrument::Option(_),
             ) => Err(MarginError::UnsupportedInstrument {
                 rule: "risk-gate".to_string(),
                 instrument: instrument.clone(),

@@ -64,6 +64,7 @@
 
 pub(crate) mod derivative;
 mod execution;
+mod option;
 mod settlement;
 mod snapshot;
 mod valuation;
@@ -77,6 +78,9 @@ pub use derivative::{
     InverseResidual, PostingBooking,
 };
 pub use execution::{Action, Booking, Execution, ExecutionCashflow, Fee};
+pub use option::{
+    OptionOutcome, OptionSettlement, OptionSettlementBooking, OptionSettlementCashflow,
+};
 pub use settlement::{DerivativeSettlement, SettlementBooking, SettlementCashflow};
 
 pub use snapshot::{BalanceSnapshot, LedgerSnapshot, PositionSnapshot};
@@ -206,6 +210,8 @@ pub struct Ledger {
     expiries: BTreeMap<ExecutionId, (ExpirySettlement, usize)>,
     expiry_journal: Vec<ExpiryCashflow>,
     settled_instruments: BTreeMap<InstrumentId, ExecutionId>,
+    option_settlements: BTreeMap<ExecutionId, (OptionSettlement, usize)>,
+    option_settlement_journal: Vec<OptionSettlementCashflow>,
 }
 
 impl Ledger {
@@ -292,6 +298,9 @@ impl Ledger {
             }
             Instrument::LinearPerpetual(perpetual) => {
                 self.asset_scale_or_err(perpetual.terms().settlement())?;
+            }
+            Instrument::Option(option) => {
+                self.asset_scale_or_err(option.terms().settlement())?;
             }
             Instrument::InverseFuture(_) | Instrument::InversePerpetual(_) => {
                 let terms = instrument
@@ -600,7 +609,7 @@ impl Ledger {
     /// - [`MarginError::InsufficientBalance`]: an asset debited by the
     ///   execution would end with a negative available balance.
     /// - [`MarginError::InvalidInput`]: the instrument is a future or
-    ///   perpetual (linear or inverse). Their executions are mandatory and are booked with
+    ///   perpetual (linear or inverse) or an option. Their executions are mandatory and are booked with
     ///   [`Ledger::book_execution_allowing_overdraft`].
     /// - [`MarginError::Arithmetic`]: overflow or a non exact intermediate.
     pub fn book_execution(&mut self, execution: &Execution) -> Result<Booking> {
@@ -638,7 +647,7 @@ impl Ledger {
 
     /// Books an execution that **already happened** at a venue, even if it
     /// overdraws the account. It is the authoritative path for executions of
-    /// futures and perpetuals, linear or inverse, which are always mandatory (see
+    /// futures and perpetuals, linear or inverse, and options, which are always mandatory (see
     /// "Derivative positions" in `docs/ledger.md`).
     ///
     /// Same rules as [`Ledger::book_execution_with_reservation`] (or
@@ -658,10 +667,12 @@ impl Ledger {
     ///
     /// - [`MarginError::InvalidInput`]: a reservation is given (a derivative
     ///   fill consumes none), or the execution has no `executed_at_ms`.
-    /// - [`MarginError::ExecutedAfterExpiry`]: a future's fill executed at or
-    ///   after its expiry, whether or not the future was settled. A fill
-    ///   executed before the expiry and delivered after the settlement is
-    ///   booked and closed at the settlement price.
+    /// - [`MarginError::ExecutedAfterExpiry`]: a future's or an option's fill
+    ///   executed at or after its expiry, whether or not it was settled. A
+    ///   future's fill executed before the expiry and delivered after the
+    ///   settlement is booked and closed at the settlement price; an option's
+    ///   reopens a position, to be settled again with
+    ///   [`Ledger::settle_option`].
     /// - [`MarginError::InvalidInput`] or [`MarginError::PrecisionExceeded`]:
     ///   price, contracts or fee off their grids.
     /// - [`MarginError::Arithmetic`]: a stored result (realized PnL, basis,
@@ -725,7 +736,8 @@ impl Ledger {
             Instrument::LinearFuture(_)
             | Instrument::LinearPerpetual(_)
             | Instrument::InverseFuture(_)
-            | Instrument::InversePerpetual(_) => {
+            | Instrument::InversePerpetual(_)
+            | Instrument::Option(_) => {
                 let contract = instrument
                     .derivative()
                     .ok_or(MarginError::arithmetic("derivative contract"))?;
@@ -927,6 +939,7 @@ impl Ledger {
         self.settlements.contains_key(id)
             || self.fundings.contains_key(id)
             || self.expiries.contains_key(id)
+            || self.option_settlements.contains_key(id)
     }
 
     /// Books an execution of a linear or inverse future or perpetual (see
@@ -985,7 +998,13 @@ impl Ledger {
             ),
             None => None,
         };
-        if execution.price <= Decimal::ZERO {
+        // A worthless option can trade at a premium of zero; nothing else can
+        // trade at a price of zero.
+        let is_option = matches!(
+            self.instruments.get(&execution.instrument),
+            Some(Instrument::Option(_))
+        );
+        if execution.price < Decimal::ZERO || (execution.price.is_zero() && !is_option) {
             return Err(MarginError::invalid_input("price", "must be positive"));
         }
         if execution.quantity <= Decimal::ZERO {
@@ -1023,12 +1042,25 @@ impl Ledger {
             )?,
         };
 
-        // Only the realized PnL and the fee move cash.
+        // Only the realized PnL and the fee move cash, except that an option's
+        // whole premium is exchanged at the fill.
+        let premium = if is_option {
+            let cash = derivative::signed_virtual_cash(
+                dir,
+                execution.price,
+                execution.quantity,
+                contract.size,
+                scale,
+            )?;
+            Some(decimal::wide_to_decimal(cash, scale, "option premium")?)
+        } else {
+            None
+        };
         let mut changes: BTreeMap<Asset, Vec<Decimal>> = BTreeMap::new();
         changes
             .entry(settlement.clone())
             .or_default()
-            .push(effect.realized);
+            .push(premium.unwrap_or(effect.realized));
         if let Some(fee) = &execution.fee {
             changes
                 .entry(fee.asset.clone())
@@ -1082,9 +1114,10 @@ impl Ledger {
             side: execution.side,
             price: execution.price,
             quantity: execution.quantity,
-            // A derivative exchanges no notional: its cash is in `deltas`.
+            // A future or perpetual exchanges no notional: its cash is in
+            // `deltas`. An option exchanges its premium.
             notional_exact: None,
-            notional: Decimal::ZERO,
+            notional: premium.map_or(Decimal::ZERO, |cash| cash.abs()),
             rounding_residual: None,
             fee: execution.fee.clone(),
             deltas,
@@ -1152,6 +1185,7 @@ impl Ledger {
         if self.executions.contains_key(&settlement.id)
             || self.fundings.contains_key(&settlement.id)
             || self.expiries.contains_key(&settlement.id)
+            || self.option_settlements.contains_key(&settlement.id)
         {
             return Err(MarginError::ConflictingEntry {
                 kind: "settlement",
@@ -1277,6 +1311,7 @@ impl Ledger {
         if self.executions.contains_key(&payment.id)
             || self.settlements.contains_key(&payment.id)
             || self.expiries.contains_key(&payment.id)
+            || self.option_settlements.contains_key(&payment.id)
         {
             return Err(MarginError::ConflictingEntry {
                 kind: "funding",
@@ -1287,7 +1322,10 @@ impl Ledger {
             Some(Instrument::LinearPerpetual(perpetual)) => perpetual.terms().settlement().clone(),
             Some(Instrument::InversePerpetual(perpetual)) => perpetual.terms().settlement().clone(),
             Some(
-                Instrument::Spot(_) | Instrument::LinearFuture(_) | Instrument::InverseFuture(_),
+                Instrument::Spot(_)
+                | Instrument::LinearFuture(_)
+                | Instrument::InverseFuture(_)
+                | Instrument::Option(_),
             ) => {
                 return Err(MarginError::invalid_input(
                     "instrument",
@@ -1391,6 +1429,7 @@ impl Ledger {
         if self.executions.contains_key(&settlement.id)
             || self.settlements.contains_key(&settlement.id)
             || self.fundings.contains_key(&settlement.id)
+            || self.option_settlements.contains_key(&settlement.id)
             || self
                 .settled_instruments
                 .contains_key(&settlement.instrument)
@@ -1418,6 +1457,12 @@ impl Ledger {
                 return Err(MarginError::invalid_input(
                     "instrument",
                     "only a future expires",
+                ));
+            }
+            Some(Instrument::Option(_)) => {
+                return Err(MarginError::invalid_input(
+                    "instrument",
+                    "an option settles with settle_option",
                 ));
             }
             None => {
@@ -1623,7 +1668,8 @@ impl Ledger {
     /// # Errors
     ///
     /// - [`MarginError::MissingMark`] if an open position has no mark.
-    /// - [`MarginError::InvalidInput`] if a used mark is not positive.
+    /// - [`MarginError::InvalidInput`] if a used mark is not positive, or
+    ///   for an option negative.
     /// - [`MarginError::PrecisionExceeded`] if a used mark has more than
     ///   [`MAX_SCALE`](crate::decimal::MAX_SCALE) fractional digits.
     /// - [`MarginError::Arithmetic`] on overflow.
@@ -1901,6 +1947,17 @@ impl Ledger {
                 add_virtual(&mut virtual_cash, &expiry.instrument, term)?;
             }
         }
+        for settled in &self.option_settlement_journal {
+            totals.entry(&settled.asset).or_default().push(settled.cash);
+            quantity_terms
+                .entry(&settled.instrument)
+                .or_default()
+                .push(neg(settled.contracts));
+            let scale = self.asset_scale_or_err(&settled.asset)?;
+            // The close is a sell of a long and a buy of a short at the value.
+            let term = decimal_to_wide(settled.cash, scale, "option value")?;
+            add_virtual(&mut virtual_cash, &settled.instrument, term)?;
+        }
         let total_of = |terms: Option<&Vec<Decimal>>, op| match terms {
             Some(values) => decimal::sum(values, op),
             None => Ok(Decimal::ZERO),
@@ -1954,7 +2011,8 @@ impl Ledger {
                     registered @ (Instrument::LinearFuture(_)
                     | Instrument::LinearPerpetual(_)
                     | Instrument::InverseFuture(_)
-                    | Instrument::InversePerpetual(_)),
+                    | Instrument::InversePerpetual(_)
+                    | Instrument::Option(_)),
                 ) => Some((
                     self.asset_scale_or_err(registered.quote())?,
                     registered.contract_size(),
@@ -2015,7 +2073,12 @@ fn position_value(
     scale: u32,
     rounding: Rounding,
 ) -> Result<Decimal> {
-    if mark <= Decimal::ZERO {
+    // A worthless option has a mark of zero; nothing else has.
+    if let Instrument::Option(_) = instrument {
+        if mark < Decimal::ZERO {
+            return Err(MarginError::invalid_input("mark", "must not be negative"));
+        }
+    } else if mark <= Decimal::ZERO {
         return Err(MarginError::invalid_input("mark", "must be positive"));
     }
     check_scale(mark, decimal::MAX_SCALE, "mark")?;

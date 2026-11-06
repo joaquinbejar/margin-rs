@@ -242,6 +242,12 @@ pub fn stress(
                 }
                 return Err(inverse_unsupported(id));
             }
+            Some(Instrument::Option(_)) => {
+                if position.quantity.is_zero() {
+                    continue;
+                }
+                return Err(option_unsupported(id));
+            }
         };
         if derivative && !position.quantity.is_zero() {
             open.insert(id, position.quantity);
@@ -334,6 +340,11 @@ fn validate_scenario(
         {
             return Err(inverse_unsupported(id));
         }
+        if let Some(Instrument::Option(_)) = snapshot.instruments.get(id)
+            && !position.quantity.is_zero()
+        {
+            return Err(option_unsupported(id));
+        }
     }
     if scenario.liquidation_spread < Decimal::ZERO || scenario.liquidation_spread >= Decimal::ONE {
         return Err(MarginError::invalid_input(
@@ -361,6 +372,7 @@ fn validate_scenario(
             Some(Instrument::InverseFuture(_) | Instrument::InversePerpetual(_)) => {
                 return Err(inverse_unsupported(instrument));
             }
+            Some(Instrument::Option(_)) => return Err(option_unsupported(instrument)),
             Some(Instrument::Spot(_)) => {
                 return Err(MarginError::invalid_input(
                     "instrument shock",
@@ -478,6 +490,15 @@ fn inverse_unsupported(instrument: &InstrumentId) -> MarginError {
     }
 }
 
+/// Options have no pricing model here, so a shock cannot revalue them.
+fn option_unsupported(instrument: &InstrumentId) -> MarginError {
+    MarginError::UnsupportedInstrument {
+        rule: "stress".to_string(),
+        instrument: instrument.clone(),
+        reason: "options are not stressed yet",
+    }
+}
+
 /// A relative shock must be greater than -1.
 fn check_shock(shock: Decimal) -> Result<()> {
     if shock <= -Decimal::ONE {
@@ -519,6 +540,7 @@ fn apply_hypothetical(
         Some(Instrument::InverseFuture(_) | Instrument::InversePerpetual(_)) => {
             Err(inverse_unsupported(&fill.instrument))
         }
+        Some(Instrument::Option(_)) => Err(option_unsupported(&fill.instrument)),
         None => Err(MarginError::UnknownInstrument {
             instrument: fill.instrument.clone(),
         }),

@@ -19,10 +19,13 @@ use common::Q;
 use financial_types::OptionStyle;
 use financial_types::instrument::reference::{binance_usdm, deribit};
 use financial_types::instrument::{
-    AssetCode, ContractKind, ContractSize, InstrumentDraft, InstrumentError,
-    InstrumentId as SpecId, InstrumentSpec, Margining, TickBand, TickSchedule,
+    AssetCode, ContractKind, ContractSize, ExerciseStyle as SpecExercise, InstrumentDraft,
+    InstrumentError, InstrumentId as SpecId, InstrumentSpec, Margining, OptionTerms,
+    SettlementType, TickBand, TickSchedule,
 };
-use margin_rs::instrument::InstrumentScales;
+use margin_rs::instrument::{
+    ExerciseStyle, InstrumentScales, OptionDelivery, OptionMargining, OptionRight,
+};
 use margin_rs::ledger::{
     Action, Execution, ExecutionCashflow, ExpirySettlement, InverseResidual, Ledger,
 };
@@ -276,9 +279,9 @@ fn test_try_from_tuple_matches_from_spec() {
 
 // -------------------------------------------------------------- errors
 
-/// An option has no ledger instrument, whatever the scales.
+/// An option's scales are checked like any other's.
 #[test]
-fn test_from_spec_option_is_unsupported_before_scales() {
+fn test_from_spec_option_scale_below_grid_is_refused() {
     let spec = deribit::btc_option(
         SpecId::new("BTC-27NOV26-100000-C").unwrap(),
         EXPIRY_MS,
@@ -286,19 +289,89 @@ fn test_from_spec_option_is_unsupported_before_scales() {
         OptionStyle::Call,
     )
     .unwrap();
-    let unsupported = MarginError::UnsupportedSpec {
-        instrument: iid("BTC-27NOV26-100000-C"),
+    assert_eq!(
+        Instrument::from_spec(&spec, scales(0, 1)).unwrap_err(),
+        below_grid("BTC-27NOV26-100000-C", "price_scale", "price ticks", 0, 4)
+    );
+    assert_eq!(
+        Instrument::from_spec(&spec, scales(4, 0)).unwrap_err(),
+        below_grid("BTC-27NOV26-100000-C", "contract_scale", "lot", 0, 1)
+    );
+}
+
+/// A Deribit option is inverse, cash settled and European.
+#[test]
+fn test_from_spec_deribit_option_maps_to_inverse_option() {
+    for (style, right) in [
+        (OptionStyle::Call, OptionRight::Call),
+        (OptionStyle::Put, OptionRight::Put),
+    ] {
+        let spec = deribit::btc_option(
+            SpecId::new("BTC-27NOV26-100000").unwrap(),
+            EXPIRY_MS,
+            dec!(100000),
+            style,
+        )
+        .unwrap();
+        let instrument = Instrument::from_spec(&spec, scales(4, 1)).unwrap();
+        assert_eq!(instrument.id(), &iid("BTC-27NOV26-100000"));
+        assert_eq!(instrument.quote().as_str(), "BTC");
+        assert_eq!(instrument.expiry_ms(), Some(EXPIRY_MS));
+        let option = instrument.option_terms().unwrap();
+        assert_eq!(option.terms().multiplier(), Decimal::ONE);
+        assert_eq!(option.terms().price_scale(), 4);
+        assert_eq!(option.terms().contract_scale(), 1);
+        let contract = option.contract();
+        assert_eq!(contract.underlying.as_str(), "BTC");
+        assert_eq!(contract.strike, dec!(100000));
+        assert_eq!(contract.expiry_ms, EXPIRY_MS);
+        assert_eq!(contract.right, right);
+        assert_eq!(contract.exercise, ExerciseStyle::European);
+        assert_eq!(contract.delivery, OptionDelivery::Cash);
+        assert_eq!(contract.margining, OptionMargining::Inverse);
+    }
+}
+
+/// A linear physical American option keeps every term, and the multiplier
+/// comes from the size.
+#[test]
+fn test_from_spec_linear_physical_american_option_keeps_its_terms() {
+    let spec = InstrumentSpec::new(InstrumentDraft {
+        id: SpecId::new("ETH-OPTION").unwrap(),
         kind: ContractKind::Option,
-        margining: Margining::Inverse,
-    };
-    assert_eq!(
-        Instrument::from_spec(&spec, scales(4, 1)).unwrap_err(),
-        unsupported
-    );
-    assert_eq!(
-        Instrument::from_spec(&spec, scales(0, 0)).unwrap_err(),
-        unsupported
-    );
+        margining: Margining::Linear,
+        underlying: code("ETH"),
+        price_asset: code("USDT"),
+        settlement_asset: code("USDT"),
+        size: ContractSize::base(dec!(0.1), code("ETH")).unwrap(),
+        price_ticks: ticks(dec!(0.01)),
+        lot: dec!(1),
+        expiry_ms: Some(EXPIRY_MS),
+        option: Some(
+            OptionTerms::new(
+                dec!(2500.5),
+                OptionStyle::Put,
+                SpecExercise::American,
+                SettlementType::Physical,
+                code("USDT"),
+            )
+            .unwrap(),
+        ),
+    })
+    .unwrap();
+    let instrument = Instrument::from_spec(&spec, scales(2, 0)).unwrap();
+    assert_eq!(instrument.quote().as_str(), "USDT");
+    let option = instrument.option_terms().unwrap();
+    assert_eq!(option.terms().multiplier(), dec!(0.1));
+    let contract = option.contract();
+    assert_eq!(contract.underlying.as_str(), "ETH");
+    assert_eq!(contract.strike, dec!(2500.5));
+    assert_eq!(contract.right, OptionRight::Put);
+    assert_eq!(contract.exercise, ExerciseStyle::American);
+    assert_eq!(contract.delivery, OptionDelivery::Physical);
+    assert_eq!(contract.margining, OptionMargining::Linear);
+    let mut ledger = ledger(&[("USDT", 6)]);
+    ledger.register_instrument(instrument).unwrap();
 }
 
 /// Price scale below the tick, contract scale below the lot.

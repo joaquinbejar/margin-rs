@@ -18,6 +18,8 @@
   - `InvalidInput` for a size that is not positive or not of the product's kind, a non-positive mark, or a duplicate instrument;
   - `Arithmetic` for an amount that cannot be represented.
 
+Options are margined by `short-option-im/1`, with its own view: see `options.md`.
+
 ## `linear-im/1`
 
 | | |

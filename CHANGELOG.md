@@ -6,6 +6,49 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-06
+
+Options in the ledger: positions, premium, settlement, valuation and the short
+side's margin. The ledger takes marks and outcomes as inputs and prices nothing
+(#49). See `docs/options.md`.
+
+### Added
+
+- `instrument::OptionInstrument`, `OptionContract`, `OptionRight`,
+  `ExerciseStyle`, `OptionDelivery` and `OptionMargining`;
+  `Instrument::Option`, `Instrument::option_terms` and `PositionKind::Option`.
+- Option fills through `Ledger::book_execution_allowing_overdraft`: the premium
+  moves cash at the fill. A premium of zero is valid.
+- `Ledger::settle_option` and `RiskGate::settle_option`: closes contracts by a
+  cash price, a delivery booked atomically as a spot execution at the strike, or
+  a lapse. `Ledger::option_settlement_journal`.
+- Rule `short-option-im/1`: `rules::ShortOptionIm`, `ShortOptionParameters`,
+  `OptionExposure` and `OptionExposureView`. It is this crate's own
+  specification, not a venue's.
+- `DerivativeValue::is_option`.
+
+### Changed
+
+- **Breaking:** `Instrument::from_spec` now converts option specifications, where
+  it returned `MarginError::UnsupportedSpec`. Its checks now start with the
+  scales for options too.
+- **Breaking:** `DerivativeValue` has the new public field `is_option`.
+- `Ledger::reconcile` checks option settlements. `ExecutionCashflow::notional` is
+  the premium for an option.
+- Valuation: an option's mark may be zero. Reporting equity adds its market value
+  and collateral counts `min(market value, 0)`; a short at an invalid mark makes
+  collateral unknown.
+
+### Not covered
+
+These refuse an open option with `UnsupportedInstrument` instead of leaving it
+out:
+
+- `scenarios::stress`;
+- `LiquidationAccount::from_ledger`;
+- `MarginReservationService` on a ledger, for an option settled in its currency;
+- the risk gate's orders, which remain for spot.
+
 ## [0.1.1] - 2026-11-04
 
 ### Added

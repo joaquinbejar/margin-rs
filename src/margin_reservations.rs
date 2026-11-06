@@ -1023,7 +1023,8 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
             let Some(mark) = marks.get(id) else {
                 return Ok((cash, Err(id.clone())));
             };
-            if *mark <= Decimal::ZERO {
+            let is_option = matches!(instrument, Instrument::Option(_));
+            if *mark < Decimal::ZERO || (*mark == Decimal::ZERO && !is_option) {
                 return Err(MarginError::invalid_input(
                     "instrument mark",
                     "must be positive",
@@ -1036,6 +1037,12 @@ impl<M: InitialMarginModel> MarginReservationService<M> {
                 *mark,
                 scale,
             )?;
+            // An option's basis already moved cash: a short deducts its value
+            // and a long counts nothing.
+            if is_option {
+                terms.push(value.min(Decimal::ZERO));
+                continue;
+            }
             // upnl: value - basis (linear), basis - value (inverse).
             match contract.size {
                 ContractSize::Multiplier(_) => {

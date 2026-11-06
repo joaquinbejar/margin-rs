@@ -13,7 +13,8 @@ The conversion is exact: nothing is rounded, rescaled or substituted.
 | linear perpetual | `LinearPerpetual` | multiplier: the size amount |
 | inverse future | `InverseFuture`, settled in the settlement asset (the underlying) | contract value: the size amount |
 | inverse perpetual | `InversePerpetual` | contract value: the size amount |
-| option | none: `MarginError::UnsupportedSpec` | |
+| linear option | `OptionInstrument`, settled in the settlement asset, cash or physical | multiplier: the size amount |
+| inverse option | `OptionInstrument`, settled in the settlement asset (the underlying), cash | multiplier: the size amount |
 
 The identifier and the assets go through `InstrumentId::new` and `Asset::new`. The expiry, in milliseconds since the epoch, is passed unchanged.
 
@@ -21,12 +22,11 @@ The conversion is not reversible. An instrument does not carry:
 
 - the tick schedule or the lot;
 - the underlying of a linear derivative;
-- the price asset of an inverse derivative, which is not a ledger asset;
-- option terms.
+- the price asset of an inverse derivative or an inverse option, which is not a ledger asset.
 
 ## Scales
 
-`price_scale` caps the digits of execution prices and expiry settlement prices. `contract_scale` caps the digits of contract quantities (the quantity scale for spot).
+`price_scale` caps the digits of execution prices and expiry settlement prices; for an option, of its premium only. Its strike and settlement price are capped by `MAX_SCALE`. `contract_scale` caps the digits of contract quantities (the quantity scale for spot).
 
 The scales are explicit. Venues publish marks and delivery prices with more digits than the tick: a tick of 0.5 with a delivery price of 61234.57 needs a price scale of 2.
 
@@ -40,9 +40,9 @@ The lot is not the risk minimum either. With `min_quantity` unset, the risk gate
 
 The checks run in this order, after the identifier goes through `InstrumentId::new`. A validated specification's identifier always passes, because both crates apply the same rule (1 to 64 bytes, printable ASCII without whitespace).
 
-1. `UnsupportedSpec` for an option.
-2. `ScaleBelowGrid`.
-3. `InvalidInput` from the instrument constructors: a scale above 18, or a contract value whose digits plus `contract_scale` exceed 28.
+1. `ScaleBelowGrid`.
+2. `InvalidInput` from the instrument constructors: a scale above 18, or a contract value whose digits plus `contract_scale` exceed 28.
+3. `UnsupportedSpec` for a kind, margining, exercise style or settlement type added to `financial_types` and not mapped here.
 
 `Ledger::register_instrument` then checks what needs asset scales:
 

@@ -12,7 +12,8 @@
 //! | linear perpetual | [`LinearPerpetual`] | multiplier: the size amount |
 //! | inverse future | [`InverseFuture`], settled in the settlement asset (the underlying) | contract value: the size amount |
 //! | inverse perpetual | [`InversePerpetual`] | contract value: the size amount |
-//! | option | none: [`MarginError::UnsupportedSpec`] | |
+//! | linear option | [`OptionInstrument`], settled in the settlement asset, cash or physical | multiplier: the size amount |
+//! | inverse option | [`OptionInstrument`], settled in the settlement asset (the underlying), cash | multiplier: the size amount |
 //!
 //! The identifier and the asset codes go through [`InstrumentId::new`] and
 //! [`Asset::new`], and the expiry (milliseconds since the epoch) is passed
@@ -79,12 +80,16 @@
 
 use core::convert::TryFrom;
 
-use financial_types::instrument::{ContractKind, InstrumentSpec, Margining};
+use financial_types::OptionStyle;
+use financial_types::instrument::{
+    ContractKind, ExerciseStyle as SpecExercise, InstrumentSpec, Margining, SettlementType,
+};
 use rust_decimal::Decimal;
 
 use super::{
-    Instrument, InverseFuture, InversePerpetual, InverseTerms, LinearFuture, LinearPerpetual,
-    LinearTerms, SpotInstrument,
+    ExerciseStyle, Instrument, InverseFuture, InversePerpetual, InverseTerms, LinearFuture,
+    LinearPerpetual, LinearTerms, OptionContract, OptionDelivery, OptionInstrument,
+    OptionMargining, OptionRight, SpotInstrument,
 };
 use crate::error::{MarginError, Result};
 use crate::ids::{Asset, InstrumentId};
@@ -159,9 +164,6 @@ impl Instrument {
     pub fn from_spec(spec: &InstrumentSpec, scales: InstrumentScales) -> Result<Self> {
         let id = InstrumentId::new(spec.id().as_str())?;
         let (kind, margining) = (spec.kind(), spec.margining());
-        if kind == ContractKind::Option {
-            return Err(MarginError::unsupported_spec(id, kind, margining));
-        }
         let tick_digits = spec
             .price_ticks()
             .bands()
@@ -224,9 +226,57 @@ impl Instrument {
                 let terms = InverseTerms::new(id, settlement, size, price_scale, contract_scale)?;
                 Ok(InversePerpetual::new(terms).into())
             }
+            (ContractKind::Option, Margining::Linear | Margining::Inverse, Some(expiry_ms)) => {
+                let Some(contract) = option_contract(spec, margining, expiry_ms)? else {
+                    return Err(MarginError::unsupported_spec(id, kind, margining));
+                };
+                let terms = LinearTerms::new(id, settlement, size, price_scale, contract_scale)?;
+                Ok(OptionInstrument::new(terms, contract)?.into())
+            }
             _ => Err(MarginError::unsupported_spec(id, kind, margining)),
         }
     }
+}
+
+/// The terms of an option specification; `None` when it has no option terms
+/// or uses a style or settlement type added to `financial_types` and not
+/// mapped here.
+fn option_contract(
+    spec: &InstrumentSpec,
+    margining: Margining,
+    expiry_ms: u64,
+) -> Result<Option<OptionContract>> {
+    let Some(terms) = spec.option() else {
+        return Ok(None);
+    };
+    let exercise = match terms.exercise() {
+        SpecExercise::European => ExerciseStyle::European,
+        SpecExercise::American => ExerciseStyle::American,
+        _ => return Ok(None),
+    };
+    let delivery = match terms.settlement() {
+        SettlementType::Cash => OptionDelivery::Cash,
+        SettlementType::Physical => OptionDelivery::Physical,
+        _ => return Ok(None),
+    };
+    let right = match terms.style() {
+        OptionStyle::Call => OptionRight::Call,
+        OptionStyle::Put => OptionRight::Put,
+    };
+    let margining = match margining {
+        Margining::Linear => OptionMargining::Linear,
+        Margining::Inverse => OptionMargining::Inverse,
+        _ => return Ok(None),
+    };
+    Ok(Some(OptionContract {
+        underlying: Asset::new(spec.underlying().as_str())?,
+        strike: terms.strike(),
+        expiry_ms,
+        right,
+        exercise,
+        delivery,
+        margining,
+    }))
 }
 
 /// The same conversion as [`Instrument::from_spec`].

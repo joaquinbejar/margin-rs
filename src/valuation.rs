@@ -78,6 +78,22 @@
 //!   [`InvalidMarkPolicy::HaircutStale`]: they are excluded.
 //! - Attribution: `unrealized` adds `upnl * price(settlement asset)`;
 //!   realized PnL and funding were paid in cash and are counted once.
+//!
+//! # Options
+//!
+//! An open option is valued the same way at its premium mark, listed in
+//! [`AccountValuation::derivatives`], with `upnl = rhe(Q * M * mark) - basis`.
+//! Zero is a valid option mark; a negative one is an error. Because the premium
+//! already moved cash, unlike the basis of a future:
+//!
+//! - Reporting equity adds the market value `rhe(Q * M * mark)`, not the
+//!   `upnl`: a long adds its value and a short deducts it.
+//!   `equity - net_transfers = realized + unrealized - fees` still holds.
+//! - Collateral counts `min(market value, 0)` in the same net amount: a short
+//!   deducts its mark and a long gives no credit. A short at an invalid mark
+//!   makes collateral equity `None`, even at a mark of zero; a long at one
+//!   counts nothing.
+//! - Attribution is as for a future.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -262,7 +278,7 @@ pub struct AssetValue {
     pub collateral_value: Option<Decimal>,
 }
 
-/// Valuation of one open future or perpetual position, in its
+/// Valuation of one open future, perpetual or option position, in its
 /// settlement asset.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DerivativeValue {
@@ -284,6 +300,39 @@ pub struct DerivativeValue {
     /// `market_value - basis`; `basis - market_value` for an inverse
     /// contract.
     pub unrealized_pnl: Decimal,
+    /// True for an option, whose basis already moved cash. See the
+    /// [module docs](self#options).
+    pub is_option: bool,
+}
+
+impl DerivativeValue {
+    /// What the position adds to reporting equity on top of the cash.
+    pub(crate) fn equity_term(&self) -> Decimal {
+        if self.is_option {
+            self.market_value
+        } else {
+            self.unrealized_pnl
+        }
+    }
+
+    /// What collateral counts of the position on top of the cash.
+    pub(crate) fn collateral_term(&self) -> Decimal {
+        if self.is_option {
+            self.market_value.min(Decimal::ZERO)
+        } else {
+            self.unrealized_pnl
+        }
+    }
+
+    /// True when an invalid mark on the position leaves collateral unknown:
+    /// a loss, or a short option whatever its mark says.
+    pub(crate) fn unbounded_at_invalid_mark(&self) -> bool {
+        if self.is_option {
+            self.contracts < Decimal::ZERO
+        } else {
+            self.unrealized_pnl < Decimal::ZERO
+        }
+    }
 }
 
 /// Split of the PnL into realized, unrealized and fees, in the reporting
@@ -382,7 +431,14 @@ pub(crate) fn pricing(
 fn mark_status(mark: &Mark, as_of_ms: u64, max_age_ms: u64) -> MarkStatus {
     if mark.price <= Decimal::ZERO {
         MarkStatus::NonPositive
-    } else if mark.timestamp_ms > as_of_ms {
+    } else {
+        mark_timing(mark, as_of_ms, max_age_ms)
+    }
+}
+
+/// Status of a present mark by its time alone: future, stale or valid.
+fn mark_timing(mark: &Mark, as_of_ms: u64, max_age_ms: u64) -> MarkStatus {
+    if mark.timestamp_ms > as_of_ms {
         MarkStatus::Future {
             ahead_ms: mark.timestamp_ms.abs_diff(as_of_ms),
         }
@@ -425,7 +481,8 @@ pub(crate) fn derivative_values(
                 derivative @ (Instrument::LinearFuture(_)
                 | Instrument::LinearPerpetual(_)
                 | Instrument::InverseFuture(_)
-                | Instrument::InversePerpetual(_)),
+                | Instrument::InversePerpetual(_)
+                | Instrument::Option(_)),
             ) => derivative
                 .derivative()
                 .ok_or(MarginError::arithmetic("derivative terms"))?,
@@ -441,7 +498,20 @@ pub(crate) fn derivative_values(
             .ok_or_else(|| MarginError::MissingMark {
                 instrument: id.clone(),
             })?;
-        let status = mark_status(&mark, marks.as_of_ms, max_age_ms);
+        let is_option = matches!(snapshot.instruments.get(id), Some(Instrument::Option(_)));
+        // A worthless option has a mark of zero: it is timed like any other,
+        // and only a negative one is refused.
+        let status = if is_option {
+            if mark.price < Decimal::ZERO {
+                return Err(MarginError::invalid_input(
+                    "instrument mark",
+                    "must not be negative",
+                ));
+            }
+            mark_timing(&mark, marks.as_of_ms, max_age_ms)
+        } else {
+            mark_status(&mark, marks.as_of_ms, max_age_ms)
+        };
         if status == MarkStatus::NonPositive {
             return Err(MarginError::invalid_input(
                 "instrument mark",
@@ -476,6 +546,7 @@ pub(crate) fn derivative_values(
                 basis: position.cost_basis,
                 market_value,
                 unrealized_pnl,
+                is_option,
             },
         );
     }
@@ -498,9 +569,9 @@ pub(crate) fn collateral_upnl(
             .or_insert_with(|| Some(Vec::new()));
         if value.status.is_valid() {
             if let Some(values) = entry {
-                values.push(value.unrealized_pnl);
+                values.push(value.collateral_term());
             }
-        } else if value.unrealized_pnl < Decimal::ZERO {
+        } else if value.unbounded_at_invalid_mark() {
             *entry = None;
         }
     }
@@ -546,12 +617,13 @@ pub(crate) fn validate(
                 Instrument::LinearFuture(_)
                 | Instrument::LinearPerpetual(_)
                 | Instrument::InverseFuture(_)
-                | Instrument::InversePerpetual(_),
+                | Instrument::InversePerpetual(_)
+                | Instrument::Option(_),
             ) => {}
             Some(Instrument::Spot(_)) => {
                 return Err(MarginError::invalid_input(
                     "instrument marks",
-                    "only futures and perpetuals take instrument marks",
+                    "only futures, perpetuals and options take instrument marks",
                 ));
             }
             None => {
@@ -745,14 +817,16 @@ pub fn value(
             },
         );
     }
-    // The unrealized PnL of open derivatives, in their settlement assets.
+    // The unrealized PnL of open futures and perpetuals and the market value
+    // of open options, in their settlement assets.
     for value in derivatives.values() {
-        if value.unrealized_pnl.is_zero() {
+        let term = value.equity_term();
+        if term.is_zero() {
             continue;
         }
         flag(&value.settlement);
         match price(&value.settlement) {
-            Some(p) => equity_terms.push(vec![value.unrealized_pnl, p]),
+            Some(p) => equity_terms.push(vec![term, p]),
             None => equity_known = false,
         }
     }
@@ -808,7 +882,8 @@ pub fn value(
                 derivative @ (Instrument::LinearFuture(_)
                 | Instrument::LinearPerpetual(_)
                 | Instrument::InverseFuture(_)
-                | Instrument::InversePerpetual(_)),
+                | Instrument::InversePerpetual(_)
+                | Instrument::Option(_)),
             ) => {
                 let settlement = derivative.quote();
                 if !position.realized_pnl.is_zero() {

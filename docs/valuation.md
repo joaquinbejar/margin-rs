@@ -60,6 +60,10 @@ An open derivative position is valued at its **instrument mark**, `MarkSet::inst
 
 `maintenance::CollateralView::from_valuation` builds the maintenance view from a valuation without recomputing anything: equity and collateral equity on total balances (reservations not deducted), `None` preserved.
 
+## Options
+
+An open option is valued at its premium mark, which may be zero. Its premium already moved cash, so reporting equity adds its market value instead of its unrealized PnL, and collateral counts only `min(market value, 0)`. See `options.md`.
+
 ## Stress scenarios
 
 `stress` values the snapshot with and without a `Scenario`, from the baseline marks. It never changes the snapshot, the marks or the ledger: it values a stressed copy of each, with `valuation::value`, so open futures and perpetuals use the same rule as an unstressed valuation, `upnl = rhe(Q * M * mark) - basis`. It applies, in this order:

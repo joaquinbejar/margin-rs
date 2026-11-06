@@ -303,7 +303,8 @@ pub enum MarginError {
     },
 
     /// An instrument specification has no ledger instrument (feature
-    /// `instruments`).
+    /// `instruments`): a kind, margining, exercise style or settlement type
+    /// added to `financial_types` and not mapped here.
     #[cfg(feature = "instruments")]
     #[error("{instrument}: a {margining:?} {kind:?} specification has no ledger instrument")]
     UnsupportedSpec {

@@ -325,6 +325,15 @@ impl LiquidationAccount {
                 // Spot holdings are not part of the plan.
                 continue;
             };
+            // A premium is not a virtual notional: the plan's cash would be
+            // wrong, so an account with an open option gets no plan at all.
+            if product == crate::initial_margin::ProductKind::Option {
+                return Err(MarginError::UnsupportedInstrument {
+                    rule: "closeout".to_string(),
+                    instrument: id.clone(),
+                    reason: "an open option has no closeout plan yet",
+                });
+            }
             if let Some(expiry_ms) = contract.expiry_ms
                 && expiry_ms <= as_of_ms
             {
