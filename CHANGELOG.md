@@ -16,6 +16,10 @@ follows [Semantic Versioning](https://semver.org/).
   `LiquidationAccount::from_ledger` take any rule evaluated on the whole
   projected account, including one that nets across positions. Every
   `PiecewiseLinearMargin` implements it, with unchanged plans (#52).
+- Rule `scenario-pm/1`: `rules::ScenarioPm`, `ScenarioPmRates`, `ScenarioSets`,
+  `PmLeg`, `PmLegKind`, `PmOrder`, `PmBreakdown` and `ScenarioPmRequirement`.
+  Nets linear and option legs over caller supplied scenarios, with floors and
+  an admission figure over resting orders. See `docs/scenario-margin.md` (#51).
 
 ### Changed
 
