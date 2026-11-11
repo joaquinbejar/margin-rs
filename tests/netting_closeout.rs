@@ -295,3 +295,24 @@ fn test_wrong_monotone_claim_takes_the_whole_level() {
     assert_eq!(plan.reductions[0].contracts, dec!(10));
     assert_ne!(plan.outcome, CloseoutOutcome::TargetMet);
 }
+
+/// The hedged pair with cash 4.01 meets the target only in a narrow band,
+/// n in [3.9975, 4.00166...]. At a step of 0.0005 the walk reaches the
+/// reserve at 1.948 and gallops; its probes 3.996 and 6.044 straddle the
+/// band without landing in it, so the whole level is taken and `minimal`
+/// is false: a count between two probes met the target.
+#[test]
+fn test_gallop_missing_a_narrow_band_is_not_minimal() {
+    let mut account = hedged();
+    account.cash = dec!(4.01);
+    let plan = plan_liquidation(
+        &NetLinear::new(),
+        &account,
+        &bids_on_a(),
+        &policy(CloseoutTarget::Maintenance, dec!(0.0005)),
+    )
+    .expect("plan");
+    assert_eq!(plan.reductions[0].contracts, dec!(10));
+    assert_ne!(plan.outcome, CloseoutOutcome::TargetMet);
+    assert!(!plan.minimal);
+}

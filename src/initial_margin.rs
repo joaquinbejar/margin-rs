@@ -255,7 +255,9 @@ pub trait AccountMargin: InitialMarginModel {
     /// cash cannot turn negative over the level (for example, closing a
     /// position whose fills credit cash, or cash far above the level's
     /// cost). If the claim is wrong the plan stays valid, every count it
-    /// takes is evaluated exactly, but the count may not be the smallest.
+    /// takes is evaluated exactly, but it can miss every meeting count and
+    /// take the whole level, and [`LiquidationPlan::minimal`](crate::liquidation::LiquidationPlan::minimal)
+    /// still reports true: it assumes the claim.
     fn plan_monotone(&self, position: &ExposurePosition) -> bool {
         let _ = position;
         false

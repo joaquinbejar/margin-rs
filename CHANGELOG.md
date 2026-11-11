@@ -13,8 +13,12 @@ follows [Semantic Versioning](https://semver.org/).
   evaluations, instead of walked count by count (#69).
 - A tierless walk that reaches the last 200 units of `SEARCH_BUDGET` gallops
   and bisects the rest of the level, `O(log n)` evaluations, instead of
-  failing with `CloseoutSearchLimit`; `minimal` is then false. Plans the walk
-  finished within the budget are unchanged (#69).
+  failing with `CloseoutSearchLimit`; `minimal` is then false, also when no
+  probe meets the target and the whole level is taken. Plans the walk
+  finishes within 3896 evaluations (the budget less the reserve) are
+  unchanged (#69).
+- `LinearWithOptionsIm` declares its option positions monotone
+  (`plan_monotone`), so their levels are bisected.
 
 ## [0.3.0] - 2026-11-11
 

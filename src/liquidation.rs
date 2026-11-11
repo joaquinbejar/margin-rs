@@ -97,8 +97,9 @@
 //!   a linear position; cash changes by `fill cash - fee`: the premium is
 //!   the cash, credited when a long is sold and debited when a short is
 //!   bought back;
-//! - it gets no certificate: its levels are walked count by count (see
-//!   [rules](self#rules)). The rule must margin options, for example
+//! - it gets no certificate: its levels are bisected when the rule declares
+//!   it monotone, else walked and galloped (see [rules](self#rules)). The
+//!   rule must margin options, for example
 //!   [`LinearWithOptionsIm`](crate::rules::LinearWithOptionsIm).
 //!
 //! Marks stay those of the [`ExposureView`] for the whole plan: the
@@ -120,15 +121,20 @@
 //!   order and takes the first that meets the target, the smallest; if no
 //!   count does, the whole level. Each evaluation uses one unit of
 //!   [`SEARCH_BUDGET`]. When the walk reaches the last
-//!   `GALLOP_RESERVE` (200) units, it gallops from the next count
+//!   `GALLOP_RESERVE` (200) units (so an exact walk covers at most 3896
+//!   counts of the whole plan), it gallops from the next count
 //!   (offsets 1, 2, 4, ...) until one meets the target and bisects the gap
 //!   before it, `O(log n)` evaluations: the count meets the target, but
 //!   [`LiquidationPlan::minimal`] becomes false, since it is the smallest
-//!   only if meeting the target is monotone over that gap. A rule that declares the
+//!   only if meeting the target is monotone over that gap; when no probe
+//!   meets the target the whole level is taken, also with `minimal` false.
+//!   A rule that declares the
 //!   target monotone in the count ([`AccountMargin::plan_monotone`]) gets
 //!   a bisection of the level instead, `O(log n)` evaluations: the
 //!   smallest meeting count when the claim holds, the whole level when its
-//!   last count does not meet the target. Instruments are taken in
+//!   last count does not meet the target. A wrong claim keeps every taken
+//!   count exact but can take the whole level although a smaller count
+//!   meets the target, and `minimal` assumes the claim. Instruments are taken in
 //!   decreasing order of the maintenance the rule attributes to their
 //!   lines.
 //!
@@ -998,7 +1004,10 @@ impl<M: AccountMargin> Planner<'_, M> {
     /// The smallest count of a level that meets the target, by bisection,
     /// when the rule declares meeting it monotone in the count
     /// ([`AccountMargin::plan_monotone`]); the whole level when its last
-    /// count does not meet it. Each evaluation uses one unit of the search
+    /// count does not meet it. Both, and [`LiquidationPlan::minimal`],
+    /// assume the claim: under a wrong one the plan may take the whole
+    /// level even though a smaller count meets the target, and still
+    /// report `minimal`. Each evaluation uses one unit of the search
     /// budget; running out is `limit`.
     fn bisect_level(
         &self,
@@ -1052,7 +1061,8 @@ impl<M: AccountMargin> Planner<'_, M> {
     /// evaluations from the search budget. The count found meets the target
     /// and is the smallest when meeting it is monotone over that gap, which
     /// is not proven: [`LiquidationPlan::minimal`] becomes false. The whole
-    /// level when no evaluated count meets the target.
+    /// level when no evaluated count meets the target, also with `minimal`
+    /// false: a count between two probes may have met it.
     fn gallop_level(
         &self,
         grid: &ContractGrid,
@@ -1090,6 +1100,8 @@ impl<M: AccountMargin> Planner<'_, M> {
             stride = stride.saturating_mul(2);
         };
         let Some((mut high, mut best)) = found else {
+            // Unprobed counts between the probes may meet the target.
+            self.minimal.set(false);
             return Self::whole_level(grid, size, last, at);
         };
         self.minimal.set(false);

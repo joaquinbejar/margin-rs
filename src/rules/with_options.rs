@@ -13,7 +13,8 @@
 //! [`plan_liquidation`](crate::liquidation::plan_liquidation) closes an
 //! account of linear and option positions under it: linear positions keep
 //! the exact tiered search (each option's margin is constant while a
-//! linear position shrinks), option positions are searched count by count.
+//! linear position shrinks), option positions are declared monotone and
+//! their levels bisected.
 
 use std::collections::BTreeMap;
 
@@ -165,5 +166,14 @@ impl<L: PiecewiseLinearMargin> AccountMargin for LinearWithOptionsIm<L> {
     /// The linear rule's tiers for a linear position, none for an option.
     fn plan_tiers(&self, position: &ExposurePosition) -> Option<Vec<MarginTier>> {
         (position.product != ProductKind::Option).then(|| self.linear.margin_tiers(position))
+    }
+
+    /// True for an option: [`ShortOptionIm`] margins each position on its
+    /// own, linearly in its contracts, and a long requires nothing, so on a
+    /// level the excess changes linearly with the count closed. Only the
+    /// cash condition can break the claim (buying back a short costs cash);
+    /// see [`AccountMargin::plan_monotone`].
+    fn plan_monotone(&self, position: &ExposurePosition) -> bool {
+        position.product == ProductKind::Option
     }
 }

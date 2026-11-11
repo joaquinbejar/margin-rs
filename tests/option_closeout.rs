@@ -319,3 +319,58 @@ fn test_rules_in_different_currencies_are_refused() {
         })
     ));
 }
+
+/// A short of 10000 CALL under `LinearWithOptionsIm`, declared monotone:
+/// the level is bisected, well within the search budget, to the smallest
+/// count meeting maintenance. With cash 80000, buying back `n` at 6.5
+/// leaves collateral `80000 - 6.5n - 6 (10000 - n) = 20000 - 0.5n` against
+/// `0.075 * 100 * (10000 - n)`: met from n = 55000 / 7 = 7857.14, so 7858.
+#[test]
+fn test_large_short_option_is_bisected() {
+    let model = model();
+    let account = LiquidationAccount {
+        view: margin_rs::initial_margin::ExposureView {
+            account: AccountId::new("acct").expect("id"),
+            venue: VenueId::new("venue").expect("id"),
+            positions: vec![margin_rs::initial_margin::ExposurePosition {
+                instrument: iid("CALL"),
+                product: margin_rs::initial_margin::ProductKind::Option,
+                settlement: usdc(),
+                contracts: dec!(-10000),
+                size: margin_rs::ContractSize::Multiplier(Decimal::ONE),
+                mark: dec!(6),
+            }],
+        },
+        basis: BTreeMap::from([(iid("CALL"), dec!(-50000))]),
+        cash: dec!(80000),
+        resting_orders: vec![],
+    };
+    let plan = plan_liquidation(
+        &model,
+        &account,
+        &BTreeMap::from([(
+            iid("CALL"),
+            vec![LiquidityLevel {
+                price: dec!(6.5),
+                contracts: dec!(20000),
+            }],
+        )]),
+        &LiquidationPolicy {
+            target: CloseoutTarget::Maintenance,
+            fee_rate: Decimal::ZERO,
+            fee_rates: BTreeMap::new(),
+            loss_budget: None,
+            contract_step: Decimal::ONE,
+        },
+    )
+    .expect("plan within the budget");
+    assert_eq!(plan.outcome, CloseoutOutcome::TargetMet);
+    assert!(plan.minimal);
+    let n = plan.reductions[0].contracts;
+    assert_eq!(n, dec!(7858));
+    // n meets the target and n - 1 does not.
+    let collateral = |n: Decimal| dec!(80000) - dec!(6.5) * n - dec!(6) * (dec!(10000) - n);
+    let mm = |n: Decimal| dec!(7.5) * (dec!(10000) - n);
+    assert!(collateral(n) >= mm(n));
+    assert!(collateral(n - Decimal::ONE) < mm(n - Decimal::ONE));
+}
