@@ -38,7 +38,8 @@ pub struct ViewPosition {
     pub basis: Decimal,
 }
 
-/// One resting risk-increasing order.
+/// One resting risk-increasing order, as the caller declares it: the view
+/// does not check that the order would increase the position's risk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ViewReservation {
     /// Instrument.
