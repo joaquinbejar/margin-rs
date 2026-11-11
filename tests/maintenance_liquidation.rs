@@ -92,6 +92,7 @@ fn policy(target: CloseoutTarget) -> LiquidationPolicy {
         target,
         fee_rate: dec!(0.0005),
         fee_rates: BTreeMap::new(),
+        loss_budget: None,
         contract_step: Decimal::ONE,
     }
 }
@@ -366,7 +367,7 @@ mod plan {
         assert_eq!(plan.after.positions[0].unrealized_pnl, dec!(-35));
         assert_eq!(plan.deficit, dec!(0));
         assert_eq!(plan.debt, dec!(0));
-        assert!(plan.unfilled.is_empty());
+        assert_eq!(plan.unfilled, BTreeMap::new());
 
         assert_eq!(
             plan.intents().expect("intents"),
@@ -1154,4 +1155,127 @@ fn test_fee_rates_outside_unit_interval_are_refused() {
             })
         ));
     }
+}
+
+fn budgeted(target: CloseoutTarget, budget: Decimal, step: Decimal) -> LiquidationPolicy {
+    LiquidationPolicy {
+        loss_budget: Some(budget),
+        contract_step: step,
+        ..policy(target)
+    }
+}
+
+/// Cash 0: collateral -50 - 1.047n after closing n at 94. With B = 60,
+/// n <= 9.55: 9 contracts at a step of 1 (-59.423; 10 gives -60.47), 9.5
+/// at a step of 0.5 (-59.9465).
+#[test]
+fn test_loss_budget_cuts_the_level_and_stops() {
+    let account = long_btc(dec!(0));
+    let liquidity = bids(&[(dec!(94), dec!(100))]);
+    let unbounded = plan(&account, &liquidity, &policy(CloseoutTarget::Maintenance));
+    assert_eq!(unbounded.reductions[0].contracts, dec!(10));
+    assert_eq!(unbounded.outcome, CloseoutOutcome::FlatWithDeficit);
+
+    for (step, contracts, collateral) in [
+        (dec!(1), dec!(9), dec!(-59.423)),
+        (dec!(0.5), dec!(9.5), dec!(-59.9465)),
+    ] {
+        let plan = plan(
+            &account,
+            &liquidity,
+            &budgeted(CloseoutTarget::Maintenance, dec!(60), step),
+        );
+        assert_eq!(plan.outcome, CloseoutOutcome::BudgetExhausted);
+        assert_eq!(plan.reductions.len(), 1);
+        assert_eq!(plan.reductions[0].contracts, contracts);
+        assert_eq!(plan.after.collateral, collateral);
+        assert!(plan.after.collateral >= dec!(-60));
+        assert_eq!(plan.unfilled, BTreeMap::new());
+        assert_eq!(plan.cancels, vec![oid("o1"), oid("o2")]);
+    }
+}
+
+/// Cash 0, B = 55, bids 3 at 94 then 100 at 90. The first level ends at
+/// -53.141; one contract at 90 would give -63.186: the plan stops after
+/// the first level, leaving the second untouched.
+#[test]
+fn test_loss_budget_stops_before_a_level_with_no_count_within_it() {
+    let plan = plan(
+        &long_btc(dec!(0)),
+        &bids(&[(dec!(94), dec!(3)), (dec!(90), dec!(100))]),
+        &budgeted(CloseoutTarget::Maintenance, dec!(55), Decimal::ONE),
+    );
+    assert_eq!(plan.outcome, CloseoutOutcome::BudgetExhausted);
+    assert_eq!(plan.reductions.len(), 1);
+    assert_eq!(plan.reductions[0].contracts, dec!(3));
+    assert_eq!(plan.after.collateral, dec!(-53.141));
+}
+
+/// Cash 0, B = 40: the equity is already -50, so nothing is closed.
+#[test]
+fn test_loss_budget_already_exceeded_closes_nothing() {
+    let plan = plan(
+        &long_btc(dec!(0)),
+        &bids(&[(dec!(94), dec!(100))]),
+        &budgeted(CloseoutTarget::Maintenance, dec!(40), Decimal::ONE),
+    );
+    assert_eq!(plan.outcome, CloseoutOutcome::BudgetExhausted);
+    assert_eq!(plan.reductions, vec![]);
+    assert_eq!(plan.after, plan.before);
+    assert_eq!(plan.cancels, vec![oid("o1"), oid("o2")]);
+}
+
+/// Cash 80: the target is met at 5 contracts (collateral 24.765), inside
+/// a budget of 0; an ample budget leaves every plan unchanged.
+#[test]
+fn test_loss_budget_target_met_and_ample_budget_unchanged() {
+    let account = long_btc(dec!(80));
+    let liquidity = bids(&[(dec!(94), dec!(100))]);
+    let unbounded = plan(&account, &liquidity, &policy(CloseoutTarget::Maintenance));
+    let tight = plan(
+        &account,
+        &liquidity,
+        &budgeted(CloseoutTarget::Maintenance, dec!(0), Decimal::ONE),
+    );
+    assert_eq!(tight.outcome, CloseoutOutcome::TargetMet);
+    assert_eq!(tight.reductions[0].contracts, dec!(5));
+    assert_eq!(tight, unbounded);
+    for (cash, target) in [
+        (dec!(0), CloseoutTarget::Maintenance),
+        (dec!(0), CloseoutTarget::Flat),
+        (dec!(30), CloseoutTarget::Initial),
+    ] {
+        let account = long_btc(cash);
+        assert_eq!(
+            plan(
+                &account,
+                &liquidity,
+                &budgeted(target, dec!(1000), Decimal::ONE)
+            ),
+            plan(&account, &liquidity, &policy(target)),
+        );
+    }
+}
+
+#[test]
+fn test_loss_budget_negative_or_off_scale_is_refused() {
+    let refuse = |budget| {
+        plan_liquidation(
+            &rule(),
+            &long_btc(dec!(0)),
+            &bids(&[(dec!(94), dec!(100))]),
+            &budgeted(CloseoutTarget::Maintenance, budget, Decimal::ONE),
+        )
+    };
+    assert!(matches!(
+        refuse(dec!(-1)),
+        Err(MarginError::InvalidInput {
+            field: "loss_budget",
+            ..
+        })
+    ));
+    assert!(matches!(
+        refuse(dec!(0.0000001)),
+        Err(MarginError::PrecisionExceeded { .. })
+    ));
 }

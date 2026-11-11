@@ -91,6 +91,31 @@
 //! Marks stay those of the [`ExposureView`] for the whole plan: the
 //! scenario's prices for the closeout are the liquidity levels.
 //!
+//! # Loss budget
+//!
+//! With [`LiquidationPolicy::loss_budget`] `Some(B)`, the plan's projected
+//! equity, the collateral of [`AccountSummary`] (cash plus unrealized PnL
+//! at the marks, every figure rounded as above), never ends a fill below
+//! `-B`:
+//!
+//! - if it is already below `-B` before any fill, the plan cancels the
+//!   resting orders and closes nothing;
+//! - on each level the plan first chooses its count as without a budget;
+//!   if that count brings the equity below `-B`, it bisects the level's
+//!   grid between zero and that count for a count within the budget whose
+//!   next larger count that can be booked is not, takes it (if positive)
+//!   and stops: no later level or instrument is used.
+//!
+//! The outcome is then [`CloseoutOutcome::BudgetExhausted`], unless the
+//! cut count still meets the target. A level may so be used in part, at a
+//! multiple of [`LiquidationPolicy::contract_step`]. Each evaluated count
+//! is booked with the rounding above, so the bound holds exactly; the
+//! equity is linear in the count only up to that rounding (each figure
+//! within one quantum), so the count found is the largest within the
+//! budget whenever the rounding does not reverse the order of two
+//! neighbouring counts. The bisection takes at most as many evaluations as
+//! the grid index has bits and does not use [`SEARCH_BUDGET`].
+//!
 //! # Search within a level
 //!
 //! On one level, with `n` the contracts closed there, `cash(n)` is linear
@@ -218,6 +243,13 @@ pub struct LiquidationPolicy {
     /// [`fee_rate`](Self::fee_rate). An entry for an instrument the account
     /// does not hold is allowed and unused.
     pub fee_rates: BTreeMap<InstrumentId, Decimal>,
+    /// Loss budget `B`, at least zero, at the rule's
+    /// [`cash_scale`](PiecewiseLinearMargin::cash_scale): the plan takes no
+    /// count that brings its projected equity (the collateral of
+    /// [`AccountSummary`], cash plus unrealized PnL at the marks) below
+    /// `-B`, and stops with [`CloseoutOutcome::BudgetExhausted`] instead.
+    /// `None` sets no bound. See the [loss budget](self#loss-budget).
+    pub loss_budget: Option<Decimal>,
     /// Smallest number of contracts the plan trades at a time, positive.
     /// The last step of a position or level may be smaller.
     pub contract_step: Decimal,
@@ -509,6 +541,10 @@ pub enum CloseoutOutcome {
     FlatWithDeficit,
     /// Liquidity ran out with positions still open and the target not met.
     LiquidityExhausted,
+    /// The plan stopped at [`LiquidationPolicy::loss_budget`] with the
+    /// target not met: the next count would bring the projected equity
+    /// below `-B`, or it was already below before any fill.
+    BudgetExhausted,
 }
 
 /// What an adapter must do to execute the plan, in order.
@@ -809,6 +845,62 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
         Self::whole_level(&grid, size, last, &at)
     }
 
+    /// True when `summary` keeps the projected equity within the loss
+    /// budget, `collateral >= -B`; always true without a budget.
+    fn within_budget(&self, summary: &AccountSummary) -> bool {
+        self.policy
+            .loss_budget
+            .is_none_or(|budget| summary.collateral >= neg(budget))
+    }
+
+    /// The fill of position `index` on one level cut to the loss budget:
+    /// the largest count, at most `chosen` (a count of the level that
+    /// breaks the budget), found by bisection, that keeps the projected
+    /// equity within it; `None` when no positive count does. See the
+    /// [loss budget](self#loss-budget).
+    fn cut_to_budget(
+        &self,
+        state: &State,
+        index: usize,
+        level: usize,
+        price: Decimal,
+        chosen: Decimal,
+    ) -> Result<Option<(State, ForcedReduction, AccountSummary)>> {
+        let size = state.open(index)?.exposure.contracts.abs();
+        let grid = ContractGrid::new(self.policy.contract_step, chosen)?;
+        let at = |k: GridIndex| -> Result<(State, ForcedReduction, AccountSummary)> {
+            let n = grid.contracts(k)?;
+            let (next, reduction) = self.reduce(state, index, level, price, n)?;
+            let summary = self.summary(&next)?;
+            Ok((next, reduction, summary))
+        };
+        // Invariant: `low` is zero or a count within the budget; `high`
+        // breaks it, or no count in `(low, high]` other than `high` can be
+        // booked.
+        let mut low = GridIndex::ZERO;
+        let mut high = grid.last();
+        let mut best = None;
+        while !ContractGrid::adjacent(low, high) {
+            let mid = ContractGrid::midpoint(low, high);
+            let Some(candidate) = grid.first_holding(size, (mid, high))? else {
+                high = mid;
+                continue;
+            };
+            if candidate == high {
+                high = mid;
+                continue;
+            }
+            let attempt = at(candidate)?;
+            if self.within_budget(&attempt.2) {
+                low = candidate;
+                best = Some(attempt);
+            } else {
+                high = candidate;
+            }
+        }
+        Ok(best)
+    }
+
     /// A count certified to meet the target, checked.
     fn certified_count(
         &self,
@@ -982,6 +1074,15 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
             .any(|rate| *rate < Decimal::ZERO || *rate >= Decimal::ONE)
         {
             return Err(MarginError::invalid_input("fee_rates", "must be in [0, 1)"));
+        }
+        if let Some(budget) = policy.loss_budget {
+            if budget < Decimal::ZERO {
+                return Err(MarginError::invalid_input(
+                    "loss_budget",
+                    "must be at least zero",
+                ));
+            }
+            check_scale(budget, self.scale, "loss_budget")?;
         }
         if policy.contract_step <= Decimal::ZERO {
             return Err(MarginError::invalid_input(
@@ -1183,7 +1284,11 @@ fn plan_with_budget<M: PiecewiseLinearMargin>(
     let mut reductions = Vec::new();
     let mut unfilled = BTreeMap::new();
     let mut current = before.clone();
+    let mut stopped = !planner.within_budget(&before);
     'instruments: for (_, instrument) in order {
+        if stopped {
+            break;
+        }
         let index = state
             .positions
             .iter()
@@ -1198,13 +1303,29 @@ fn plan_with_budget<M: PiecewiseLinearMargin>(
             if size.is_zero() {
                 break;
             }
-            let (next, reduction, summary) =
+            let (mut next, mut reduction, mut summary) =
                 planner.close_on_level(&state, index, level, available)?;
+            if !planner.within_budget(&summary) {
+                stopped = true;
+                match planner.cut_to_budget(
+                    &state,
+                    index,
+                    level,
+                    available.price,
+                    reduction.contracts,
+                )? {
+                    Some(cut) => (next, reduction, summary) = cut,
+                    None => break,
+                }
+            }
             state = next;
             reductions.push(reduction);
             current = summary;
+            if stopped {
+                break;
+            }
         }
-        if planner.met(&current) {
+        if stopped || planner.met(&current) {
             break;
         }
         let left = state.open(index)?.exposure.contracts.abs();
@@ -1215,6 +1336,8 @@ fn plan_with_budget<M: PiecewiseLinearMargin>(
 
     let outcome = if planner.met(&current) {
         CloseoutOutcome::TargetMet
+    } else if stopped {
+        CloseoutOutcome::BudgetExhausted
     } else if current.positions.is_empty() {
         CloseoutOutcome::FlatWithDeficit
     } else {
@@ -1620,6 +1743,7 @@ mod tests {
             target: CloseoutTarget::Initial,
             fee_rate: dec!(0),
             fee_rates: BTreeMap::new(),
+            loss_budget: None,
             contract_step: dec!(1),
         }
     }
@@ -1739,6 +1863,7 @@ mod tests {
             target: CloseoutTarget::Maintenance,
             fee_rate: dec!(0),
             fee_rates: BTreeMap::new(),
+            loss_budget: None,
             contract_step: step,
         };
 

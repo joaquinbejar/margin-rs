@@ -100,6 +100,7 @@ fn policy() -> LiquidationPolicy {
         target: CloseoutTarget::Maintenance,
         fee_rate: dec!(0.0005),
         fee_rates: BTreeMap::new(),
+        loss_budget: None,
         contract_step: dec!(1),
     }
 }

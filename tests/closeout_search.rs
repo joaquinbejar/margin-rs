@@ -95,6 +95,7 @@ fn policy(target: CloseoutTarget, step: Decimal) -> LiquidationPolicy {
         target,
         fee_rate: dec!(0),
         fee_rates: BTreeMap::new(),
+        loss_budget: None,
         contract_step: step,
     }
 }
