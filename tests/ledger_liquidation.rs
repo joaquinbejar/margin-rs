@@ -203,6 +203,7 @@ fn assert_parity(
         &LiquidationPolicy {
             target: CloseoutTarget::Flat,
             fee_rate: dec!(0),
+            fee_rates: BTreeMap::new(),
             contract_step: dec!(1),
         },
     )
@@ -271,6 +272,7 @@ fn liquidation_fixture_round_trips_through_the_ledger() {
         &LiquidationPolicy {
             target: CloseoutTarget::Maintenance,
             fee_rate: dec!(0.0005),
+            fee_rates: BTreeMap::new(),
             contract_step: dec!(1),
         },
     )
@@ -339,6 +341,7 @@ fn quantum_rounding_matches_the_ledger_long() {
         &LiquidationPolicy {
             target: CloseoutTarget::Flat,
             fee_rate: dec!(0.001),
+            fee_rates: BTreeMap::new(),
             contract_step: dec!(1),
         },
     )
@@ -403,6 +406,7 @@ fn quantum_rounding_matches_the_ledger_short() {
         &LiquidationPolicy {
             target: CloseoutTarget::Flat,
             fee_rate: dec!(0.001),
+            fee_rates: BTreeMap::new(),
             contract_step: dec!(1),
         },
     )
@@ -457,6 +461,7 @@ fn closeout_into_debt_is_booked_in_full() {
         &LiquidationPolicy {
             target: CloseoutTarget::Initial,
             fee_rate: dec!(0.0005),
+            fee_rates: BTreeMap::new(),
             contract_step: dec!(1),
         },
     )
@@ -493,6 +498,7 @@ fn zero_basis_is_read_and_planned() {
         &LiquidationPolicy {
             target: CloseoutTarget::Flat,
             fee_rate: dec!(0),
+            fee_rates: BTreeMap::new(),
             contract_step: dec!(1),
         },
     )

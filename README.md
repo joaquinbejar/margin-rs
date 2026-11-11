@@ -286,6 +286,7 @@ fn main() -> margin_rs::Result<()> {
     let policy = LiquidationPolicy {
         target: CloseoutTarget::Maintenance,
         fee_rate: Decimal::new(5, 4), // 0.0005
+        fee_rates: BTreeMap::new(),
         contract_step: Decimal::ONE,
     };
     let plan = plan_liquidation(&rule, &account, &liquidity, &policy)?;

@@ -71,7 +71,8 @@
 //!   when buying; it releases `round_half_even(basis * n / |Qc|, c)` of the
 //!   basis, or the whole basis when it closes the position; its realized PnL
 //!   is `fill cash - released`;
-//! - its fee is `trunc(fee_rate * p * n * M, c)`, one exact product
+//! - its fee is `trunc(f * p * n * M, c)`, with `f` the instrument's
+//!   [fee rate](LiquidationPolicy::fee_rate_for), one exact product
 //!   truncated toward zero;
 //! - cash changes by `realized PnL - fee`, booked in full even when it
 //!   leaves cash negative.
@@ -85,7 +86,7 @@
 //!   `+round_half_even(n * CV / p, c)` when selling and the negative when
 //!   buying (in [`ForcedReduction::fill_cash`]); it releases the basis as
 //!   above; its realized PnL is `released - fill value`;
-//! - its fee is `trunc(fee_rate * n * CV / p, c)`, in the base.
+//! - its fee is `trunc(f * n * CV / p, c)`, in the base.
 //!
 //! Marks stay those of the [`ExposureView`] for the whole plan: the
 //! scenario's prices for the closeout are the liquidity levels.
@@ -205,16 +206,33 @@ pub enum CloseoutTarget {
 }
 
 /// How the closeout is simulated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiquidationPolicy {
     /// When to stop.
     pub target: CloseoutTarget,
     /// Fee charged on every forced fill, as a fraction of its notional, in
-    /// `[0, 1)`.
+    /// `[0, 1)`: the rate of every instrument without an entry in
+    /// [`fee_rates`](Self::fee_rates).
     pub fee_rate: Decimal,
+    /// Fee rate of each listed instrument, in `[0, 1)`, in place of
+    /// [`fee_rate`](Self::fee_rate). An entry for an instrument the account
+    /// does not hold is allowed and unused.
+    pub fee_rates: BTreeMap<InstrumentId, Decimal>,
     /// Smallest number of contracts the plan trades at a time, positive.
     /// The last step of a position or level may be smaller.
     pub contract_step: Decimal,
+}
+
+impl LiquidationPolicy {
+    /// The fee rate charged on forced fills of `instrument`: its entry in
+    /// [`fee_rates`](Self::fee_rates), else [`fee_rate`](Self::fee_rate).
+    #[must_use]
+    pub fn fee_rate_for(&self, instrument: &InstrumentId) -> Decimal {
+        self.fee_rates
+            .get(instrument)
+            .copied()
+            .unwrap_or(self.fee_rate)
+    }
 }
 
 /// Liquidity available at one price to close a position.
@@ -872,7 +890,7 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
             basis: open.basis,
             mark: open.exposure.mark,
             price,
-            fee_rate: self.policy.fee_rate,
+            fee_rate: self.policy.fee_rate_for(&open.exposure.instrument),
             cash: state.cash,
             others,
             tiers,
@@ -913,16 +931,17 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
         };
         // Linear: fill cash - released; inverse: released - fill value.
         let realized_pnl = unrealized_pnl(contract, fill_cash, released_basis)?;
+        let fee_rate = self.policy.fee_rate_for(&open.exposure.instrument);
         let fee = match contract {
             ContractSize::Multiplier(m) => mul_div_round(
-                &[self.policy.fee_rate, price, contracts, m],
+                &[fee_rate, price, contracts, m],
                 &[],
                 scale,
                 Rounding::TowardZero,
                 "fee",
             )?,
             ContractSize::ContractValue(cv) => mul_div_round(
-                &[self.policy.fee_rate, contracts, cv],
+                &[fee_rate, contracts, cv],
                 &[price],
                 scale,
                 Rounding::TowardZero,
@@ -956,6 +975,13 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
         let policy = self.policy;
         if policy.fee_rate < Decimal::ZERO || policy.fee_rate >= Decimal::ONE {
             return Err(MarginError::invalid_input("fee_rate", "must be in [0, 1)"));
+        }
+        if policy
+            .fee_rates
+            .values()
+            .any(|rate| *rate < Decimal::ZERO || *rate >= Decimal::ONE)
+        {
+            return Err(MarginError::invalid_input("fee_rates", "must be in [0, 1)"));
         }
         if policy.contract_step <= Decimal::ZERO {
             return Err(MarginError::invalid_input(
@@ -1047,7 +1073,7 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
 ///
 /// # Errors
 ///
-/// - [`MarginError::InvalidInput`] for an invalid policy (fee rate outside
+/// - [`MarginError::InvalidInput`] for an invalid policy (a fee rate outside
 ///   `[0, 1)`, non positive step, or a step whose multiples are not exact
 ///   below a level's size: field `contract_step`), a basis missing for an
 ///   open position,
@@ -1593,6 +1619,7 @@ mod tests {
         LiquidationPolicy {
             target: CloseoutTarget::Initial,
             fee_rate: dec!(0),
+            fee_rates: BTreeMap::new(),
             contract_step: dec!(1),
         }
     }
@@ -1711,6 +1738,7 @@ mod tests {
         let policy = |step| LiquidationPolicy {
             target: CloseoutTarget::Maintenance,
             fee_rate: dec!(0),
+            fee_rates: BTreeMap::new(),
             contract_step: step,
         };
 
