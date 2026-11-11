@@ -228,7 +228,10 @@ impl ScenarioPm {
     /// The rule with the underlying price of each option instrument, so
     /// that [`InitialMarginModel::requirement`] can margin option
     /// positions of an [`ExposureView`] (an [`ExposurePosition`] carries no
-    /// underlying price). Replaces any prices given before.
+    /// underlying price). Replaces any prices given before. The price only
+    /// feeds the short option floor; an option's values under each scenario
+    /// stay the repriced premiums of the [`ScenarioSets`], exact decimals
+    /// the caller supplies: the crate computes none.
     ///
     /// # Errors
     ///
