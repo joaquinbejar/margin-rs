@@ -119,8 +119,12 @@
 //!   on each level the plan evaluates the counts one by one in increasing
 //!   order and takes the first that meets the target, the smallest; if no
 //!   count does, the whole level. Each evaluation uses one unit of
-//!   [`SEARCH_BUDGET`]; when it runs out the plan fails with
-//!   [`MarginError::CloseoutSearchLimit`]. A rule that declares the
+//!   [`SEARCH_BUDGET`]. When the walk reaches the last
+//!   `GALLOP_RESERVE` (200) units, it gallops from the next count
+//!   (offsets 1, 2, 4, ...) until one meets the target and bisects the gap
+//!   before it, `O(log n)` evaluations: the count meets the target, but
+//!   [`LiquidationPlan::minimal`] becomes false, since it is the smallest
+//!   only if meeting the target is monotone over that gap. A rule that declares the
 //!   target monotone in the count ([`AccountMargin::plan_monotone`]) gets
 //!   a bisection of the level instead, `O(log n)` evaluations: the
 //!   smallest meeting count when the claim holds, the whole level when its
@@ -132,11 +136,10 @@
 //! requirement, and when no count of a level meets the target the plan
 //! still takes the whole level, which can then lower the excess instead of
 //! raising it: the rule's attribution of maintenance to its lines decides
-//! which leg goes first. And the walk does not degrade on a fine step: a
-//! level whose smallest meeting count lies beyond the budget fails with
-//! [`MarginError::CloseoutSearchLimit`], so size
-//! [`LiquidationPolicy::contract_step`] to the number of counts a level
-//! can need.
+//! which leg goes first. And on a fine step the walk may run into the
+//! reserve and gallop, so the count is not proven minimal; a level still
+//! fails with [`MarginError::CloseoutSearchLimit`] only once the whole
+//! budget is spent over several levels and positions.
 //!
 //! # Loss budget
 //!
@@ -866,7 +869,8 @@ impl<M: AccountMargin> Planner<'_, M> {
         // do; without a certificate (a rule without tiers, or an overflow
         // of the wide integers), J is the whole level.
         let continuous = self.continuous(state, index, offer.price)?;
-        if continuous.is_none() && self.model.plan_monotone(exposure) {
+        let tierless = continuous.is_none();
+        if tierless && self.model.plan_monotone(exposure) {
             let limit = MarginError::CloseoutSearchLimit {
                 instrument: exposure.instrument.clone(),
                 level,
@@ -894,9 +898,14 @@ impl<M: AccountMargin> Planner<'_, M> {
         let holding = |from: GridIndex, to: GridIndex| grid.first_holding(size, (from, to));
         let certified = |k: GridIndex| certain.is_some_and(|(low, high)| low <= k && k <= high);
         let mut k = start;
+        let mut unmet = GridIndex::ZERO;
         while let Some(next) = holding(k, end)? {
             k = next;
             let left = self.budget.get();
+            // A tierless walk that would eat the reserve gallops from here.
+            if tierless && left <= GALLOP_RESERVE {
+                return self.gallop_level(&grid, size, (unmet, k, end), last, &at, &limit());
+            }
             if left == 0 {
                 // Every count of J' that can be booked meets the target.
                 let Some((low, high)) = certain else {
@@ -920,6 +929,7 @@ impl<M: AccountMargin> Planner<'_, M> {
             if self.met(&attempt.2) {
                 return Ok(attempt);
             }
+            unmet = k;
             match grid.next(k) {
                 Some(next) if next <= end => k = next,
                 _ => break,
@@ -1028,6 +1038,74 @@ impl<M: AccountMargin> Planner<'_, M> {
                     }
                 }
                 // Nothing bookable in [mid, high): look below `mid`.
+                _ => high = mid,
+            }
+        }
+        Ok(best)
+    }
+
+    /// The rest `[start, end]` of a tierless level the walk could not finish
+    /// within the budget, every count up to `unmet` having failed: counts
+    /// `start`,
+    /// `start + 1`, `start + 3`, `start + 7`, ... are evaluated until one
+    /// meets the target, then the gap before it is bisected, `O(log n)`
+    /// evaluations from the search budget. The count found meets the target
+    /// and is the smallest when meeting it is monotone over that gap, which
+    /// is not proven: [`LiquidationPlan::minimal`] becomes false. The whole
+    /// level when no evaluated count meets the target.
+    fn gallop_level(
+        &self,
+        grid: &ContractGrid,
+        size: Decimal,
+        (unmet, start, end): (GridIndex, GridIndex, GridIndex),
+        last: GridIndex,
+        at: &dyn Fn(GridIndex) -> Result<(State, ForcedReduction, AccountSummary)>,
+        limit: &MarginError,
+    ) -> Result<(State, ForcedReduction, AccountSummary)> {
+        let spend = || -> Result<()> {
+            let left = self.budget.get();
+            if left == 0 {
+                return Err(limit.clone());
+            }
+            self.budget.set(left.saturating_sub(1));
+            Ok(())
+        };
+        let mut low = unmet;
+        let mut stride: u128 = 1;
+        let mut k = start;
+        let found = loop {
+            let Some(count) = grid.first_holding(size, (k, end))? else {
+                break None;
+            };
+            spend()?;
+            let attempt = at(count)?;
+            if self.met(&attempt.2) {
+                break Some((count, attempt));
+            }
+            low = count;
+            if count >= end {
+                break None;
+            }
+            k = grid.advance(count, stride).min(end);
+            stride = stride.saturating_mul(2);
+        };
+        let Some((mut high, mut best)) = found else {
+            return Self::whole_level(grid, size, last, at);
+        };
+        self.minimal.set(false);
+        while !ContractGrid::adjacent(low, high) {
+            let mid = ContractGrid::midpoint(low, high);
+            match grid.first_holding(size, (mid, high))? {
+                Some(count) if count < high => {
+                    spend()?;
+                    let attempt = at(count)?;
+                    if self.met(&attempt.2) {
+                        best = attempt;
+                        high = count;
+                    } else {
+                        low = count;
+                    }
+                }
                 _ => high = mid,
             }
         }
@@ -1514,6 +1592,11 @@ fn plan_with_budget<M: AccountMargin>(
 /// budget only binds when the quantum is coarse against what one step
 /// changes.
 pub const SEARCH_BUDGET: u32 = 4096;
+
+/// Evaluations a tierless walk leaves for galloping and bisection: a grid
+/// index has at most 96 significant bits (see [`ContractGrid`]), so each
+/// phase takes at most 97.
+const GALLOP_RESERVE: u32 = 200;
 
 /// A grid interval `[start, end]`, both ends included.
 type Span = (GridIndex, GridIndex);

@@ -228,7 +228,9 @@ pub trait InitialMarginModel {
 /// planner searches exactly. Any other rule gets no
 /// [`AccountMargin::plan_tiers`]: the planner then evaluates the counts of
 /// a level one by one, in increasing order, within
-/// [`SEARCH_BUDGET`](crate::liquidation::SEARCH_BUDGET).
+/// [`SEARCH_BUDGET`](crate::liquidation::SEARCH_BUDGET), galloping and
+/// bisecting once the walk reaches a reserve of that budget, or bisects
+/// the level outright when [`AccountMargin::plan_monotone`] holds.
 pub trait AccountMargin: InitialMarginModel {
     /// Number of decimals every requirement is rounded to: the cash
     /// quantum of the rule's currency.

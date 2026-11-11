@@ -10,7 +10,11 @@ follows [Semantic Versioning](https://semver.org/).
 
 - `AccountMargin::plan_monotone` (default `false`): a tierless position whose
   target is monotone in the count is bisected per level, `O(log n)` exact
-  evaluations, instead of walked count by count.
+  evaluations, instead of walked count by count (#69).
+- A tierless walk that reaches the last 200 units of `SEARCH_BUDGET` gallops
+  and bisects the rest of the level, `O(log n)` evaluations, instead of
+  failing with `CloseoutSearchLimit`; `minimal` is then false. Plans the walk
+  finished within the budget are unchanged (#69).
 
 ## [0.3.0] - 2026-11-11
 
