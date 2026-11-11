@@ -339,6 +339,7 @@ fn run<M: PiecewiseLinearMargin>(rule: &M, family: &Family) -> Coverage {
                                     target,
                                     fee_rate,
                                     fee_rates: BTreeMap::new(),
+                                    loss_budget: None,
                                     contract_step: step,
                                 };
                                 let (partial, passed) = check_case(

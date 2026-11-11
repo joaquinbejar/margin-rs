@@ -10,6 +10,8 @@ follows [Semantic Versioning](https://semver.org/).
 
 - `LiquidationPolicy::fee_rates`, a fee rate per instrument in place of
   `fee_rate`, and `LiquidationPolicy::fee_rate_for` (#55).
+- `LiquidationPolicy::loss_budget` and `CloseoutOutcome::BudgetExhausted`: the
+  plan never brings its projected equity below `-B` (#54).
 
 ### Changed
 

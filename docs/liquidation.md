@@ -44,7 +44,7 @@ The margins come from a `TieredLinearIm` rule, for example a single tier with IM
 
 ```text
 plan_liquidation(&model, &LiquidationAccount { view, basis, cash, resting_orders },
-                 &liquidity, &LiquidationPolicy { target, fee_rate, fee_rates, contract_step })
+                 &liquidity, &LiquidationPolicy { target, fee_rate, fee_rates, loss_budget, contract_step })
 ```
 
 `model` implements `PiecewiseLinearMargin`, which every `TieredLinearIm` does. The trait's contract has three parts:
@@ -91,6 +91,7 @@ The fee rate `f` of an instrument is its entry in `fee_rates`, else `fee_rate`; 
 | `TargetMet` | The forced fills meet the target |
 | `FlatWithDeficit` | Every position is closed and the target is still missed, so the deficit and the debt stay explicit |
 | `LiquidityExhausted` | Positions remain open, listed in `unfilled`, and the target is missed |
+| `BudgetExhausted` | The plan stopped at `loss_budget` with the target missed (see "Loss budget") |
 
 ### Cash conventions
 
@@ -119,6 +120,16 @@ An **inverse** position (contract value `CV` in quote units, settled in the base
 | released basis | as above |
 | realized PnL | `released - fill value` |
 | fee | `trunc(f * n * CV / p, c)`, in the base |
+
+### Loss budget
+
+`loss_budget: Some(B)` (`B >= 0`, at the cash scale) bounds the loss the plan may realize: the projected equity, the plan's `collateral` (cash plus unrealized PnL at the marks, rounded as above), never ends a fill below `-B`.
+
+- Already below `-B` before any fill: the plan cancels the resting orders and closes nothing.
+- On each level the count is first chosen as without a budget. If it brings the equity below `-B`, the plan bisects the level's grid between zero and that count for a count within the budget whose next larger bookable count is not, takes it if positive, and stops: no later level or instrument is used.
+- The outcome is `BudgetExhausted` unless the cut count still meets the target.
+
+Every evaluated count is booked with the rounding above, so the bound is exact. The equity is linear in the count only up to that rounding (each figure within one quantum), so the count is the largest within the budget whenever rounding does not reverse two neighbouring counts. The bisection takes at most as many evaluations as the grid index has bits and does not use `SEARCH_BUDGET`. `None` sets no bound and leaves plans unchanged.
 
 ### Search within a level
 
