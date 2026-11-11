@@ -17,6 +17,7 @@ pub mod initial_linear;
 pub mod scenario_pm;
 pub mod short_option;
 pub(crate) mod tiers;
+pub mod with_options;
 
 pub use initial_inverse::TieredInverseIm;
 pub use initial_linear::{MarginTier, TieredLinearIm};
@@ -25,3 +26,4 @@ pub use scenario_pm::{
     ScenarioSets,
 };
 pub use short_option::{OptionExposure, OptionExposureView, ShortOptionIm, ShortOptionParameters};
+pub use with_options::LinearWithOptionsIm;

@@ -8,6 +8,11 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Closeout plans over European linear options: premium cash conventions,
+  `min(value, 0)` collateral, reduce-only intents on the opposite side.
+  `rules::LinearWithOptionsIm` margins options under `ShortOptionIm` and the
+  rest under a linear rule; `ShortOptionIm::scale`. American and inverse
+  options are `UnsupportedInstrument` (#53).
 - `LiquidationPolicy::fee_rates`, a fee rate per instrument in place of
   `fee_rate`, and `LiquidationPolicy::fee_rate_for` (#55).
 - `LiquidationPolicy::loss_budget` and `CloseoutOutcome::BudgetExhausted`: the

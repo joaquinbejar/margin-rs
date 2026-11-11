@@ -230,6 +230,12 @@ impl ShortOptionIm {
         &self.currency
     }
 
+    /// Scale every amount is rounded up to.
+    #[must_use]
+    pub fn scale(&self) -> u32 {
+        self.scale
+    }
+
     /// The rates.
     #[must_use]
     pub fn parameters(&self) -> ShortOptionParameters {

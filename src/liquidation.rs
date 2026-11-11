@@ -1,8 +1,8 @@
 //! Staged closeout plan for an account below its margin threshold.
 //!
 //! [`plan_liquidation`] simulates one closeout of an account's linear or
-//! inverse futures and perpetuals against supplied scenario liquidity,
-//! under one [`AccountMargin`] rule, and returns a
+//! inverse futures and perpetuals and European options against supplied
+//! scenario liquidity, under one [`AccountMargin`] rule, and returns a
 //! [`LiquidationPlan`]. It is a pure function: it books nothing and changes
 //! no state. There is no live liquidator.
 //!
@@ -85,6 +85,21 @@
 //!   buying (in [`ForcedReduction::fill_cash`]); it releases the basis as
 //!   above; its realized PnL is `released - fill value`;
 //! - its fee is `trunc(f * n * CV / p, c)`, in the base.
+//!
+//! A European option with linear margining follows the ledger's premium
+//! convention, with `p` a premium and its mark a premium mark (zero is
+//! allowed):
+//!
+//! - its collateral term is `min(round_half_even(Qc * M * mark, c), 0)`, as
+//!   in [`crate::valuation`]: a short deducts its value, a long gets no
+//!   credit;
+//! - a reduction's fill cash, released basis and realized PnL are those of
+//!   a linear position; cash changes by `fill cash - fee`: the premium is
+//!   the cash, credited when a long is sold and debited when a short is
+//!   bought back;
+//! - it gets no certificate: its levels are walked count by count (see
+//!   [rules](self#rules)). The rule must margin options, for example
+//!   [`LinearWithOptionsIm`](crate::rules::LinearWithOptionsIm).
 //!
 //! Marks stay those of the [`ExposureView`] for the whole plan: the
 //! scenario's prices for the closeout are the liquidity levels.
@@ -241,11 +256,17 @@ use crate::direction::Dir;
 use crate::error::{MarginError, Result};
 use crate::ids::{AccountId, Asset, ExecutionId, InstrumentId, OrderId, VenueId};
 use crate::initial_margin::{
-    AccountMargin, ExposurePosition, ExposureView, MarginRequirement, RuleId, check_size,
+    AccountMargin, ExposurePosition, ExposureView, MarginRequirement, ProductKind, RuleId,
+    check_size,
 };
-use crate::instrument::ContractSize;
+use crate::instrument::{ContractSize, ExerciseStyle, OptionInstrument, OptionMargining};
 use crate::ledger::derivative::{market_value, unrealized_pnl};
 use crate::ledger::{Action, DerivativeSettlement, Execution, LedgerSnapshot};
+
+/// True for an option position.
+fn is_option(exposure: &ExposurePosition) -> bool {
+    exposure.product == ProductKind::Option
+}
 
 /// When the closeout stops.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -338,7 +359,9 @@ impl LiquidationAccount {
     ///
     /// Spot holdings, in `currency` or any other asset, are not part of the
     /// plan: the plan closes derivatives only, and its collateral is the
-    /// cash plus their unrealized PnL. Every open derivative must settle in
+    /// cash plus their unrealized PnL (for an option, `min(value, 0)`).
+    /// Options must be European with linear margining; their marks are
+    /// premium marks, at least zero. Every open derivative must settle in
     /// `currency`; one in another asset is an error, never left out.
     ///
     /// `as_of_ms` is when the closeout runs: a future whose expiry is at or
@@ -356,6 +379,8 @@ impl LiquidationAccount {
     ///   positive.
     /// - [`MarginError::CurrencyMismatch`] for an open derivative settled in
     ///   another asset.
+    /// - [`MarginError::UnsupportedInstrument`] for an American or inverse
+    ///   option.
     /// - [`MarginError::ExpiredUnsettled`] for an open future whose expiry
     ///   is at or before `as_of_ms`.
     /// - [`MarginError::MissingMark`] for an open derivative without a mark.
@@ -403,14 +428,19 @@ impl LiquidationAccount {
                 // Spot holdings are not part of the plan.
                 continue;
             };
-            // A premium is not a virtual notional: the plan's cash would be
-            // wrong, so an account with an open option gets no plan at all.
-            if product == crate::initial_margin::ProductKind::Option {
-                return Err(MarginError::UnsupportedInstrument {
+            let option = product == ProductKind::Option;
+            if let Some(contract) = instrument.option_terms().map(OptionInstrument::contract) {
+                let unsupported = |reason| MarginError::UnsupportedInstrument {
                     rule: "closeout".to_string(),
                     instrument: id.clone(),
-                    reason: "an open option has no closeout plan yet",
-                });
+                    reason,
+                };
+                if contract.exercise != ExerciseStyle::European {
+                    return Err(unsupported("only European options have a closeout plan"));
+                }
+                if contract.margining != OptionMargining::Linear {
+                    return Err(unsupported("only linear options have a closeout plan"));
+                }
             }
             if let Some(expiry_ms) = contract.expiry_ms
                 && expiry_ms <= as_of_ms
@@ -431,7 +461,14 @@ impl LiquidationAccount {
             let mark = *marks.get(id).ok_or_else(|| MarginError::MissingMark {
                 instrument: id.clone(),
             })?;
-            if mark <= Decimal::ZERO {
+            // A premium mark may be zero; a price mark is positive.
+            if option && mark < Decimal::ZERO {
+                return Err(MarginError::invalid_input(
+                    "instrument mark",
+                    "an option's premium mark must be at least zero",
+                ));
+            }
+            if !option && mark <= Decimal::ZERO {
                 return Err(MarginError::invalid_input(
                     "instrument mark",
                     "must be positive",
@@ -759,9 +796,11 @@ impl<M: AccountMargin> Planner<'_, M> {
                 open.exposure.mark,
                 self.scale,
             )?;
-            // upnl: value - basis (linear), basis - value (inverse), summed
-            // with the cash in one exact step.
+            // upnl: value - basis (linear), basis - value (inverse); an
+            // option counts min(value, 0). Summed with the cash in one exact
+            // step.
             match size {
+                _ if is_option(&open.exposure) => terms.push(value.min(Decimal::ZERO)),
                 ContractSize::Multiplier(_) => {
                     terms.push(value);
                     terms.push(neg(open.basis));
@@ -972,6 +1011,10 @@ impl<M: AccountMargin> Planner<'_, M> {
         price: Decimal,
     ) -> Result<Option<Continuous>> {
         let open = state.open(index)?;
+        // The search's bounds assume a linear or inverse cash convention.
+        if is_option(&open.exposure) {
+            return Ok(None);
+        }
         let Some(tiers) = self.model.plan_tiers(&open.exposure) else {
             return Ok(None);
         };
@@ -987,7 +1030,11 @@ impl<M: AccountMargin> Planner<'_, M> {
                 line.exposure.mark,
                 self.scale,
             )?;
-            others.push(unrealized_pnl(line.exposure.size, value, line.basis)?);
+            others.push(if is_option(&line.exposure) {
+                value.min(Decimal::ZERO)
+            } else {
+                unrealized_pnl(line.exposure.size, value, line.basis)?
+            });
         }
         for line in &requirement.positions {
             if line.instrument == open.exposure.instrument {
@@ -1079,11 +1126,15 @@ impl<M: AccountMargin> Planner<'_, M> {
                 "fee",
             )?,
         };
+        // An option's premium is the cash; a linear or inverse fill moves
+        // only its realized PnL.
+        let moved = if is_option(&open.exposure) {
+            fill_cash
+        } else {
+            realized_pnl
+        };
         let mut next = state.clone();
-        next.cash = sum(
-            &[state.cash, realized_pnl, neg(fee)],
-            "cash + realized - fee",
-        )?;
+        next.cash = sum(&[state.cash, moved, neg(fee)], "cash + moved - fee")?;
         let updated = next.open_mut(index)?;
         updated.exposure.contracts = contracts_after;
         updated.basis = sub(open.basis, released_basis, "basis - released")?;
