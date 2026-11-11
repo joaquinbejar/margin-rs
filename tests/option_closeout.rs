@@ -319,3 +319,143 @@ fn test_rules_in_different_currencies_are_refused() {
         })
     ));
 }
+
+/// A short of 10000 CALL under `LinearWithOptionsIm`, declared monotone:
+/// the level is bisected, well within the search budget, to the smallest
+/// count meeting maintenance. With cash 80000, buying back `n` at 6.5
+/// leaves collateral `80000 - 6.5n - 6 (10000 - n) = 20000 - 0.5n` against
+/// `0.075 * 100 * (10000 - n)`: met from n = 55000 / 7 = 7857.14, so 7858.
+#[test]
+fn test_large_short_option_is_bisected() {
+    let model = model();
+    let account = LiquidationAccount {
+        view: margin_rs::initial_margin::ExposureView {
+            account: AccountId::new("acct").expect("id"),
+            venue: VenueId::new("venue").expect("id"),
+            positions: vec![margin_rs::initial_margin::ExposurePosition {
+                instrument: iid("CALL"),
+                product: margin_rs::initial_margin::ProductKind::Option,
+                settlement: usdc(),
+                contracts: dec!(-10000),
+                size: margin_rs::ContractSize::Multiplier(Decimal::ONE),
+                mark: dec!(6),
+            }],
+        },
+        basis: BTreeMap::from([(iid("CALL"), dec!(-50000))]),
+        cash: dec!(80000),
+        resting_orders: vec![],
+    };
+    let plan = plan_liquidation(
+        &model,
+        &account,
+        &BTreeMap::from([(
+            iid("CALL"),
+            vec![LiquidityLevel {
+                price: dec!(6.5),
+                contracts: dec!(20000),
+            }],
+        )]),
+        &LiquidationPolicy {
+            target: CloseoutTarget::Maintenance,
+            fee_rate: Decimal::ZERO,
+            fee_rates: BTreeMap::new(),
+            loss_budget: None,
+            contract_step: Decimal::ONE,
+        },
+    )
+    .expect("plan within the budget");
+    assert_eq!(plan.outcome, CloseoutOutcome::TargetMet);
+    assert!(plan.minimal);
+    let n = plan.reductions[0].contracts;
+    assert_eq!(n, dec!(7858));
+    // n meets the target and n - 1 does not.
+    let collateral = |n: Decimal| dec!(80000) - dec!(6.5) * n - dec!(6) * (dec!(10000) - n);
+    let mm = |n: Decimal| dec!(7.5) * (dec!(10000) - n);
+    assert!(collateral(n) >= mm(n));
+    assert!(collateral(n - Decimal::ONE) < mm(n - Decimal::ONE));
+}
+
+/// The cash condition makes the meeting counts a band, not a suffix:
+/// short 10000 CALL (mark 1, underlying 1: mm 0.075 each) and long 100
+/// BTC-PERP at 300 (upnl 10500, mm 1500, no liquidity), cash 1000. Buying
+/// back `n` calls at 0.5: collateral `1500 + 0.5n` against
+/// `2250 - 0.075n`, met from n = 1304.3, while cash `1000 - 0.5n` stays
+/// non negative only up to 2000. The whole level fails on cash, so the
+/// level is walked despite the monotone claim and the plan takes 1305.
+#[test]
+fn test_short_option_band_under_a_cash_limit() {
+    let linear = TieredLinearIm::new(
+        RuleId::new("linear-im", 1),
+        usdc(),
+        2,
+        vec![MarginTier {
+            floor: Decimal::ZERO,
+            initial_rate: dec!(0.10),
+            maintenance_rate: dec!(0.05),
+        }],
+    )
+    .expect("rule");
+    let model = LinearWithOptionsIm::new(
+        RuleId::new("linear-with-options", 1),
+        linear,
+        ShortOptionIm::short_option_v1(usdc(), 2).expect("rule"),
+        vec![(option("CALL", OptionRight::Call), dec!(1))],
+    )
+    .expect("model");
+    let position =
+        |id: &str, product, contracts, mark| margin_rs::initial_margin::ExposurePosition {
+            instrument: iid(id),
+            product,
+            settlement: usdc(),
+            contracts,
+            size: margin_rs::ContractSize::Multiplier(Decimal::ONE),
+            mark,
+        };
+    let account = LiquidationAccount {
+        view: margin_rs::initial_margin::ExposureView {
+            account: AccountId::new("acct").expect("id"),
+            venue: VenueId::new("venue").expect("id"),
+            positions: vec![
+                position(
+                    "CALL",
+                    margin_rs::initial_margin::ProductKind::Option,
+                    dec!(-10000),
+                    dec!(1),
+                ),
+                position(
+                    "BTC-PERP",
+                    margin_rs::initial_margin::ProductKind::LinearPerpetual,
+                    dec!(100),
+                    dec!(300),
+                ),
+            ],
+        },
+        basis: BTreeMap::from([(iid("CALL"), dec!(-10000)), (iid("BTC-PERP"), dec!(19500))]),
+        cash: dec!(1000),
+        resting_orders: vec![],
+    };
+    let plan = plan_liquidation(
+        &model,
+        &account,
+        &BTreeMap::from([(
+            iid("CALL"),
+            vec![LiquidityLevel {
+                price: dec!(0.5),
+                contracts: dec!(10000),
+            }],
+        )]),
+        &LiquidationPolicy {
+            target: CloseoutTarget::Maintenance,
+            fee_rate: Decimal::ZERO,
+            fee_rates: BTreeMap::new(),
+            loss_budget: None,
+            contract_step: Decimal::ONE,
+        },
+    )
+    .expect("plan");
+    assert_eq!(plan.before.maintenance, dec!(2250));
+    assert_eq!(plan.outcome, CloseoutOutcome::TargetMet);
+    assert_eq!(plan.reductions[0].contracts, dec!(1305));
+    assert!(plan.after.cash >= Decimal::ZERO);
+    assert!(plan.minimal);
+}

@@ -228,7 +228,9 @@ pub trait InitialMarginModel {
 /// planner searches exactly. Any other rule gets no
 /// [`AccountMargin::plan_tiers`]: the planner then evaluates the counts of
 /// a level one by one, in increasing order, within
-/// [`SEARCH_BUDGET`](crate::liquidation::SEARCH_BUDGET).
+/// [`SEARCH_BUDGET`](crate::liquidation::SEARCH_BUDGET), galloping and
+/// bisecting once the walk reaches a reserve of that budget, or bisects
+/// the level outright when [`AccountMargin::plan_monotone`] holds.
 pub trait AccountMargin: InitialMarginModel {
     /// Number of decimals every requirement is rounded to: the cash
     /// quantum of the rule's currency.
@@ -253,7 +255,11 @@ pub trait AccountMargin: InitialMarginModel {
     /// cash cannot turn negative over the level (for example, closing a
     /// position whose fills credit cash, or cash far above the level's
     /// cost). If the claim is wrong the plan stays valid, every count it
-    /// takes is evaluated exactly, but the count may not be the smallest.
+    /// takes is evaluated exactly: a level whose last count fails is walked
+    /// as without the claim, and when the last count meets the target the
+    /// count found meets it too, though it may not be the smallest while
+    /// [`LiquidationPlan::minimal`](crate::liquidation::LiquidationPlan::minimal)
+    /// reports true: it assumes the claim.
     fn plan_monotone(&self, position: &ExposurePosition) -> bool {
         let _ = position;
         false

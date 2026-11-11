@@ -26,7 +26,7 @@ use margin_rs::liquidation::{
     plan_liquidation,
 };
 use margin_rs::rules::{MarginTier, TieredLinearIm};
-use margin_rs::{AccountId, Asset, ContractSize, Decimal, InstrumentId, MarginError, VenueId};
+use margin_rs::{AccountId, Asset, ContractSize, Decimal, InstrumentId, VenueId};
 use rust_decimal::RoundingStrategy;
 use rust_decimal_macros::dec;
 
@@ -220,8 +220,10 @@ fn test_gross_rule_on_the_same_account_runs_out_of_liquidity() {
 }
 
 /// Without tiers each count costs one evaluation; the target needs
-/// `10 - n >= 5 (4 - n)`, n >= 2.5: 2500 counts at a step of 0.001
-/// fit the budget of 4096, 5000 at 0.0005 do not.
+/// `10 - n >= 5 (4 - n)`, n >= 2.5: 2500 counts at a step of 0.001 fit the
+/// budget of 4096 and the walk proves 2.5 the smallest. 5000 at 0.0005 do
+/// not: once the walk reaches the reserve it gallops and bisects, finds
+/// 2.5 again, and reports it as not proven minimal.
 #[test]
 fn test_netting_rule_walk_is_bounded_by_the_search_budget() {
     let at = |step| {
@@ -232,20 +234,21 @@ fn test_netting_rule_walk_is_bounded_by_the_search_budget() {
             &policy(CloseoutTarget::Maintenance, step),
         )
     };
-    assert_eq!(
-        at(dec!(0.001)).expect("plan").reductions[0].contracts,
-        dec!(2.5)
-    );
-    assert!(matches!(
-        at(dec!(0.0005)),
-        Err(MarginError::CloseoutSearchLimit { .. })
-    ));
+    let walked = at(dec!(0.001)).expect("plan");
+    assert_eq!(walked.reductions[0].contracts, dec!(2.5));
+    assert!(walked.minimal);
+    let galloped = at(dec!(0.0005)).expect("plan");
+    assert_eq!(galloped.outcome, CloseoutOutcome::TargetMet);
+    assert_eq!(galloped.reductions[0].contracts, dec!(2.5));
+    assert!(!galloped.minimal);
 }
 
 /// A lone long A 10 (no hedge), cash 10, sold at 99.5: collateral
 /// `10 - 0.5n` against a maintenance of `5 * (10 - n)`, met from
 /// n = 8.888..., so 8.889 at a step of 0.0005: 17778 counts, beyond the
-/// walk's budget. Declared monotone, the level is bisected.
+/// walk's budget. Declared monotone, the level is bisected and the count
+/// is proven minimal; undeclared, the walk gallops to the same count but
+/// cannot prove it minimal.
 #[test]
 fn test_monotone_rule_is_bisected() {
     let mut account = hedged();
@@ -259,10 +262,9 @@ fn test_monotone_rule_is_bisected() {
         }],
     )]);
     let step = policy(CloseoutTarget::Maintenance, dec!(0.0005));
-    assert!(matches!(
-        plan_liquidation(&NetLinear::new(), &account, &liquidity, &step),
-        Err(MarginError::CloseoutSearchLimit { .. })
-    ));
+    let galloped = plan_liquidation(&NetLinear::new(), &account, &liquidity, &step).expect("plan");
+    assert_eq!(galloped.reductions[0].contracts, dec!(8.889));
+    assert!(!galloped.minimal);
     let plan = plan_liquidation(&NetLinear::monotone(), &account, &liquidity, &step).expect("plan");
     assert_eq!(plan.outcome, CloseoutOutcome::TargetMet);
     assert_eq!(plan.reductions[0].contracts, dec!(8.889));
@@ -277,19 +279,41 @@ fn test_monotone_rule_is_bisected() {
     );
 }
 
-/// A wrong claim keeps the plan valid: on the hedged pair the target is
-/// met only between 2.5 and 5 contracts, so the whole level (10) does not
-/// meet it and the bisection takes the whole level, as the walk does when
-/// no count meets the target.
+/// A wrong claim cannot skip a meeting count: on the hedged pair the
+/// target is met only between 2.5 and 5 contracts, so the whole level
+/// (10) does not meet it; the level is then walked, as without the claim,
+/// and the plan takes 3, the smallest.
 #[test]
-fn test_wrong_monotone_claim_takes_the_whole_level() {
-    let plan = plan_liquidation(
+fn test_wrong_monotone_claim_falls_back_to_the_walk() {
+    let claimed = plan_liquidation(
         &NetLinear::monotone(),
         &hedged(),
         &bids_on_a(),
         &policy(CloseoutTarget::Maintenance, Decimal::ONE),
     )
     .expect("plan");
+    assert_eq!(claimed.reductions[0].contracts, dec!(3));
+    assert_eq!(claimed.outcome, CloseoutOutcome::TargetMet);
+    assert!(claimed.minimal);
+}
+
+/// The hedged pair with cash 4.01 meets the target only in a narrow band,
+/// n in [3.9975, 4.00166...]. At a step of 0.0005 the walk reaches the
+/// reserve at 1.948 and gallops; its probes 3.996 and 6.044 straddle the
+/// band without landing in it, so the whole level is taken and `minimal`
+/// is false: a count between two probes met the target.
+#[test]
+fn test_gallop_missing_a_narrow_band_is_not_minimal() {
+    let mut account = hedged();
+    account.cash = dec!(4.01);
+    let plan = plan_liquidation(
+        &NetLinear::new(),
+        &account,
+        &bids_on_a(),
+        &policy(CloseoutTarget::Maintenance, dec!(0.0005)),
+    )
+    .expect("plan");
     assert_eq!(plan.reductions[0].contracts, dec!(10));
     assert_ne!(plan.outcome, CloseoutOutcome::TargetMet);
+    assert!(!plan.minimal);
 }

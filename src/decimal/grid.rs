@@ -292,6 +292,15 @@ impl ContractGrid {
         (next <= self.last).then_some(GridIndex(next))
     }
 
+    /// `index + by`, or the last index if that is beyond the grid.
+    pub(crate) fn advance(&self, index: GridIndex, by: u128) -> GridIndex {
+        let moved = index
+            .0
+            .checked_add(U768::from_u128(by))
+            .unwrap_or(self.last);
+        GridIndex(if moved > self.last { self.last } else { moved })
+    }
+
     /// True when no index lies strictly between `low` and `high`.
     pub(crate) fn adjacent(low: GridIndex, high: GridIndex) -> bool {
         match high.0.checked_sub(low.0) {

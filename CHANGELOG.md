@@ -10,7 +10,17 @@ follows [Semantic Versioning](https://semver.org/).
 
 - `AccountMargin::plan_monotone` (default `false`): a tierless position whose
   target is monotone in the count is bisected per level, `O(log n)` exact
-  evaluations, instead of walked count by count.
+  evaluations, instead of walked count by count (#69).
+- A tierless walk that reaches the last 200 units of `SEARCH_BUDGET` gallops
+  and bisects the rest of the level, `O(log n)` evaluations, instead of
+  failing with `CloseoutSearchLimit`; `minimal` is then false, also when no
+  probe meets the target and the whole level is taken. Plans the walk
+  finishes within 3896 evaluations (the budget less the reserve) are
+  unchanged (#69).
+- `LinearWithOptionsIm` declares its option positions monotone
+  (`plan_monotone`), so their levels are bisected. A monotone level whose last
+  count fails the target is walked as without the claim, so a cash limit on a
+  short buy-back never skips a meeting count.
 
 ## [0.3.0] - 2026-11-11
 
