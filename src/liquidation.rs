@@ -109,6 +109,16 @@
 //!   decreasing order of the maintenance the rule attributes to their
 //!   lines.
 //!
+//! Two caveats for rules that net. Closing a hedge leg can raise the
+//! requirement, and when no count of a level meets the target the plan
+//! still takes the whole level, which can then lower the excess instead of
+//! raising it: the rule's attribution of maintenance to its lines decides
+//! which leg goes first. And the walk does not degrade on a fine step: a
+//! level whose smallest meeting count lies beyond the budget fails with
+//! [`MarginError::CloseoutSearchLimit`], so size
+//! [`LiquidationPolicy::contract_step`] to the number of counts a level
+//! can need.
+//!
 //! # Loss budget
 //!
 //! With [`LiquidationPolicy::loss_budget`] `Some(B)`, the plan's projected
