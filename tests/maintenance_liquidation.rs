@@ -1279,3 +1279,38 @@ fn test_loss_budget_negative_or_off_scale_is_refused() {
         Err(MarginError::PrecisionExceeded { .. })
     ));
 }
+
+/// Cash 0, B = 62, BTC-PERP 10 (closed first: larger maintenance) and
+/// ETH-PERP 4 at mark 50, entry 50. After BTC at 94 the equity is
+/// -60.47; each ETH contract at 49 costs 1 + 0.0245, so 1 fits (-61.4945)
+/// and 2 do not (-62.519). The plan stops on the second instrument with
+/// ETH 3 left in `after.positions` and nothing in `unfilled`.
+#[test]
+fn test_loss_budget_stops_on_a_second_instrument() {
+    let (mut account, liquidity) = two_longs();
+    account.cash = dec!(0);
+    let plan = plan(
+        &account,
+        &liquidity,
+        &budgeted(CloseoutTarget::Maintenance, dec!(62), Decimal::ONE),
+    );
+    assert_eq!(plan.outcome, CloseoutOutcome::BudgetExhausted);
+    let closed: Vec<(InstrumentId, Decimal)> = plan
+        .reductions
+        .iter()
+        .map(|r| (r.instrument.clone(), r.contracts))
+        .collect();
+    assert_eq!(
+        closed,
+        vec![(iid("BTC-PERP"), dec!(10)), (iid("ETH-PERP"), dec!(1))]
+    );
+    assert_eq!(plan.after.collateral, dec!(-61.4945));
+    assert_eq!(plan.unfilled, BTreeMap::new());
+    let left: Vec<(InstrumentId, Decimal)> = plan
+        .after
+        .positions
+        .iter()
+        .map(|p| (p.instrument.clone(), p.contracts))
+        .collect();
+    assert_eq!(left, vec![(iid("ETH-PERP"), dec!(3))]);
+}

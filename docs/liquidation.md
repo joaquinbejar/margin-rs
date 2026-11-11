@@ -127,7 +127,7 @@ An **inverse** position (contract value `CV` in quote units, settled in the base
 
 - Already below `-B` before any fill: the plan cancels the resting orders and closes nothing.
 - On each level the count is first chosen as without a budget. If it brings the equity below `-B`, the plan bisects the level's grid between zero and that count for a count within the budget whose next larger bookable count is not, takes it if positive, and stops: no later level or instrument is used.
-- The outcome is `BudgetExhausted` unless the cut count still meets the target.
+- The outcome is `BudgetExhausted` unless the cut count still meets the target. The positions left open are in `after.positions`; `unfilled` lists only liquidity that ran out.
 
 Every evaluated count is booked with the rounding above, so the bound is exact. The equity is linear in the count only up to that rounding (each figure within one quantum), so the count is the largest within the budget whenever rounding does not reverse two neighbouring counts. The bisection takes at most as many evaluations as the grid index has bits and does not use `SEARCH_BUDGET`. `None` sets no bound and leaves plans unchanged.
 
