@@ -8,6 +8,9 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Rule `scenario-pm/2`: `ScenarioPm::scenario_pm_v2`. Long options at their
+  full scenario value; linear floor `g * (gross - |net|)` with its admission
+  bound. `scenario-pm/1` is unchanged (#67).
 - `AccountMargin::plan_monotone` (default `false`): a tierless position whose
   target is monotone in the count is bisected per level, `O(log n)` exact
   evaluations, instead of walked count by count (#69).

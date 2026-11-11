@@ -6,6 +6,7 @@
 //! | [`TieredLinearIm::linear_v1`] (`linear-im/1`) | Linear futures and perpetuals, in the settlement asset | [`initial_linear`] and `docs/initial-margin.md` |
 //! | [`TieredInverseIm::inverse_v1`] (`inverse-im/1`) | Inverse futures and perpetuals, in the base | [`initial_inverse`] and `docs/initial-margin.md` |
 //! | [`ScenarioPm::scenario_pm_v1`] (`scenario-pm/1`) | Linear futures, perpetuals and options of one account, netted over caller supplied scenarios | [`scenario_pm`] and `docs/scenario-margin.md` |
+//! | [`ScenarioPm::scenario_pm_v2`] (`scenario-pm/2`) | As version 1, long options at full scenario value, linear floor on spreads | [`scenario_pm`] and `docs/scenario-margin.md` |
 //! | [`ShortOptionIm::short_option_v1`] (`short-option-im/1`) | Options, in the settlement asset; only shorts require margin | [`short_option`] and `docs/options.md` |
 //!
 //! External venue rules (for example Binance USDⓈ-M leverage brackets) are

@@ -52,6 +52,34 @@
 //! requirement of any fill subset. Every order needs a leg for its
 //! instrument (with zero contracts if the account holds none).
 //!
+//! # Version 2
+//!
+//! [`ScenarioPm::scenario_pm_v2`] (`scenario-pm/2`) keeps everything above
+//! (caller-supplied values, the short option floor `F` and `F'`, netting,
+//! the maximum, one round-up, the lowest index on a tie, the breakdown and
+//! the order terms) and changes two things, for venues whose collateral
+//! gives a long option no credit and whose linear floor charges spreads
+//! only:
+//!
+//! ```text
+//! long option:  loss_i(s) = -Q_i * M_i * X_s,i      (its full value)
+//! G   = g * (gross - |net|)
+//! G'  = g * (gross + O - max(0, |net| - O_against))
+//! ```
+//!
+//! with `gross = sum |Q| * M * X0` and `net = sum Q * M * X0` over the
+//! linear legs, `O` the notional `|q| * M * X0` of every linear order at
+//! its leg's mark, and `O_against` that of the orders whose sign is
+//! opposite to `net`. A single linear position has `G = 0`; a calendar
+//! spread of two equal and opposite notionals `N` pays `g * 2N`. `G'` is
+//! at least `G` after any subset of fills, since fills raise the gross by
+//! at most `O` and lower `|net|` by at most `O_against`.
+//!
+//! An option leg is long or short by the position held, not by the
+//! position after the orders: in admission a buy order that would turn a
+//! short option long is valued like any order, by its loss
+//! `-q * M * (X_s - L)` against the leg's version 2 terms.
+//!
 //! # Breakdown
 //!
 //! [`ScenarioPmRequirement`] gives, for each figure, the worst scenario's
@@ -60,7 +88,7 @@
 //! with the largest term in its worst scenario (the first in view order on
 //! a tie), zero to the others, so lines add up to the totals.
 //!
-//! The formula and the rule id are this crate's own specification
+//! The formulas and the rule ids are this crate's own specification
 //! (`docs/scenario-margin.md`), not a venue's rule.
 
 use std::collections::BTreeMap;
@@ -185,6 +213,12 @@ pub struct ScenarioPm {
     underlying_prices: BTreeMap<InstrumentId, Decimal>,
 }
 
+/// True for a leg the rule values at its full scenario value: a long option
+/// under version 2.
+fn full_value(version: u32, leg: &PmLeg) -> bool {
+    version == 2 && matches!(leg.kind, PmLegKind::Option { .. }) && leg.contracts > Decimal::ZERO
+}
+
 impl ScenarioPm {
     /// The rule `scenario-pm/1` in `currency` at `scale`, with the floor
     /// rates of each figure and the scenarios of the current evaluation.
@@ -194,6 +228,34 @@ impl ScenarioPm {
     /// [`MarginError::InvalidInput`] if `scale` exceeds 18, a rate is
     /// outside `[0, 1]` or a scenario set is empty.
     pub fn scenario_pm_v1(
+        currency: Asset,
+        scale: u32,
+        initial: ScenarioPmRates,
+        maintenance: ScenarioPmRates,
+        scenarios: ScenarioSets,
+    ) -> Result<Self> {
+        Self::build(1, currency, scale, initial, maintenance, scenarios)
+    }
+
+    /// The rule `scenario-pm/2`: version 1 with a long option valued at its
+    /// full scenario value and a linear floor on spread exposure only. See
+    /// the [module docs](self#version-2).
+    ///
+    /// # Errors
+    ///
+    /// As [`ScenarioPm::scenario_pm_v1`].
+    pub fn scenario_pm_v2(
+        currency: Asset,
+        scale: u32,
+        initial: ScenarioPmRates,
+        maintenance: ScenarioPmRates,
+        scenarios: ScenarioSets,
+    ) -> Result<Self> {
+        Self::build(2, currency, scale, initial, maintenance, scenarios)
+    }
+
+    fn build(
+        version: u32,
         currency: Asset,
         scale: u32,
         initial: ScenarioPmRates,
@@ -215,7 +277,7 @@ impl ScenarioPm {
             ));
         }
         Ok(Self {
-            id: RuleId::new("scenario-pm", 1),
+            id: RuleId::new("scenario-pm", version),
             currency,
             scale,
             initial,
@@ -390,12 +452,15 @@ impl ScenarioPm {
                 check_value(kind, x, "scenario value")?;
                 Ok(x)
             };
-            // -Q M X_s + Q M X0 for every leg.
+            // -Q M X_s + Q M X0 for every leg; -Q M X_s alone for a leg at
+            // its full value.
             let mut terms: Vec<Vec<Decimal>> = Vec::new();
             for leg in legs {
                 let x = value(&leg.instrument, leg.kind)?;
                 terms.push(vec![neg(leg.contracts), leg.multiplier, x]);
-                terms.push(vec![leg.contracts, leg.multiplier, leg.mark]);
+                if !full_value(self.id.version, leg) {
+                    terms.push(vec![leg.contracts, leg.multiplier, leg.mark]);
+                }
             }
             for order in orders {
                 let leg = by_id
@@ -430,8 +495,8 @@ impl ScenarioPm {
         let scenario = scenarios.get(index).ok_or_else(overflow)?;
         let positive = total.0.cmp_signed(&crate::decimal::Wide::ZERO) == Ordering::Greater;
 
-        let (leg_terms, order_terms) = worst_terms(legs, orders, by_id, scenario)?;
-        let (option_floor, linear_floor) = floor_terms(legs, orders, rates)?;
+        let (leg_terms, order_terms) = worst_terms(self.id.version, legs, orders, by_id, scenario)?;
+        let (option_floor, linear_floor) = floor_terms(self.id.version, legs, orders, rates)?;
         let exact = |terms: &[Vec<Decimal>], operation| -> Result<Decimal> {
             let refs: Vec<&[Decimal]> = terms.iter().map(Vec::as_slice).collect();
             sum_products(&refs, operation)
@@ -472,6 +537,7 @@ type Exact = (crate::decimal::Wide, u32);
 /// Each leg's loss and each order's positive contribution in `scenario`.
 #[expect(clippy::type_complexity, reason = "two parallel breakdown lists")]
 fn worst_terms(
+    version: u32,
     legs: &[PmLeg],
     orders: &[PmOrder],
     by_id: &BTreeMap<&InstrumentId, &PmLeg>,
@@ -484,13 +550,13 @@ fn worst_terms(
             .ok_or_else(|| MarginError::MissingMark {
                 instrument: leg.instrument.clone(),
             })?;
-        let loss = sum_products(
-            &[
-                &[neg(leg.contracts), leg.multiplier, x],
-                &[leg.contracts, leg.multiplier, leg.mark],
-            ],
-            "leg loss",
-        )?;
+        let at_scenario = [neg(leg.contracts), leg.multiplier, x];
+        let at_mark = [leg.contracts, leg.multiplier, leg.mark];
+        let loss = if full_value(version, leg) {
+            sum_products(&[&at_scenario], "leg loss")?
+        } else {
+            sum_products(&[&at_scenario, &at_mark], "leg loss")?
+        };
         leg_terms.push((leg.instrument.clone(), loss));
     }
     let mut order_terms = Vec::with_capacity(orders.len());
@@ -518,12 +584,16 @@ fn worst_terms(
 /// The terms of `F` (every option sell filled, no buy) and of `G` (the
 /// linear legs with their orders' contracts).
 fn floor_terms(
+    version: u32,
     legs: &[PmLeg],
     orders: &[PmOrder],
     rates: ScenarioPmRates,
 ) -> Result<(Terms, Terms)> {
     let mut option_floor: Vec<Vec<Decimal>> = Vec::new();
     let mut linear_floor: Vec<Vec<Decimal>> = Vec::new();
+    if version == 2 {
+        linear_floor = spread_floor_terms(legs, orders, rates)?;
+    }
     for leg in legs {
         let mine = orders.iter().filter(|o| o.instrument == leg.instrument);
         match leg.kind {
@@ -540,6 +610,7 @@ fn floor_terms(
                     ]);
                 }
             }
+            PmLegKind::Linear if version == 2 => {}
             PmLegKind::Linear => {
                 let mut gross = vec![leg.contracts.abs()];
                 gross.extend(mine.map(|o| o.contracts.abs()));
@@ -554,6 +625,58 @@ fn floor_terms(
         }
     }
     Ok((option_floor, linear_floor))
+}
+
+/// Version 2's linear floor: `g * (gross' - max(0, |net| - against))`, with
+/// `gross'` the gross notional of the linear legs plus that of every linear
+/// order, `net` the net notional of the legs and `against` the notional of
+/// the orders against its sign, all at the marks. Without orders it is
+/// `g * (gross - |net|)`.
+fn spread_floor_terms(legs: &[PmLeg], orders: &[PmOrder], rates: ScenarioPmRates) -> Result<Terms> {
+    let linear: Vec<&PmLeg> = legs
+        .iter()
+        .filter(|l| l.kind == PmLegKind::Linear)
+        .collect();
+    let notional = |contracts: Decimal, leg: &PmLeg| [contracts, leg.multiplier, leg.mark];
+    let net_terms: Vec<[Decimal; 3]> = linear.iter().map(|l| notional(l.contracts, l)).collect();
+    let net_refs: Vec<&[Decimal]> = net_terms.iter().map(<[Decimal; 3]>::as_slice).collect();
+    let net = sum_products(&net_refs, "net notional")?;
+    let mut gross_terms: Vec<[Decimal; 3]> = linear
+        .iter()
+        .map(|l| notional(l.contracts.abs(), l))
+        .collect();
+    let mut against_terms: Vec<[Decimal; 3]> = Vec::new();
+    for order in orders {
+        let Some(leg) = linear.iter().find(|l| l.instrument == order.instrument) else {
+            continue;
+        };
+        gross_terms.push(notional(order.contracts.abs(), leg));
+        let opposite = (order.contracts > Decimal::ZERO && net < Decimal::ZERO)
+            || (order.contracts < Decimal::ZERO && net > Decimal::ZERO);
+        if opposite {
+            against_terms.push(notional(order.contracts.abs(), leg));
+        }
+    }
+    let refs = |terms: &[[Decimal; 3]]| -> Vec<Vec<Decimal>> {
+        terms.iter().map(|t| t.to_vec()).collect()
+    };
+    let gross = {
+        let t = refs(&gross_terms);
+        let r: Vec<&[Decimal]> = t.iter().map(Vec::as_slice).collect();
+        sum_products(&r, "gross notional")?
+    };
+    let against = {
+        let t = refs(&against_terms);
+        let r: Vec<&[Decimal]> = t.iter().map(Vec::as_slice).collect();
+        sum_products(&r, "against notional")?
+    };
+    let kept = sum(&[net.abs(), neg(against)], "net kept")?.max(Decimal::ZERO);
+    let spread = sum(&[gross, neg(kept)], "spread notional")?;
+    Ok(if spread.is_zero() {
+        Vec::new()
+    } else {
+        vec![vec![rates.linear_floor_rate, spread]]
+    })
 }
 
 /// Checks the legs and orders; the legs by instrument.
