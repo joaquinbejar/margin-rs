@@ -238,6 +238,26 @@ pub trait AccountMargin: InitialMarginModel {
     /// sum of per-position piecewise linear margins (see
     /// [`PiecewiseLinearMargin`]); `None` for a rule that nets.
     fn plan_tiers(&self, position: &ExposurePosition) -> Option<Vec<crate::rules::MarginTier>>;
+
+    /// True when, for `position` without [`AccountMargin::plan_tiers`],
+    /// meeting the closeout target is monotone in the count closed on a
+    /// level: once a count meets it, every larger count of that level does.
+    /// The planner then bisects the level, `O(log n)` exact evaluations,
+    /// instead of walking it count by count (see
+    /// [`plan_liquidation`](crate::liquidation::plan_liquidation)). The
+    /// default is `false`.
+    ///
+    /// A rule may claim it when it margins the position on its own (no
+    /// netting) and its margin falls at least linearly with the contracts,
+    /// so that the excess is non decreasing in the count, and the account's
+    /// cash cannot turn negative over the level (for example, closing a
+    /// position whose fills credit cash, or cash far above the level's
+    /// cost). If the claim is wrong the plan stays valid, every count it
+    /// takes is evaluated exactly, but the count may not be the smallest.
+    fn plan_monotone(&self, position: &ExposurePosition) -> bool {
+        let _ = position;
+        false
+    }
 }
 
 impl<T: PiecewiseLinearMargin> AccountMargin for T {

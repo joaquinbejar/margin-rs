@@ -120,7 +120,11 @@
 //!   order and takes the first that meets the target, the smallest; if no
 //!   count does, the whole level. Each evaluation uses one unit of
 //!   [`SEARCH_BUDGET`]; when it runs out the plan fails with
-//!   [`MarginError::CloseoutSearchLimit`]. Instruments are taken in
+//!   [`MarginError::CloseoutSearchLimit`]. A rule that declares the
+//!   target monotone in the count ([`AccountMargin::plan_monotone`]) gets
+//!   a bisection of the level instead, `O(log n)` evaluations: the
+//!   smallest meeting count when the claim holds, the whole level when its
+//!   last count does not meet the target. Instruments are taken in
 //!   decreasing order of the maintenance the rule attributes to their
 //!   lines.
 //!
@@ -861,9 +865,17 @@ impl<M: AccountMargin> Planner<'_, M> {
         // J contains every count that meets the target, J' only counts that
         // do; without a certificate (a rule without tiers, or an overflow
         // of the wide integers), J is the whole level.
-        let certificate = self
-            .continuous(state, index, offer.price)?
-            .and_then(|continuous| continuous.certify(&grid, first, last, self.scale));
+        let continuous = self.continuous(state, index, offer.price)?;
+        if continuous.is_none() && self.model.plan_monotone(exposure) {
+            let limit = MarginError::CloseoutSearchLimit {
+                instrument: exposure.instrument.clone(),
+                level,
+                limit: self.limit,
+            };
+            return self.bisect_level(&grid, size, last, &at, &limit);
+        }
+        let certificate =
+            continuous.and_then(|continuous| continuous.certify(&grid, first, last, self.scale));
         let (possible, certain) = match certificate {
             Some((possible, certain)) => (possible.span(), certain.span()),
             None => (Some((first, last)), None),
@@ -968,6 +980,55 @@ impl<M: AccountMargin> Planner<'_, M> {
                 best = Some(attempt);
             } else {
                 high = candidate;
+            }
+        }
+        Ok(best)
+    }
+
+    /// The smallest count of a level that meets the target, by bisection,
+    /// when the rule declares meeting it monotone in the count
+    /// ([`AccountMargin::plan_monotone`]); the whole level when its last
+    /// count does not meet it. Each evaluation uses one unit of the search
+    /// budget; running out is `limit`.
+    fn bisect_level(
+        &self,
+        grid: &ContractGrid,
+        size: Decimal,
+        last: GridIndex,
+        at: &dyn Fn(GridIndex) -> Result<(State, ForcedReduction, AccountSummary)>,
+        limit: &MarginError,
+    ) -> Result<(State, ForcedReduction, AccountSummary)> {
+        let spend = || -> Result<()> {
+            let left = self.budget.get();
+            if left == 0 {
+                return Err(limit.clone());
+            }
+            self.budget.set(left.saturating_sub(1));
+            Ok(())
+        };
+        spend()?;
+        let mut best = Self::whole_level(grid, size, last, at)?;
+        if !self.met(&best.2) {
+            return Ok(best);
+        }
+        // The smallest meeting count lies in (low, high]; `best` is at
+        // `high` or above it with nothing bookable in between.
+        let (mut low, mut high) = (GridIndex::ZERO, last);
+        while !ContractGrid::adjacent(low, high) {
+            let mid = ContractGrid::midpoint(low, high);
+            match grid.first_holding(size, (mid, high))? {
+                Some(count) if count < high => {
+                    spend()?;
+                    let attempt = at(count)?;
+                    if self.met(&attempt.2) {
+                        best = attempt;
+                        high = count;
+                    } else {
+                        low = count;
+                    }
+                }
+                // Nothing bookable in [mid, high): look below `mid`.
+                _ => high = mid,
             }
         }
         Ok(best)

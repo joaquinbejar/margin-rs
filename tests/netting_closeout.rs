@@ -40,12 +40,22 @@ fn iid(id: &str) -> InstrumentId {
 
 struct NetLinear {
     rule: RuleId,
+    /// What `plan_monotone` claims.
+    monotone: bool,
 }
 
 impl NetLinear {
     fn new() -> Self {
         Self {
             rule: RuleId::new("net-linear", 1),
+            monotone: false,
+        }
+    }
+
+    fn monotone() -> Self {
+        Self {
+            monotone: true,
+            ..Self::new()
         }
     }
 }
@@ -103,6 +113,10 @@ impl AccountMargin for NetLinear {
 
     fn plan_tiers(&self, _: &ExposurePosition) -> Option<Vec<MarginTier>> {
         None
+    }
+
+    fn plan_monotone(&self, _: &ExposurePosition) -> bool {
+        self.monotone
     }
 }
 
@@ -226,4 +240,56 @@ fn test_netting_rule_walk_is_bounded_by_the_search_budget() {
         at(dec!(0.0005)),
         Err(MarginError::CloseoutSearchLimit { .. })
     ));
+}
+
+/// A lone long A 10 (no hedge), cash 10, sold at 99.5: collateral
+/// `10 - 0.5n` against a maintenance of `5 * (10 - n)`, met from
+/// n = 8.888..., so 8.889 at a step of 0.0005: 17778 counts, beyond the
+/// walk's budget. Declared monotone, the level is bisected.
+#[test]
+fn test_monotone_rule_is_bisected() {
+    let mut account = hedged();
+    account.view.positions.truncate(1);
+    account.basis.remove(&iid("B"));
+    let liquidity = BTreeMap::from([(
+        iid("A"),
+        vec![LiquidityLevel {
+            price: dec!(99.5),
+            contracts: dec!(100),
+        }],
+    )]);
+    let step = policy(CloseoutTarget::Maintenance, dec!(0.0005));
+    assert!(matches!(
+        plan_liquidation(&NetLinear::new(), &account, &liquidity, &step),
+        Err(MarginError::CloseoutSearchLimit { .. })
+    ));
+    let plan = plan_liquidation(&NetLinear::monotone(), &account, &liquidity, &step).expect("plan");
+    assert_eq!(plan.outcome, CloseoutOutcome::TargetMet);
+    assert_eq!(plan.reductions[0].contracts, dec!(8.889));
+    // The count before it does not meet the target: 8.8885 leaves
+    // 5.55575 against 5.5575.
+    assert!(plan.minimal);
+    // At a step of 1 the walk and the bisection agree.
+    let unit = policy(CloseoutTarget::Maintenance, Decimal::ONE);
+    assert_eq!(
+        plan_liquidation(&NetLinear::monotone(), &account, &liquidity, &unit).expect("plan"),
+        plan_liquidation(&NetLinear::new(), &account, &liquidity, &unit).expect("plan"),
+    );
+}
+
+/// A wrong claim keeps the plan valid: on the hedged pair the target is
+/// met only between 2.5 and 5 contracts, so the whole level (10) does not
+/// meet it and the bisection takes the whole level, as the walk does when
+/// no count meets the target.
+#[test]
+fn test_wrong_monotone_claim_takes_the_whole_level() {
+    let plan = plan_liquidation(
+        &NetLinear::monotone(),
+        &hedged(),
+        &bids_on_a(),
+        &policy(CloseoutTarget::Maintenance, Decimal::ONE),
+    )
+    .expect("plan");
+    assert_eq!(plan.reductions[0].contracts, dec!(10));
+    assert_ne!(plan.outcome, CloseoutOutcome::TargetMet);
 }

@@ -6,6 +6,12 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `AccountMargin::plan_monotone` (default `false`): a tierless position whose
+  target is monotone in the count is bisected per level, `O(log n)` exact
+  evaluations, instead of walked count by count.
+
 ## [0.3.0] - 2026-11-11
 
 Breaking against 0.2.0: `LiquidationPolicy` gains fields and is no longer
