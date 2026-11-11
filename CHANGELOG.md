@@ -20,6 +20,11 @@ follows [Semantic Versioning](https://semver.org/).
   `PmLeg`, `PmLegKind`, `PmOrder`, `PmBreakdown` and `ScenarioPmRequirement`.
   Nets linear and option legs over caller supplied scenarios, with floors and
   an admission figure over resting orders. See `docs/scenario-margin.md` (#51).
+- Closeout plans over European linear options: premium cash conventions,
+  `min(value, 0)` collateral, reduce-only intents on the opposite side.
+  `rules::LinearWithOptionsIm` margins options under `ShortOptionIm` and the
+  rest under a linear rule; `ShortOptionIm::scale`. American and inverse
+  options are `UnsupportedInstrument` (#53).
 
 ### Changed
 

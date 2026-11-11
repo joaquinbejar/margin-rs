@@ -112,9 +112,9 @@ inverse, in the underlying:
 
 ## What does not cover options yet
 
-These refuse an open option with `UnsupportedInstrument` instead of leaving it out, since leaving it out would overstate the account:
+These refuse an open option with `UnsupportedInstrument` instead of leaving it out, since leaving it out would overstate the account (the closeout plan supports European linear options under a rule that margins them, see `liquidation.md`):
 
 - **Stress** (`scenarios::stress`): options are not stressed, shocked or filled hypothetically. Revaluing them needs a pricing model.
-- **Closeout** (`LiquidationAccount::from_ledger`): an account with an open option gets no plan.
+- **Closeout**: American and inverse options get no plan (`LiquidationAccount::from_ledger`), and a rule that does not margin options refuses the plan (`plan_liquidation`).
 - **Margin reservations** (`MarginReservationService` on a ledger): an open option settled in the service's currency makes its requirement fail, because its rule does not cover options, so the service blocks orders in that currency. An option settled in another asset does not affect it, and neither does a flat one. An external hold does not lift this.
 - **Pretrade risk gate** (`RiskGate::submit`): orders are for spot. Its option fills and settlements are mandatory postings (`book_derivative_execution`, `settle_option`).

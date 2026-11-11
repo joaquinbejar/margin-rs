@@ -237,9 +237,20 @@ The account holds 10 BTC-PERP long, `M = 1`, entry 100 (basis 1000), mark 95, wi
 ## Out of scope
 
 - Insurance fund, loss allocation and auto-deleveraging. The debt and the deficit are left for them, explicitly.
-- Options. The rules cover linear (`TieredLinearIm`) and inverse (`TieredInverseIm`) futures and perpetuals only.
+- American and inverse options.
 - Stress of inverse positions (see `docs/valuation.md`).
 
 ## Options
 
-An account with an open option gets no plan: `LiquidationAccount::from_ledger` returns `UnsupportedInstrument`. See `options.md`.
+An account may hold European options with linear margining (`OptionMargining::Linear`); `LiquidationAccount::from_ledger` refuses American and inverse options with `UnsupportedInstrument`. The rule must margin options: `rules::LinearWithOptionsIm` margins the options under `ShortOptionIm` and the rest under a linear rule (no netting), holding each option's definition and underlying price. A rule that does not cover options makes the plan fail with `UnsupportedInstrument`, never leaving the option out.
+
+An option position follows the ledger's premium convention (`options.md`), with `p` a premium and the mark a premium mark (zero allowed):
+
+| Figure | Formula |
+|---|---|
+| collateral term | `min(round_half_even(Qc * M * mark, c), 0)`: a short deducts its value, a long gets no credit |
+| fill cash, `n` at `p` | `+round_half_even(p * n * M, c)` when selling (closing a long credits the premium), negative when buying (closing a short debits it) |
+| released basis, realized PnL | as for a linear position (reported) |
+| cash after a fill | `cash + fill cash - fee`: the premium is the cash |
+
+Reduce intents are reduce-only orders on the opposite side, limited at the worst premium used. An option position gets no certificate: its levels are walked count by count (one unit of `SEARCH_BUDGET` each), while linear positions under `LinearWithOptionsIm` keep the exact search, since an option's margin does not change while a linear position shrinks.

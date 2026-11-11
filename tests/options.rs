@@ -23,7 +23,9 @@ use margin_rs::ledger::{
     Action, DerivativeSettlement, Execution, ExpirySettlement, FundingPayment, Ledger,
     OptionOutcome, OptionSettlement, OptionSettlementBooking,
 };
-use margin_rs::liquidation::LiquidationAccount;
+use margin_rs::liquidation::{
+    CloseoutTarget, LiquidationAccount, LiquidationPolicy, plan_liquidation,
+};
 use margin_rs::margin_reservations::{MarginInstrument, MarginOrder, MarginReservationService};
 use margin_rs::risk::{OrderRequest, RiskDecision, RiskGate};
 use margin_rs::rules::TieredLinearIm;
@@ -1566,13 +1568,14 @@ fn venue() -> VenueId {
     VenueId::new("venue").unwrap()
 }
 
-/// No closeout plan is better than one that leaves the short option out.
+/// No closeout plan is better than one that leaves the short option out:
+/// a rule that does not margin options refuses the plan.
 #[test]
-fn test_liquidation_open_option_is_refused() {
+fn test_liquidation_open_option_needs_a_rule_for_options() {
     let mut ledger = ledger();
     fill(&mut ledger, "e1", CALL, Action::Sell, dec!(10), dec!(2));
     let rule = TieredLinearIm::linear_v1(asset("USDC"), 6).unwrap();
-    let error = LiquidationAccount::from_ledger(
+    let account = LiquidationAccount::from_ledger(
         &rule,
         &ledger.snapshot(),
         account(),
@@ -1581,8 +1584,46 @@ fn test_liquidation_open_option_is_refused() {
         &BTreeMap::from([(iid(CALL), dec!(13))]),
         1,
     )
+    .unwrap();
+    let error = plan_liquidation(
+        &rule,
+        &account,
+        &BTreeMap::new(),
+        &LiquidationPolicy {
+            target: CloseoutTarget::Flat,
+            fee_rate: Decimal::ZERO,
+            fee_rates: BTreeMap::new(),
+            loss_budget: None,
+            contract_step: Decimal::ONE,
+        },
+    )
     .unwrap_err();
     assert!(is_unsupported(&error), "{error:?}");
+}
+
+/// American and inverse options have no closeout plan.
+#[test]
+fn test_liquidation_unsupported_option_styles_are_refused() {
+    for (id, mark) in [(AMERICAN_CASH_CALL, dec!(13)), ("INVERSE-CALL", dec!(0.01))] {
+        let mut ledger = ledger();
+        if id == "INVERSE-CALL" {
+            ledger
+                .deposit(TransferId::new("btc").unwrap(), asset("BTC"), dec!(1))
+                .unwrap();
+        }
+        fill(&mut ledger, "e1", id, Action::Buy, mark, dec!(1));
+        let error = LiquidationAccount::from_ledger(
+            &TieredLinearIm::linear_v1(asset("USDC"), 6).unwrap(),
+            &ledger.snapshot(),
+            account(),
+            venue(),
+            &asset("USDC"),
+            &BTreeMap::from([(iid(id), mark)]),
+            1,
+        )
+        .unwrap_err();
+        assert!(is_unsupported(&error), "{id}: {error:?}");
+    }
 }
 
 fn perp_gate(fill_option: Option<&str>) -> RiskGate {
