@@ -26,7 +26,7 @@
 
 use std::collections::BTreeMap;
 
-use margin_rs::initial_margin::RuleId;
+use margin_rs::initial_margin::{InitialMarginModel, RuleId};
 use margin_rs::instrument::{
     ExerciseStyle, LinearPerpetual, LinearTerms, OptionContract, OptionDelivery, OptionInstrument,
     OptionMargining, OptionRight,
@@ -311,7 +311,6 @@ fn test_rules_in_different_currencies_are_refused() {
         venue: VenueId::new("venue").expect("id"),
         positions: vec![],
     };
-    use margin_rs::initial_margin::InitialMarginModel;
     assert!(matches!(
         mixed.requirement(&view),
         Err(margin_rs::MarginError::InvalidInput {
