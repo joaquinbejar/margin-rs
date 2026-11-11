@@ -131,10 +131,12 @@
 //!   A rule that declares the
 //!   target monotone in the count ([`AccountMargin::plan_monotone`]) gets
 //!   a bisection of the level instead, `O(log n)` evaluations: the
-//!   smallest meeting count when the claim holds, the whole level when its
-//!   last count does not meet the target. A wrong claim keeps every taken
-//!   count exact but can take the whole level although a smaller count
-//!   meets the target, and `minimal` assumes the claim. Instruments are taken in
+//!   smallest meeting count when the claim holds. When the last count does
+//!   not meet the target the level is walked (and galloped) as for any
+//!   tierless position, so a wrong claim (for example a cash condition that
+//!   fails at large counts) never takes the whole level past a meeting
+//!   count the walk would find; when the last count meets it, the count
+//!   found meets it too and `minimal` assumes the claim. Instruments are taken in
 //!   decreasing order of the maintenance the rule attributes to their
 //!   lines.
 //!
@@ -882,7 +884,12 @@ impl<M: AccountMargin> Planner<'_, M> {
                 level,
                 limit: self.limit,
             };
-            return self.bisect_level(&grid, size, last, &at, &limit);
+            if let Some(found) = self.bisect_level(&grid, size, last, &at, &limit)? {
+                return Ok(found);
+            }
+            // The last count does not meet the target: under a wrong claim
+            // a smaller count still may, so the level is walked (and
+            // galloped) as for any tierless position.
         }
         let certificate =
             continuous.and_then(|continuous| continuous.certify(&grid, first, last, self.scale));
@@ -1003,11 +1010,10 @@ impl<M: AccountMargin> Planner<'_, M> {
 
     /// The smallest count of a level that meets the target, by bisection,
     /// when the rule declares meeting it monotone in the count
-    /// ([`AccountMargin::plan_monotone`]); the whole level when its last
-    /// count does not meet it. Both, and [`LiquidationPlan::minimal`],
-    /// assume the claim: under a wrong one the plan may take the whole
-    /// level even though a smaller count meets the target, and still
-    /// report `minimal`. Each evaluation uses one unit of the search
+    /// ([`AccountMargin::plan_monotone`]); `None` when its last count does
+    /// not meet it, and the caller walks the level instead. When the last
+    /// count meets it, the count found meets it too; it is the smallest,
+    /// and [`LiquidationPlan::minimal`] stays true, on the claim. Each evaluation uses one unit of the search
     /// budget; running out is `limit`.
     fn bisect_level(
         &self,
@@ -1016,7 +1022,7 @@ impl<M: AccountMargin> Planner<'_, M> {
         last: GridIndex,
         at: &dyn Fn(GridIndex) -> Result<(State, ForcedReduction, AccountSummary)>,
         limit: &MarginError,
-    ) -> Result<(State, ForcedReduction, AccountSummary)> {
+    ) -> Result<Option<(State, ForcedReduction, AccountSummary)>> {
         let spend = || -> Result<()> {
             let left = self.budget.get();
             if left == 0 {
@@ -1028,7 +1034,7 @@ impl<M: AccountMargin> Planner<'_, M> {
         spend()?;
         let mut best = Self::whole_level(grid, size, last, at)?;
         if !self.met(&best.2) {
-            return Ok(best);
+            return Ok(None);
         }
         // The smallest meeting count lies in (low, high]; `best` is at
         // `high` or above it with nothing bookable in between.
@@ -1050,7 +1056,7 @@ impl<M: AccountMargin> Planner<'_, M> {
                 _ => high = mid,
             }
         }
-        Ok(best)
+        Ok(Some(best))
     }
 
     /// The rest `[start, end]` of a tierless level the walk could not finish

@@ -18,7 +18,9 @@ follows [Semantic Versioning](https://semver.org/).
   finishes within 3896 evaluations (the budget less the reserve) are
   unchanged (#69).
 - `LinearWithOptionsIm` declares its option positions monotone
-  (`plan_monotone`), so their levels are bisected.
+  (`plan_monotone`), so their levels are bisected. A monotone level whose last
+  count fails the target is walked as without the claim, so a cash limit on a
+  short buy-back never skips a meeting count.
 
 ## [0.3.0] - 2026-11-11
 

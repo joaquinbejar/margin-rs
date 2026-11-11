@@ -279,21 +279,22 @@ fn test_monotone_rule_is_bisected() {
     );
 }
 
-/// A wrong claim keeps the plan valid: on the hedged pair the target is
-/// met only between 2.5 and 5 contracts, so the whole level (10) does not
-/// meet it and the bisection takes the whole level, as the walk does when
-/// no count meets the target.
+/// A wrong claim cannot skip a meeting count: on the hedged pair the
+/// target is met only between 2.5 and 5 contracts, so the whole level
+/// (10) does not meet it; the level is then walked, as without the claim,
+/// and the plan takes 3, the smallest.
 #[test]
-fn test_wrong_monotone_claim_takes_the_whole_level() {
-    let plan = plan_liquidation(
+fn test_wrong_monotone_claim_falls_back_to_the_walk() {
+    let claimed = plan_liquidation(
         &NetLinear::monotone(),
         &hedged(),
         &bids_on_a(),
         &policy(CloseoutTarget::Maintenance, Decimal::ONE),
     )
     .expect("plan");
-    assert_eq!(plan.reductions[0].contracts, dec!(10));
-    assert_ne!(plan.outcome, CloseoutOutcome::TargetMet);
+    assert_eq!(claimed.reductions[0].contracts, dec!(3));
+    assert_eq!(claimed.outcome, CloseoutOutcome::TargetMet);
+    assert!(claimed.minimal);
 }
 
 /// The hedged pair with cash 4.01 meets the target only in a narrow band,
