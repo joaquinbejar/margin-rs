@@ -36,6 +36,18 @@ G'     = g * sum over linear legs of (|Q| + sum of |q| of its orders) * M * X0
 
 Contributions are additive per scenario, so the worst subset for `s` takes exactly the orders with `c_o(s) > 0`. `F'` assumes every option sell fills and no buy; `G'` adds every linear order's contracts to the gross. Each is at least its value after any subset of fills, so the admission figure is never below the requirement of any fill subset (checked against a brute force in `tests/scenario_pm.rs`). Every order needs a leg for its instrument, with zero contracts if none is held.
 
+## Version 2: `scenario-pm/2`
+
+`ScenarioPm::scenario_pm_v2` keeps everything of version 1 and changes two figures, for venues whose collateral gives long options no credit and whose linear floor should charge only spread exposure:
+
+```text
+long option:  loss_i(s) = -Q * M * X_s     (its full scenario value)
+G   = g * (gross - |net|)
+G'  = g * (gross + O - max(0, |net| - O_against))
+```
+
+`gross = sum |Q| * M * X0` and `net = sum Q * M * X0` over linear legs; `O` is the notional `|q| * M * X0` of every linear order at its leg's mark and `O_against` that of the orders against the sign of `net`. A single linear position pays no `G`, so with extreme moves `X0 * (1 +- r)` the figure equals `linear-im/1` at rate `r` whatever `g`; a calendar spread of equal and opposite notionals `N` pays `g * 2N`. `G'` bounds `G` after any subset of fills. Version 1 keeps its formulas and id.
+
 ## Breakdown
 
 `ScenarioPmRequirement` carries the usual `MarginRequirement` and, per figure, a `PmBreakdown`: the worst scenario's index, the exact per-leg and per-order terms in it, `max(0, R_s)`, `F`, `G` and the rounded figure. In the `MarginRequirement`, each figure is attributed whole to the leg with the largest term in its worst scenario (the first in view order on a tie) and zero to the other lines, so lines add up to the totals.
