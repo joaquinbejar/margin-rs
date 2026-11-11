@@ -6,6 +6,15 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `LiquidationPolicy::fee_rates`, a fee rate per instrument in place of
+  `fee_rate`, and `LiquidationPolicy::fee_rate_for` (#55).
+
+### Changed
+
+- `LiquidationPolicy` is no longer `Copy`.
+
 ## [0.2.0] - 2026-11-06
 
 Options in the ledger: positions, premium, settlement, valuation and the short
