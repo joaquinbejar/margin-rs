@@ -115,6 +115,7 @@
 //! );
 //! ```
 
+pub mod account_view;
 pub mod collateral;
 pub mod covariance;
 pub mod decimal;

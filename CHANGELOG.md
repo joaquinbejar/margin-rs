@@ -8,6 +8,9 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `account_view::AccountMarginView`: requirement, state, collateral figures,
+  debt, positions and resting risk-increasing orders of one account at one
+  caller-supplied sequence number, built with `assess` (#56).
 - `LiquidationPolicy::fee_rates`, a fee rate per instrument in place of
   `fee_rate`, and `LiquidationPolicy::fee_rate_for` (#55).
 - `LiquidationPolicy::loss_budget` and `CloseoutOutcome::BudgetExhausted`: the
