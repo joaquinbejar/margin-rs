@@ -561,7 +561,10 @@ pub enum CloseoutOutcome {
     LiquidityExhausted,
     /// The plan stopped at [`LiquidationPolicy::loss_budget`] with the
     /// target not met: the next count would bring the projected equity
-    /// below `-B`, or it was already below before any fill.
+    /// below `-B`, or it was already below before any fill. The positions
+    /// left open are in [`LiquidationPlan::after`]'s `positions`, not in
+    /// [`LiquidationPlan::unfilled`], which lists only liquidity that ran
+    /// out.
     BudgetExhausted,
 }
 
