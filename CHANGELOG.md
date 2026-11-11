@@ -6,6 +6,8 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-11
+
 ### Added
 
 - Rule `scenario-pm/2`: `ScenarioPm::scenario_pm_v2`. Long options at their
@@ -316,7 +318,8 @@ crates.io only reserved the name.
   pinned by git to an earlier revision; updating it to this release is
   pending.
 
-[Unreleased]: https://github.com/joaquinbejar/margin-rs/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/joaquinbejar/margin-rs/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/joaquinbejar/margin-rs/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/joaquinbejar/margin-rs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/joaquinbejar/margin-rs/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/joaquinbejar/margin-rs/compare/v0.1.0...v0.1.1

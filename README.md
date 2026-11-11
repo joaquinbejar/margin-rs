@@ -410,7 +410,7 @@ See [docs/exact-arithmetic.md](docs/exact-arithmetic.md).
 
 ## Status and policies
 
-- Version 0.3.0, published on crates.io. Before 1.0 the API may change
+- Version 0.3.1, published on crates.io. Before 1.0 the API may change
   in a minor version.
 - Rust edition 2024, MSRV 1.88. CI runs the latest stable and the MSRV.
 - Small dependency set: `financial_types`, `thiserror` and `rust_decimal`
