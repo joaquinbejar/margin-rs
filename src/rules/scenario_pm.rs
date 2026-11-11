@@ -182,6 +182,7 @@ pub struct ScenarioPm {
     initial: ScenarioPmRates,
     maintenance: ScenarioPmRates,
     scenarios: ScenarioSets,
+    underlying_prices: BTreeMap<InstrumentId, Decimal>,
 }
 
 impl ScenarioPm {
@@ -220,7 +221,30 @@ impl ScenarioPm {
             initial,
             maintenance,
             scenarios,
+            underlying_prices: BTreeMap::new(),
         })
+    }
+
+    /// The rule with the underlying price of each option instrument, so
+    /// that [`InitialMarginModel::requirement`] can margin option
+    /// positions of an [`ExposureView`] (an [`ExposurePosition`] carries no
+    /// underlying price). Replaces any prices given before.
+    ///
+    /// # Errors
+    ///
+    /// [`MarginError::InvalidInput`] for a price that is not positive.
+    pub fn with_underlying_prices(
+        mut self,
+        prices: BTreeMap<InstrumentId, Decimal>,
+    ) -> Result<Self> {
+        if prices.values().any(|price| *price <= Decimal::ZERO) {
+            return Err(MarginError::invalid_input(
+                "underlying_prices",
+                "must be positive",
+            ));
+        }
+        self.underlying_prices = prices;
+        Ok(self)
     }
 
     /// Name and version of the rule.
@@ -592,15 +616,17 @@ impl InitialMarginModel for ScenarioPm {
         &self.id
     }
 
-    /// The requirement of a view of linear futures and perpetuals, each a
-    /// [`PmLegKind::Linear`] leg at its mark.
+    /// The requirement of a view of linear futures, perpetuals and options:
+    /// a linear position is a [`PmLegKind::Linear`] leg at its mark, an
+    /// option a [`PmLegKind::Option`] leg at its premium mark with the
+    /// underlying price given to [`ScenarioPm::with_underlying_prices`].
     ///
     /// # Errors
     ///
     /// As [`ScenarioPm::requirement_for`], and
-    /// [`MarginError::UnsupportedInstrument`] for an inverse position or an
-    /// option (an option needs its underlying price: use
-    /// [`ScenarioPm::requirement_for`]).
+    /// [`MarginError::UnsupportedInstrument`] for an inverse position, and
+    /// [`MarginError::MissingMark`] for an option without an underlying
+    /// price.
     fn requirement(&self, view: &ExposureView) -> Result<MarginRequirement> {
         let legs = view
             .positions
@@ -631,10 +657,22 @@ impl ScenarioPm {
                 multiplier,
                 mark: position.mark,
             }),
-            (ProductKind::Option, _) => {
-                Err(unsupported("an option leg needs its underlying price"))
+            (ProductKind::Option, ContractSize::Multiplier(multiplier)) => {
+                let underlying_price = *self
+                    .underlying_prices
+                    .get(&position.instrument)
+                    .ok_or_else(|| MarginError::MissingMark {
+                        instrument: position.instrument.clone(),
+                    })?;
+                Ok(PmLeg {
+                    instrument: position.instrument.clone(),
+                    kind: PmLegKind::Option { underlying_price },
+                    contracts: position.contracts,
+                    multiplier,
+                    mark: position.mark,
+                })
             }
-            _ => Err(unsupported("only linear futures and perpetuals")),
+            _ => Err(unsupported("only linear futures, perpetuals and options")),
         }
     }
 }
