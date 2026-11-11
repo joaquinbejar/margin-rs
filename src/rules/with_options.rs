@@ -47,8 +47,9 @@ impl<L: PiecewiseLinearMargin> LinearWithOptionsIm<L> {
     /// # Errors
     ///
     /// [`MarginError::InvalidInput`] if the two rules round to different
-    /// scales or margin different currencies, or `options_terms` repeats an
-    /// instrument.
+    /// scales or `options_terms` repeats an instrument. Rules in different
+    /// currencies are refused by [`InitialMarginModel::requirement`], once
+    /// both have produced a requirement.
     pub fn new(
         id: RuleId,
         linear: L,

@@ -292,3 +292,31 @@ fn test_option_premium_mark_may_be_zero() {
         })
     ));
 }
+
+/// Two rules in different currencies are refused when the requirement is
+/// computed.
+#[test]
+fn test_rules_in_different_currencies_are_refused() {
+    let eur = Asset::new("EUR").expect("asset");
+    let linear = TieredLinearIm::linear_v1(eur, 2).expect("rule");
+    let mixed = LinearWithOptionsIm::new(
+        RuleId::new("mixed", 1),
+        linear,
+        ShortOptionIm::short_option_v1(usdc(), 2).expect("rule"),
+        vec![(option("CALL", OptionRight::Call), dec!(100))],
+    )
+    .expect("model");
+    let view = margin_rs::initial_margin::ExposureView {
+        account: AccountId::new("acct").expect("id"),
+        venue: VenueId::new("venue").expect("id"),
+        positions: vec![],
+    };
+    use margin_rs::initial_margin::InitialMarginModel;
+    assert!(matches!(
+        mixed.requirement(&view),
+        Err(margin_rs::MarginError::InvalidInput {
+            field: "options",
+            ..
+        })
+    ));
+}
