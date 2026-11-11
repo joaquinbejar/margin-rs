@@ -91,6 +91,7 @@ fn policy(target: CloseoutTarget) -> LiquidationPolicy {
     LiquidationPolicy {
         target,
         fee_rate: dec!(0.0005),
+        fee_rates: BTreeMap::new(),
         contract_step: Decimal::ONE,
     }
 }
@@ -1065,4 +1066,92 @@ fn test_intents_caller_built_other_reduction_is_unsupported() {
         );
     }
     assert!(base.intents().is_ok());
+}
+
+/// Two longs closed flat, each at its own fee rate: BTC-PERP 10 at 94
+/// (default rate 0.0005), ETH-PERP 4 at 49 (rate 0.002).
+///
+/// - BTC: fill cash 940, released 1000, realized -60, fee
+///   trunc(0.0005 * 940) = 0.47.
+/// - ETH: fill cash 196, released 200, realized -4, fee
+///   trunc(0.002 * 196) = 0.392 (0.098 at the default rate).
+/// - Cash: 1000 - 60 - 4 - 0.47 - 0.392 = 935.138.
+fn two_longs() -> (
+    LiquidationAccount,
+    BTreeMap<InstrumentId, Vec<LiquidityLevel>>,
+) {
+    let account = LiquidationAccount {
+        view: view(vec![
+            perp("BTC-PERP", dec!(10), dec!(95)),
+            perp("ETH-PERP", dec!(4), dec!(50)),
+        ]),
+        basis: BTreeMap::from([(iid("BTC-PERP"), dec!(1000)), (iid("ETH-PERP"), dec!(200))]),
+        cash: dec!(1000),
+        resting_orders: vec![],
+    };
+    let level = |price| {
+        vec![LiquidityLevel {
+            price,
+            contracts: dec!(100),
+        }]
+    };
+    let liquidity = BTreeMap::from([
+        (iid("BTC-PERP"), level(dec!(94))),
+        (iid("ETH-PERP"), level(dec!(49))),
+    ]);
+    (account, liquidity)
+}
+
+fn fee_of(plan: &LiquidationPlan, id: &str) -> Decimal {
+    plan.reductions
+        .iter()
+        .filter(|r| r.instrument == iid(id))
+        .map(|r| r.fee)
+        .sum()
+}
+
+#[test]
+fn test_fee_rates_charge_each_instrument_its_own_rate() {
+    let (account, liquidity) = two_longs();
+    let mut per_instrument = policy(CloseoutTarget::Flat);
+    per_instrument.fee_rates = BTreeMap::from([(iid("ETH-PERP"), dec!(0.002))]);
+    let plan = plan(&account, &liquidity, &per_instrument);
+    assert_eq!(plan.outcome, CloseoutOutcome::TargetMet);
+    assert_eq!(fee_of(&plan, "BTC-PERP"), dec!(0.47));
+    assert_eq!(fee_of(&plan, "ETH-PERP"), dec!(0.392));
+    assert_eq!(plan.after.cash, dec!(935.138));
+    assert_eq!(per_instrument.fee_rate_for(&iid("BTC-PERP")), dec!(0.0005));
+    assert_eq!(per_instrument.fee_rate_for(&iid("ETH-PERP")), dec!(0.002));
+}
+
+#[test]
+fn test_fee_rates_default_only_leaves_the_plan_unchanged() {
+    let (account, liquidity) = two_longs();
+    let default_only = policy(CloseoutTarget::Flat);
+    let mut spelled_out = default_only.clone();
+    spelled_out.fee_rates = BTreeMap::from([
+        (iid("BTC-PERP"), dec!(0.0005)),
+        (iid("ETH-PERP"), dec!(0.0005)),
+        (iid("UNHELD"), dec!(0.9)),
+    ]);
+    let plan_default = plan(&account, &liquidity, &default_only);
+    assert_eq!(plan_default, plan(&account, &liquidity, &spelled_out));
+    assert_eq!(fee_of(&plan_default, "ETH-PERP"), dec!(0.098));
+    assert_eq!(plan_default.after.cash, dec!(935.432));
+}
+
+#[test]
+fn test_fee_rates_outside_unit_interval_are_refused() {
+    let (account, liquidity) = two_longs();
+    for rate in [dec!(-0.001), dec!(1)] {
+        let mut bad = policy(CloseoutTarget::Flat);
+        bad.fee_rates = BTreeMap::from([(iid("ETH-PERP"), rate)]);
+        assert!(matches!(
+            plan_liquidation(&rule(), &account, &liquidity, &bad),
+            Err(MarginError::InvalidInput {
+                field: "fee_rates",
+                ..
+            })
+        ));
+    }
 }

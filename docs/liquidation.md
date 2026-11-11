@@ -44,7 +44,7 @@ The margins come from a `TieredLinearIm` rule, for example a single tier with IM
 
 ```text
 plan_liquidation(&model, &LiquidationAccount { view, basis, cash, resting_orders },
-                 &liquidity, &LiquidationPolicy { target, fee_rate, contract_step })
+                 &liquidity, &LiquidationPolicy { target, fee_rate, fee_rates, contract_step })
 ```
 
 `model` implements `PiecewiseLinearMargin`, which every `TieredLinearIm` does. The trait's contract has three parts:
@@ -54,6 +54,8 @@ plan_liquidation(&model, &LiquidationAccount { view, basis, cash, resting_orders
 - every amount is rounded to `cash_scale`, which the plan uses as its cash quantum, so cash, PnL and margins always share one scale.
 
 Each open position needs a non-zero `basis` with the sign of the position.
+
+The fee rate `f` of an instrument is its entry in `fee_rates`, else `fee_rate`; each rate is in `[0, 1)`. An entry for an instrument the account does not hold is unused.
 
 ### Stages
 
@@ -102,7 +104,7 @@ Each open position needs a non-zero `basis` with the sign of the position.
 | fill cash, `n` at `p` | `+round_half_even(p * n * M, c)` when selling, negative when buying |
 | released basis | `round_half_even(basis * n / abs(Qc), c)`; a full close releases the whole basis |
 | realized PnL | `fill cash - released` |
-| fee | `trunc(fee_rate * p * n * M, c)`: one exact four-factor product, truncated toward zero |
+| fee | `trunc(f * p * n * M, c)`: one exact four-factor product, truncated toward zero |
 | cash after a fill | `cash + realized - fee`, as one exact sum, booked even if it goes negative |
 
 Marks stay those of the `ExposureView` for the whole plan. The scenario prices for the closeout are the liquidity levels.
@@ -116,7 +118,7 @@ An **inverse** position (contract value `CV` in quote units, settled in the base
 | fill value, `n` at `p` | `+round_half_even(n * CV / p, c)` when selling, negative when buying (`ForcedReduction::fill_cash`) |
 | released basis | as above |
 | realized PnL | `released - fill value` |
-| fee | `trunc(fee_rate * n * CV / p, c)`, in the base |
+| fee | `trunc(f * n * CV / p, c)`, in the base |
 
 ### Search within a level
 
