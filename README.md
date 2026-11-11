@@ -137,6 +137,7 @@ rounding, and no partial sum that can overflow while the result does not.
 | `collateral` | Collateral value with haircuts and a stale price policy. |
 | `margin_reservations` | Initial margin reserved for pending derivative orders, own positions or on the ledger. |
 | `maintenance` | Account state from the maintenance threshold. |
+| `account_view` | `AccountMarginView`: an account's requirement, state, collateral, debt, positions and resting orders at one sequence number. |
 | `liquidation` | Staged closeout plan with a certified search, from and back to the ledger, and adapter intents. |
 | `decimal` | Exact wide integer arithmetic and the `Rounding` modes. |
 | `instrument` | Ledger instruments: spot, linear and inverse futures and perpetuals; with the `instruments` feature, `Instrument::from_spec` converts a `financial_types` instrument specification. |
