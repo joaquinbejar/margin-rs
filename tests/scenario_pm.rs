@@ -488,3 +488,88 @@ fn test_closeout_plan_under_scenario_pm() {
     assert_eq!(plan.reductions[0].contracts, dec!(2.5));
     assert_eq!(plan.after.maintenance, dec!(7.5));
 }
+
+/// Short 10 CALL (premium mark 5, basis -50) hedged by 3 PERP long (mark
+/// 100, basis 300), cash 60, underlying 100. Scenarios: flat, and up
+/// (PERP 110, CALL 12): `R_up = -3 * 10 + 10 * 7 = 40`, so mm 40.
+/// Collateral counts min(-50, 0): 10.
+///
+/// Buying back `n` CALL at 5.5: collateral 10 - 0.5n against
+/// 40 - 7n, met at n = 5 (7.5 against 5).
+#[test]
+fn test_closeout_plan_over_options_under_scenario_pm() {
+    let up = scenario(&[("PERP", dec!(110)), ("CALL", dec!(12))]);
+    let flat = scenario(&[("PERP", dec!(100)), ("CALL", dec!(5))]);
+    let pm = rule(
+        6,
+        (NO_FLOOR, NO_FLOOR),
+        ScenarioSets {
+            initial: vec![flat.clone(), up.clone()],
+            maintenance: vec![flat, up],
+        },
+    );
+    let call = ExposurePosition {
+        instrument: iid("CALL"),
+        product: ProductKind::Option,
+        settlement: usdc(),
+        contracts: dec!(-10),
+        size: ContractSize::Multiplier(Decimal::ONE),
+        mark: dec!(5),
+    };
+    let perp = ExposurePosition {
+        instrument: iid("PERP"),
+        product: ProductKind::LinearPerpetual,
+        settlement: usdc(),
+        contracts: dec!(3),
+        size: ContractSize::Multiplier(Decimal::ONE),
+        mark: dec!(100),
+    };
+    let account = LiquidationAccount {
+        view: ExposureView {
+            account: acct(),
+            venue: venue(),
+            positions: vec![call, perp],
+        },
+        basis: BTreeMap::from([(iid("CALL"), dec!(-50)), (iid("PERP"), dec!(300))]),
+        cash: dec!(60),
+        resting_orders: vec![],
+    };
+    let liquidity = BTreeMap::from([(
+        iid("CALL"),
+        vec![LiquidityLevel {
+            price: dec!(5.5),
+            contracts: dec!(100),
+        }],
+    )]);
+    let policy = LiquidationPolicy {
+        target: CloseoutTarget::Maintenance,
+        fee_rate: Decimal::ZERO,
+        fee_rates: BTreeMap::new(),
+        loss_budget: None,
+        contract_step: Decimal::ONE,
+    };
+    // Without the underlying price the option cannot be margined.
+    assert!(matches!(
+        plan_liquidation(&pm, &account, &liquidity, &policy),
+        Err(MarginError::MissingMark { .. })
+    ));
+    let pm = pm
+        .with_underlying_prices(BTreeMap::from([(iid("CALL"), dec!(100))]))
+        .expect("prices");
+    let plan = plan_liquidation(&pm, &account, &liquidity, &policy).expect("plan");
+    assert_eq!(plan.before.collateral, dec!(10));
+    assert_eq!(plan.before.maintenance, dec!(40));
+    assert_eq!(plan.outcome, CloseoutOutcome::TargetMet);
+    assert_eq!(plan.reductions.len(), 1);
+    assert_eq!(plan.reductions[0].instrument, iid("CALL"));
+    assert_eq!(plan.reductions[0].contracts, dec!(5));
+    assert_eq!(plan.reductions[0].fill_cash, dec!(-27.5));
+    assert_eq!(plan.after.cash, dec!(32.5));
+    assert_eq!(plan.after.collateral, dec!(7.5));
+    assert_eq!(plan.after.maintenance, dec!(5));
+    assert!(
+        pm.clone()
+            .with_underlying_prices(BTreeMap::from([(iid("CALL"), Decimal::ZERO)]))
+            .is_err()
+    );
+}
