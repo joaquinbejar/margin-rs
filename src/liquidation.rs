@@ -2,9 +2,7 @@
 //!
 //! [`plan_liquidation`] simulates one closeout of an account's linear or
 //! inverse futures and perpetuals against supplied scenario liquidity,
-//! under one [`PiecewiseLinearMargin`] rule (any
-//! [`TieredLinearIm`](crate::rules::TieredLinearIm) or
-//! [`TieredInverseIm`](crate::rules::TieredInverseIm)), and returns a
+//! under one [`AccountMargin`] rule, and returns a
 //! [`LiquidationPlan`]. It is a pure function: it books nothing and changes
 //! no state. There is no live liquidator.
 //!
@@ -59,7 +57,7 @@
 //! # Cash conventions
 //!
 //! With `c` the rule's
-//! [`cash_scale`](PiecewiseLinearMargin::cash_scale) (so cash, PnL and
+//! [`cash_scale`](AccountMargin::plan_cash_scale) (so cash, PnL and
 //! margins share one quantum):
 //!
 //! - `basis` is the signed cash value of the open position at entry prices
@@ -91,6 +89,26 @@
 //! Marks stay those of the [`ExposureView`] for the whole plan: the
 //! scenario's prices for the closeout are the liquidity levels.
 //!
+//! # Rules
+//!
+//! The plan takes any [`AccountMargin`] rule; its requirement is always
+//! evaluated on the whole projected account.
+//!
+//! - A [`PiecewiseLinearMargin`](crate::initial_margin::PiecewiseLinearMargin)
+//!   rule ([`TieredLinearIm`](crate::rules::TieredLinearIm),
+//!   [`TieredInverseIm`](crate::rules::TieredInverseIm)) sums per-position
+//!   margins whose tiers the [search](self#search-within-a-level) reads to
+//!   certify counts in advance.
+//! - A rule that nets across positions has no tiers
+//!   ([`AccountMargin::plan_tiers`] is `None`): no count is certified, so
+//!   on each level the plan evaluates the counts one by one in increasing
+//!   order and takes the first that meets the target, the smallest; if no
+//!   count does, the whole level. Each evaluation uses one unit of
+//!   [`SEARCH_BUDGET`]; when it runs out the plan fails with
+//!   [`MarginError::CloseoutSearchLimit`]. Instruments are taken in
+//!   decreasing order of the maintenance the rule attributes to their
+//!   lines.
+//!
 //! # Loss budget
 //!
 //! With [`LiquidationPolicy::loss_budget`] `Some(B)`, the plan's projected
@@ -121,7 +139,7 @@
 //! On one level, with `n` the contracts closed there, `cash(n)` is linear
 //! (price, released basis and fee are all proportional to `n`) and
 //! `excess(n) = collateral(n) - margin(n)` is concave: collateral is linear
-//! and, by the [`PiecewiseLinearMargin`] contract, the margin is a convex
+//! and, by the [`PiecewiseLinearMargin`](crate::initial_margin::PiecewiseLinearMargin) contract, the margin is a convex
 //! piecewise linear function of the notional, which falls linearly in `n`.
 //! This holds for inverse positions too: their PnL is convex in the price,
 //! but within a level the price is fixed, so the fill value `n * CV / p`,
@@ -144,7 +162,7 @@
 //!    booked figures.
 //! 2. The unrounded cash and excess are evaluated exactly, in wide
 //!    integers, from the contract terms and the rule's tiers
-//!    ([`PiecewiseLinearMargin::margin_tiers`]), never from the rounded
+//!    ([`PiecewiseLinearMargin::margin_tiers`](crate::initial_margin::PiecewiseLinearMargin::margin_tiers)), never from the rounded
 //!    margin. So `J = {cash >= -2q and excess >= -3q}` contains every count
 //!    that meets the target and `J' = {cash >= 2q and excess >= 3q}` only
 //!    counts that do. Both are intervals of the grid (the cash is linear,
@@ -213,7 +231,7 @@ use crate::direction::Dir;
 use crate::error::{MarginError, Result};
 use crate::ids::{AccountId, Asset, ExecutionId, InstrumentId, OrderId, VenueId};
 use crate::initial_margin::{
-    ExposurePosition, ExposureView, MarginRequirement, PiecewiseLinearMargin, RuleId, check_size,
+    AccountMargin, ExposurePosition, ExposureView, MarginRequirement, RuleId, check_size,
 };
 use crate::instrument::ContractSize;
 use crate::ledger::derivative::{market_value, unrealized_pnl};
@@ -244,7 +262,7 @@ pub struct LiquidationPolicy {
     /// does not hold is allowed and unused.
     pub fee_rates: BTreeMap<InstrumentId, Decimal>,
     /// Loss budget `B`, at least zero, at the rule's
-    /// [`cash_scale`](PiecewiseLinearMargin::cash_scale): the plan takes no
+    /// [`cash_scale`](AccountMargin::plan_cash_scale): the plan takes no
     /// count that brings its projected equity (the collateral of
     /// [`AccountSummary`], cash plus unrealized PnL at the marks) below
     /// `-B`, and stops with [`CloseoutOutcome::BudgetExhausted`] instead.
@@ -323,7 +341,7 @@ impl LiquidationAccount {
     ///
     /// - [`MarginError::UnknownAsset`] if `currency` is not registered.
     /// - [`MarginError::InvalidInput`] if the scale of `currency` is not the
-    ///   rule's [`cash_scale`](PiecewiseLinearMargin::cash_scale) (the plan
+    ///   rule's [`cash_scale`](AccountMargin::plan_cash_scale) (the plan
     ///   and the ledger must round to the same quantum), or a mark is not
     ///   positive.
     /// - [`MarginError::CurrencyMismatch`] for an open derivative settled in
@@ -335,7 +353,7 @@ impl LiquidationAccount {
     ///   decimals.
     /// - [`MarginError::UnknownInstrument`] for a position whose instrument
     ///   the snapshot does not define.
-    pub fn from_ledger<M: PiecewiseLinearMargin>(
+    pub fn from_ledger<M: AccountMargin>(
         model: &M,
         snapshot: &LedgerSnapshot,
         account: AccountId,
@@ -350,7 +368,7 @@ impl LiquidationAccount {
             .ok_or_else(|| MarginError::UnknownAsset {
                 asset: currency.clone(),
             })?;
-        if scale != model.cash_scale() {
+        if scale != model.plan_cash_scale() {
             return Err(MarginError::invalid_input(
                 "currency",
                 "its ledger scale must be the rule's cash scale",
@@ -699,7 +717,7 @@ struct Planner<'a, M> {
     minimal: Cell<bool>,
 }
 
-impl<M: PiecewiseLinearMargin> Planner<'_, M> {
+impl<M: AccountMargin> Planner<'_, M> {
     fn requirement(&self, state: &State) -> Result<MarginRequirement> {
         self.model.requirement(&ExposureView {
             account: self.account.view.account.clone(),
@@ -788,11 +806,13 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
             return at(last);
         }
         let first = grid.next(GridIndex::ZERO).unwrap_or(last);
-        let continuous = self.continuous(state, index, offer.price)?;
         // J contains every count that meets the target, J' only counts that
-        // do; without a certificate (an overflow of the wide integers), J
-        // is the whole level.
-        let (possible, certain) = match continuous.certify(&grid, first, last, self.scale) {
+        // do; without a certificate (a rule without tiers, or an overflow
+        // of the wide integers), J is the whole level.
+        let certificate = self
+            .continuous(state, index, offer.price)?
+            .and_then(|continuous| continuous.certify(&grid, first, last, self.scale));
+        let (possible, certain) = match certificate {
             Some((possible, certain)) => (possible.span(), certain.span()),
             None => (Some((first, last)), None),
         };
@@ -932,8 +952,16 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
 
     /// The unrounded cash and excess of the account after closing part of
     /// position `index` at `price`, the other positions unchanged.
-    fn continuous(&self, state: &State, index: usize, price: Decimal) -> Result<Continuous> {
+    fn continuous(
+        &self,
+        state: &State,
+        index: usize,
+        price: Decimal,
+    ) -> Result<Option<Continuous>> {
         let open = state.open(index)?;
+        let Some(tiers) = self.model.plan_tiers(&open.exposure) else {
+            return Ok(None);
+        };
         let requirement = self.requirement(state)?;
         let mut others = Vec::new();
         for (position, line) in state.positions.iter().enumerate() {
@@ -957,9 +985,7 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
                 CloseoutTarget::Maintenance | CloseoutTarget::Flat => line.maintenance,
             }));
         }
-        let tiers = self
-            .model
-            .margin_tiers(&open.exposure)
+        let tiers = tiers
             .iter()
             .map(|tier| {
                 (
@@ -971,7 +997,7 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
                 )
             })
             .collect();
-        Ok(Continuous {
+        Ok(Some(Continuous {
             size: open.exposure.size,
             sign: if open.exposure.contracts > Decimal::ZERO {
                 Decimal::ONE
@@ -986,7 +1012,7 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
             cash: state.cash,
             others,
             tiers,
-        })
+        }))
     }
 
     /// Closes `contracts` of position `index` at `price`.
@@ -1182,12 +1208,12 @@ impl<M: PiecewiseLinearMargin> Planner<'_, M> {
 ///   repeated resting orders, or liquidity levels that are not positive or
 ///   not ordered from the best price.
 /// - [`MarginError::PrecisionExceeded`] if cash or a basis has more digits
-///   than the rule's [`cash_scale`](PiecewiseLinearMargin::cash_scale).
+///   than the rule's [`cash_scale`](AccountMargin::plan_cash_scale).
 /// - Every error of the model's
 ///   [`requirement`](crate::initial_margin::InitialMarginModel::requirement)
 ///   on the view.
 /// - [`MarginError::Arithmetic`] if an amount cannot be represented.
-pub fn plan_liquidation<M: PiecewiseLinearMargin>(
+pub fn plan_liquidation<M: AccountMargin>(
     model: &M,
     account: &LiquidationAccount,
     liquidity: &BTreeMap<InstrumentId, Vec<LiquidityLevel>>,
@@ -1201,7 +1227,7 @@ pub fn plan_liquidation<M: PiecewiseLinearMargin>(
     clippy::too_many_lines,
     reason = "the staged closeout reads as one sequence: validate, cancel, reduce level by level, report the residual"
 )]
-fn plan_with_budget<M: PiecewiseLinearMargin>(
+fn plan_with_budget<M: AccountMargin>(
     model: &M,
     account: &LiquidationAccount,
     liquidity: &BTreeMap<InstrumentId, Vec<LiquidityLevel>>,
@@ -1212,7 +1238,7 @@ fn plan_with_budget<M: PiecewiseLinearMargin>(
         model,
         policy,
         account,
-        scale: model.cash_scale(),
+        scale: model.plan_cash_scale(),
         budget: Cell::new(budget),
         limit: budget,
         minimal: Cell::new(true),
@@ -1770,7 +1796,7 @@ mod tests {
                 basis: account.basis[&iid("A")],
             }],
         };
-        let continuous = planner.continuous(&state, 0, price).unwrap();
+        let continuous = planner.continuous(&state, 0, price).unwrap().unwrap();
         continuous.cash_at_least(n, dec!(2)).unwrap()
             && continuous.excess_at_least(n, dec!(3)).unwrap()
     }
@@ -1889,6 +1915,7 @@ mod tests {
         let first = grid.next(GridIndex::ZERO).unwrap();
         let (_, certain) = planner
             .continuous(&state, 0, price)
+            .unwrap()
             .unwrap()
             .certify(&grid, first, grid.last(), 0)
             .unwrap();

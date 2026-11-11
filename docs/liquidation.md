@@ -47,7 +47,9 @@ plan_liquidation(&model, &LiquidationAccount { view, basis, cash, resting_orders
                  &liquidity, &LiquidationPolicy { target, fee_rate, fee_rates, loss_budget, contract_step })
 ```
 
-`model` implements `PiecewiseLinearMargin`, which every `TieredLinearIm` does. The trait's contract has three parts:
+`model` implements `AccountMargin`: its requirement is evaluated on the whole projected account, so it may net across positions. It lists one line per position (the plan closes instruments in decreasing order of their line's maintenance, ties by id) and rounds every amount to `plan_cash_scale`. A rule that nets has no `plan_tiers`: no count is certified in advance, so on each level the plan evaluates counts one by one in increasing order and takes the first that meets the target (the smallest), or the whole level; each evaluation costs one unit of `SEARCH_BUDGET`, and running out is `CloseoutSearchLimit`.
+
+Every `PiecewiseLinearMargin` (every `TieredLinearIm` and `TieredInverseIm`) is an `AccountMargin` whose tiers the plan searches exactly, as described below. That trait's contract has three parts:
 
 - margins are additive across positions;
 - each position's IM and MM are convex, non-decreasing, piecewise linear functions of its notional, given exactly (before rounding) by `margin_tiers`;

@@ -210,6 +210,46 @@ pub trait InitialMarginModel {
     fn requirement(&self, view: &ExposureView) -> Result<MarginRequirement>;
 }
 
+/// A margin rule the closeout planner
+/// ([`crate::liquidation::plan_liquidation`]) can drive: its requirement is
+/// evaluated on the whole projected account, so it may net across
+/// positions.
+///
+/// Contract:
+///
+/// - [`InitialMarginModel::requirement`] is deterministic and lists one
+///   [`PositionRequirement`] per position of the view; the planner closes
+///   instruments in decreasing order of their line's `maintenance` (ties by
+///   instrument id), so a netting rule chooses that order by how it
+///   attributes the requirement to its lines;
+/// - every amount is rounded to [`AccountMargin::plan_cash_scale`].
+///
+/// Every [`PiecewiseLinearMargin`] is an `AccountMargin` whose tiers the
+/// planner searches exactly. Any other rule gets no
+/// [`AccountMargin::plan_tiers`]: the planner then evaluates the counts of
+/// a level one by one, in increasing order, within
+/// [`SEARCH_BUDGET`](crate::liquidation::SEARCH_BUDGET).
+pub trait AccountMargin: InitialMarginModel {
+    /// Number of decimals every requirement is rounded to: the cash
+    /// quantum of the rule's currency.
+    fn plan_cash_scale(&self) -> u32;
+
+    /// The exact tiers of `position`'s margin when the requirement is the
+    /// sum of per-position piecewise linear margins (see
+    /// [`PiecewiseLinearMargin`]); `None` for a rule that nets.
+    fn plan_tiers(&self, position: &ExposurePosition) -> Option<Vec<crate::rules::MarginTier>>;
+}
+
+impl<T: PiecewiseLinearMargin> AccountMargin for T {
+    fn plan_cash_scale(&self) -> u32 {
+        self.cash_scale()
+    }
+
+    fn plan_tiers(&self, position: &ExposurePosition) -> Option<Vec<crate::rules::MarginTier>> {
+        Some(self.margin_tiers(position))
+    }
+}
+
 /// A margin rule whose requirement the closeout planner can search
 /// exactly ([`crate::liquidation::plan_liquidation`]).
 ///

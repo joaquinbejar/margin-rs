@@ -12,6 +12,10 @@ follows [Semantic Versioning](https://semver.org/).
   `fee_rate`, and `LiquidationPolicy::fee_rate_for` (#55).
 - `LiquidationPolicy::loss_budget` and `CloseoutOutcome::BudgetExhausted`: the
   plan never brings its projected equity below `-B` (#54).
+- `initial_margin::AccountMargin`: `plan_liquidation` and
+  `LiquidationAccount::from_ledger` take any rule evaluated on the whole
+  projected account, including one that nets across positions. Every
+  `PiecewiseLinearMargin` implements it, with unchanged plans (#52).
 
 ### Changed
 

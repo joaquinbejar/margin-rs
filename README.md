@@ -132,7 +132,7 @@ rounding, and no partial sum that can overflow while the result does not.
 | `risk` | `RiskGate`: pretrade gate for spot orders, reservations with fees in quote or base, hard limits, typed decisions, circuit breaker and quote withdrawal; mandatory derivative postings. |
 | `valuation` | Account mark to market in one reporting asset over a `LedgerSnapshot`, PnL attribution, collateral equity. |
 | `scenarios` | Stress of spot inventory and open linear futures and perpetuals. |
-| `initial_margin`, `rules` | `InitialMarginModel`, `PiecewiseLinearMargin`, `TieredLinearIm` (`linear-im/1`), `TieredInverseIm` (`inverse-im/1`) and `ShortOptionIm` (`short-option-im/1`). |
+| `initial_margin`, `rules` | `InitialMarginModel`, `AccountMargin`, `PiecewiseLinearMargin`, `TieredLinearIm` (`linear-im/1`), `TieredInverseIm` (`inverse-im/1`) and `ShortOptionIm` (`short-option-im/1`). |
 | `factors`, `covariance` | Factor exposures with units and portfolio variance. |
 | `collateral` | Collateral value with haircuts and a stale price policy. |
 | `margin_reservations` | Initial margin reserved for pending derivative orders, own positions or on the ledger. |
