@@ -46,7 +46,7 @@ G   = g * (gross - |net|)
 G'  = g * (gross + O - max(0, |net| - O_against))
 ```
 
-`gross = sum |Q| * M * X0` and `net = sum Q * M * X0` over linear legs; `O` is the notional `|q| * M * X0` of every linear order at its leg's mark and `O_against` that of the orders against the sign of `net`. A single linear position pays no `G`, so with extreme moves `X0 * (1 +- r)` the figure equals `linear-im/1` at rate `r` whatever `g`; a calendar spread of equal and opposite notionals `N` pays `g * 2N`. `G'` bounds `G` after any subset of fills. Version 1 keeps its formulas and id.
+`gross = sum |Q| * M * X0` and `net = sum Q * M * X0` over linear legs; `O` is the notional `|q| * M * X0` of every linear order at its leg's mark and `O_against` that of the orders against the sign of `net`. A single linear position pays no `G`, so with extreme moves `X0 * (1 +- r)` the figure equals `linear-im/1` at rate `r` whatever `g`; a calendar spread of equal and opposite notionals `N` pays `g * 2N`. `G'` bounds `G` after any subset of fills. An option leg is long or short by the position held, not the post-fill one: in admission an order is valued by its loss `-q * M * (X_s - L)` against the legs as held. Version 1 keeps its formulas and id.
 
 ## Breakdown
 

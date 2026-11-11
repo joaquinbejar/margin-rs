@@ -75,6 +75,11 @@
 //! at least `G` after any subset of fills, since fills raise the gross by
 //! at most `O` and lower `|net|` by at most `O_against`.
 //!
+//! An option leg is long or short by the position held, not by the
+//! position after the orders: in admission a buy order that would turn a
+//! short option long is valued like any order, by its loss
+//! `-q * M * (X_s - L)` against the leg's version 2 terms.
+//!
 //! # Breakdown
 //!
 //! [`ScenarioPmRequirement`] gives, for each figure, the worst scenario's
