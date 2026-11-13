@@ -468,12 +468,12 @@ Repositories by the same author that this project depends on, and repositories t
 
 | Repository | Description |
 |------------|-------------|
-| [financial_types](https://github.com/joaquinbejar/financial_types) · [crates.io](https://crates.io/crates/financial_types) | Core financial type definitions for trading systems; margin-rs uses its `Action` for the order and execution direction and, with the `instruments` feature, its instrument specifications. |
+| [financial_types](https://github.com/joaquinbejar/financial_types) | Core financial enums; margin-rs uses its `Action` for order and execution direction and, with the `instruments` feature, its instrument specifications. |
 
 ### Used by
 
 | Repository | Description |
 |------------|-------------|
-| [market-maker-rs](https://github.com/joaquinbejar/market-maker-rs) · [crates.io](https://crates.io/crates/market-maker-rs) | Quantitative market making strategies, starting with the Avellaneda-Stoikov model. It uses margin-rs optionally through its `margin` feature, pinned by git to an earlier revision; updating it to this release is pending. |
+| [market-maker-rs](https://github.com/joaquinbejar/market-maker-rs) | Quantitative market making engine; uses margin-rs for portfolio margin and risk limits on its positions. |
 
 <!-- related-projects:end -->
